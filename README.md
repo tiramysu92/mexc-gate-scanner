@@ -1,1 +1,0 @@
-# MEXC Gate Scanner V2\n30 cryptos, profondeur du carnet, tailles 500/1000/2500/5000 USDT, historique SQLite, lecture seule.\n
