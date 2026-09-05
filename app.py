@@ -1,472 +1,798 @@
-#!/usr/bin/env python3
-import os, json, time, math, queue, sqlite3, threading, requests
+import os, time, json, math, sqlite3, threading, queue, statistics
 from collections import defaultdict, deque
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-from flask import Flask, jsonify, render_template_string
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+
+import requests
 import websocket
+from flask import Flask, jsonify, render_template_string, request
 
-VERSION = "1.0"
-HOST = "0.0.0.0"
-PORT = int(os.getenv("PORT", "8081"))
-DB_PATH = os.getenv("DB_PATH", "mexc_routes.db")
-MARKET_CACHE = os.getenv("MARKET_CACHE", "mexc_markets_cache.json")
-TZ_NAME = os.getenv("TZ_NAME", "Europe/Paris")
-TZ = ZoneInfo(TZ_NAME)
+# ============================================================
+# MEXC <-> Gate spot arbitrage scanner V3.4
+# Public market data only. No API keys and no order execution.
+#
+# Architecture:
+# - Gate BBO: WebSocket, update speed offered by Gate: 10 ms
+# - MEXC BBO: native protobuf WebSocket bookTicker, 100 ms channels
+#   split across up to 5 connections (30 subscriptions/connection)
+# - Exact order-book depth is fetched only when the BBO suggests a
+#   potentially interesting cross-CEX spread.
+# - Positive signals are grouped into OPPORTUNITY EVENTS so 50 ticks
+#   during one 3-second spread count as 1 opportunity, not 50.
+# ============================================================
 
-FEE = float(os.getenv("TAKER_FEE", "0.0005"))  # 0.05% per leg
-STABLES = tuple(x.strip().upper() for x in os.getenv("STABLES", "USDT,USDC,USD1").split(",") if x.strip())
-SIZES = tuple(float(x) for x in os.getenv("SIZES", "250,500,1000,2000").split(","))
-MIN_NET = float(os.getenv("MIN_NET_PCT", "0.01")) / 100.0
-MAX_BBO_AGE_MS = int(os.getenv("MAX_BBO_AGE_MS", "1500"))
+APP_PORT = int(os.getenv("PORT", "8080"))
+DB_PATH = os.getenv("DB_PATH", "scanner_v3.db")
+
+SIZES = [250.0, 500.0, 1000.0, 2000.0]
+MAX_PAIRS = int(os.getenv("MAX_PAIRS", "150"))
+
+# Focus on tradable but not ultra-thin markets.
+MIN_QUOTE_VOL_24H = float(os.getenv("MIN_QUOTE_VOL_24H", "100000"))     # each CEX
+MAX_QUOTE_VOL_24H = float(os.getenv("MAX_QUOTE_VOL_24H", "75000000"))  # soft cap
+MEXC_BBO_INTERVAL = float(os.getenv("MEXC_BBO_INTERVAL", "0.25"))       # safer default: 4 req/s
+MEXC_BACKOFF_INITIAL = float(os.getenv("MEXC_BACKOFF_INITIAL", "2.0"))
+MEXC_BACKOFF_MAX = float(os.getenv("MEXC_BACKOFF_MAX", "60.0"))
+
+# BBO prefilter: exact depth fetch only if gross spread reaches this.
+# Negative threshold deliberately keeps near-misses so we can study them.
+PREFILTER_GROSS = float(os.getenv("PREFILTER_GROSS", "0.0004"))  # +0.04%
+VERIFY_COOLDOWN_MS = int(os.getenv("VERIFY_COOLDOWN_MS", "250"))
 EVENT_CLOSE_GAP_MS = int(os.getenv("EVENT_CLOSE_GAP_MS", "1000"))
-MAX_WS_SYMBOLS = int(os.getenv("MAX_WS_SYMBOLS", "600"))
-MAX_BRIDGE_ASSETS = int(os.getenv("MAX_BRIDGE_ASSETS", "80"))
-SIM_CAPITAL = float(os.getenv("SIM_CAPITAL", "2000"))
-SIM_MIN_TRADE = float(os.getenv("SIM_MIN_TRADE", "50"))
-MAX_ROUTES_PER_SYMBOL_SCAN = int(os.getenv("MAX_ROUTES_PER_SYMBOL_SCAN", "6000"))
 
-REST = "https://api.mexc.com"
-WS = "wss://wbs-api.mexc.com/ws"
+# Current account assumptions discussed:
+# MEXC usual spot taker 0.05%; XRP override 0%.
+# Gate VIP0 spot taker 0.10%.
+MEXC_DEFAULT_FEE = float(os.getenv("MEXC_TAKER_FEE", "0.0005"))
+GATE_DEFAULT_FEE = float(os.getenv("GATE_TAKER_FEE", "0.0010"))
+MEXC_FEE_OVERRIDES = {"XRPUSDT": 0.0}
+
+# Pairs discovered in V2 that deserve guaranteed inclusion.
+PINNED = {
+    "ARBUSDT", "FETUSDT", "SEIUSDT", "NEARUSDT", "XRPUSDT",
+    "OPUSDT", "SUIUSDT", "DOGEUSDT", "AAVEUSDT", "RENDERUSDT",
+    "PEPEUSDT", "ADAUSDT"
+}
+
+# Remove common stable/stable, wrapped, leveraged and obvious index-like markets.
+EXCLUDED_BASES = {
+    "USDC","USDE","FDUSD","TUSD","DAI","EUR","EURT","USD1","USDP","PYUSD",
+    "WBTC","WETH","STETH","WSTETH"
+}
+EXCLUDED_SUFFIXES = ("3L","3S","5L","5S","UP","DOWN","BULL","BEAR")
+
+MEXC = "https://api.mexc.com"
+GATE = "https://api.gateio.ws/api/v4"
+GATE_WS = "wss://api.gateio.ws/ws/v4/"
+MEXC_WS = "wss://wbs-api.mexc.com/ws"
 
 app = Flask(__name__)
+session = requests.Session()
+session.headers.update({"User-Agent": "mexc-gate-scanner-v3/1.0"})
+
 state_lock = threading.RLock()
-event_lock = threading.RLock()
 state = {
-    "bbo": {}, "last_ws_ms": 0, "ws_connected": 0, "ws_expected": 0,
-    "symbols": [], "routes": [], "route_by_id": {}, "routes_by_symbol": defaultdict(list),
-    "errors": deque(maxlen=20), "started_ms": int(time.time()*1000),
-    "market_source": "", "scan_updates": 0,
+    "started_ms": int(time.time()*1000),
+    "pairs": [],
+    "universe_meta": {},
+    "mexc": {},
+    "gate": {},
+    "live": {},
+    "last_mexc_ms": 0,
+    "last_gate_ms": 0,
+    "mexc_cycle_ms": None,
+    "mexc_latency_ms": None,
+    "mexc_ws_connected": 0,
+    "mexc_ws_total": 0,
+    "gate_connected": False,
+    "verify_queue": 0,
+    "errors": deque(maxlen=30),
 }
-active_events = {}
-dbq = queue.Queue(maxsize=20000)
-scanq = queue.Queue(maxsize=20000)
-queued_symbols = set()
-queued_lock = threading.Lock()
+last_verify = {}
+active_events = {}   # (pair,direction) -> in-memory aggregate
+event_lock = threading.RLock()
+verify_pool = ThreadPoolExecutor(max_workers=10)
+depth_http_pool = ThreadPoolExecutor(max_workers=20)
+dbq = queue.Queue(maxsize=10000)
 
+def now_ms():
+    return int(time.time()*1000)
 
-def now_ms(): return int(time.time()*1000)
+def err(msg):
+    with state_lock:
+        state["errors"].appendleft(f"{datetime.now().isoformat(timespec='seconds')} {msg}")
 
-def logerr(msg):
-    line = f"{datetime.now(TZ).isoformat(timespec='seconds')} {msg}"
-    print(line)
-    with state_lock: state["errors"].appendleft(line)
+def fee_mexc(pair):
+    return MEXC_FEE_OVERRIDES.get(pair, MEXC_DEFAULT_FEE)
 
-def local_day_bounds_ms(day_offset=0):
-    now = datetime.now(TZ) + timedelta(days=day_offset)
-    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    end = start + timedelta(days=1)
-    return int(start.timestamp()*1000), int(end.timestamp()*1000), start.date().isoformat()
+def net_return(buy_avg, sell_avg, buy_fee, sell_fee):
+    # Quote received after sell fee / quote spent including buy fee.
+    return (sell_avg * (1.0 - sell_fee)) / (buy_avg * (1.0 + buy_fee)) - 1.0
 
-# ---------- DB ----------
+def vwap_buy(asks, quote_usdt):
+    remain = quote_usdt
+    base = 0.0
+    spent = 0.0
+    for p, q in asks:
+        p, q = float(p), float(q)
+        level_quote = p*q
+        take_quote = min(remain, level_quote)
+        if take_quote <= 0: break
+        base += take_quote/p
+        spent += take_quote
+        remain -= take_quote
+        if remain <= 1e-9: break
+    if remain > max(0.01, quote_usdt*1e-6) or base <= 0:
+        return None
+    return spent/base, base
+
+def vwap_sell(bids, base_qty):
+    remain = base_qty
+    got = 0.0
+    sold = 0.0
+    for p, q in bids:
+        p, q = float(p), float(q)
+        take = min(remain, q)
+        if take <= 0: break
+        got += take*p
+        sold += take
+        remain -= take
+        if remain <= 1e-12: break
+    if remain > max(1e-12, base_qty*1e-6) or sold <= 0:
+        return None
+    return got/sold, got
+
+def depth_result(pair, direction, size, mexc_book, gate_book):
+    if direction == "MEXC->GATE":
+        buy_book, sell_book = mexc_book, gate_book
+        buy_fee, sell_fee = fee_mexc(pair), GATE_DEFAULT_FEE
+    else:
+        buy_book, sell_book = gate_book, mexc_book
+        buy_fee, sell_fee = GATE_DEFAULT_FEE, fee_mexc(pair)
+
+    buy = vwap_buy(buy_book["asks"], size)
+    if not buy:
+        return None
+    buy_avg, base_qty = buy
+    sell = vwap_sell(sell_book["bids"], base_qty)
+    if not sell:
+        return None
+    sell_avg, gross_received = sell
+    gross = sell_avg/buy_avg - 1.0
+    net = net_return(buy_avg, sell_avg, buy_fee, sell_fee)
+    # Exact quote profit for this model:
+    quote_spent = size * (1.0 + buy_fee)
+    quote_received = gross_received * (1.0 - sell_fee)
+    profit = quote_received - quote_spent
+    return {
+        "size": size, "buy_avg": buy_avg, "sell_avg": sell_avg,
+        "gross": gross, "net": net, "profit": profit,
+        "base_qty": base_qty
+    }
+
 def db_writer():
     con = sqlite3.connect(DB_PATH, timeout=30)
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA synchronous=NORMAL")
     con.executescript("""
-    CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+    CREATE TABLE IF NOT EXISTS meta(
+      key TEXT PRIMARY KEY, value TEXT
+    );
+    CREATE TABLE IF NOT EXISTS verified_checks(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts_ms INTEGER NOT NULL,
+      pair TEXT NOT NULL,
+      direction TEXT NOT NULL,
+      size REAL NOT NULL,
+      gross REAL,
+      net REAL,
+      profit REAL,
+      buy_avg REAL,
+      sell_avg REAL,
+      positive INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_checks_pair_ts ON verified_checks(pair, ts_ms);
+    CREATE INDEX IF NOT EXISTS idx_checks_positive ON verified_checks(positive, ts_ms);
+
     CREATE TABLE IF NOT EXISTS opportunities(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      route_id TEXT NOT NULL,
-      route_type INTEGER NOT NULL,
-      path TEXT NOT NULL,
-      start_asset TEXT NOT NULL,
-      end_asset TEXT NOT NULL,
-      start_ts_ms INTEGER NOT NULL,
-      end_ts_ms INTEGER NOT NULL,
+      pair TEXT NOT NULL,
+      direction TEXT NOT NULL,
+      start_ms INTEGER NOT NULL,
+      end_ms INTEGER NOT NULL,
       duration_ms INTEGER NOT NULL,
       ticks INTEGER NOT NULL,
-      entry_net REAL NOT NULL,
       peak_net REAL NOT NULL,
       avg_net REAL NOT NULL,
-      best_size REAL NOT NULL,
-      entry_profit REAL NOT NULL,
-      peak_profit REAL NOT NULL
+      peak_gross REAL NOT NULL,
+      peak_profit REAL NOT NULL,
+      best_size REAL NOT NULL
     );
-    CREATE INDEX IF NOT EXISTS idx_opp_start ON opportunities(start_ts_ms);
-    CREATE INDEX IF NOT EXISTS idx_opp_route ON opportunities(route_id,start_ts_ms);
-    """)
-    con.commit()
-    while True:
-        item = dbq.get()
-        if item is None: break
-        try:
-            typ, payload = item
-            if typ == "event":
-                con.execute("""INSERT INTO opportunities(
-                  route_id,route_type,path,start_asset,end_asset,start_ts_ms,end_ts_ms,duration_ms,
-                  ticks,entry_net,peak_net,avg_net,best_size,entry_profit,peak_profit)
-                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", payload)
-            elif typ == "meta":
-                con.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", payload)
-            con.commit()
-        except Exception as e:
-            logerr(f"DB: {e}")
-        finally:
-            dbq.task_done()
-    con.close()
+    CREATE INDEX IF NOT EXISTS idx_opp_pair_start ON opportunities(pair, start_ms);
 
+    CREATE TABLE IF NOT EXISTS universe_snapshots(
+      ts_ms INTEGER NOT NULL,
+      pair TEXT NOT NULL,
+      mexc_quote_vol REAL,
+      gate_quote_vol REAL,
+      volatility_score REAL,
+      selection_score REAL
+    );
+    """)
+    con.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('version','3')")
+    con.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('sizes',?)", (json.dumps(SIZES),))
+    con.commit()
+    buf=[]
+    last=time.time()
+    while True:
+        try:
+            item=dbq.get(timeout=.5)
+            if item[0]=="check":
+                _, r = item
+                buf.append(("check",r))
+            elif item[0]=="event":
+                _, r = item
+                buf.append(("event",r))
+            elif item[0]=="universe":
+                _, rows = item
+                buf.extend(("universe",r) for r in rows)
+        except queue.Empty:
+            pass
+        if buf and (len(buf)>=100 or time.time()-last>.75):
+            try:
+                for typ,r in buf:
+                    if typ=="check":
+                        con.execute("""INSERT INTO verified_checks
+                        (ts_ms,pair,direction,size,gross,net,profit,buy_avg,sell_avg,positive)
+                        VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                        (r["ts_ms"],r["pair"],r["direction"],r["size"],r["gross"],r["net"],
+                         r["profit"],r["buy_avg"],r["sell_avg"],int(r["net"]>0)))
+                    elif typ=="event":
+                        con.execute("""INSERT INTO opportunities
+                        (pair,direction,start_ms,end_ms,duration_ms,ticks,peak_net,avg_net,
+                         peak_gross,peak_profit,best_size)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                        (r["pair"],r["direction"],r["start_ms"],r["end_ms"],r["duration_ms"],
+                         r["ticks"],r["peak_net"],r["avg_net"],r["peak_gross"],
+                         r["peak_profit"],r["best_size"]))
+                    else:
+                        con.execute("""INSERT INTO universe_snapshots
+                        (ts_ms,pair,mexc_quote_vol,gate_quote_vol,volatility_score,selection_score)
+                        VALUES(?,?,?,?,?,?)""",
+                        (r["ts_ms"],r["pair"],r["mexc_quote_vol"],r["gate_quote_vol"],
+                         r["volatility_score"],r["selection_score"]))
+                con.commit()
+                buf.clear()
+                last=time.time()
+            except Exception as e:
+                con.rollback(); err(f"DB: {e}"); buf.clear()
 
 def put_db(item):
     try: dbq.put_nowait(item)
-    except queue.Full: logerr("DB queue full")
+    except queue.Full: err("DB queue full")
 
-# ---------- MEXC market discovery ----------
-def save_market_cache(markets):
+def fetch_json(url, params=None, timeout=4):
+    r=session.get(url,params=params,timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+def load_cached_universe():
+    """Load the most recent saved universe from scanner_v3.db without any exchange REST call."""
+    if not os.path.exists(DB_PATH):
+        return []
+    con=None
     try:
-        with open(MARKET_CACHE, "w", encoding="utf-8") as f: json.dump(markets, f)
-    except Exception as e: logerr(f"market cache save: {e}")
+        con=sqlite3.connect(DB_PATH,timeout=3)
+        row=con.execute("SELECT MAX(ts_ms) FROM universe_snapshots").fetchone()
+        if not row or row[0] is None:
+            return []
+        ts=row[0]
+        rows=con.execute("""
+            SELECT pair,mexc_quote_vol,gate_quote_vol,volatility_score,selection_score
+            FROM universe_snapshots WHERE ts_ms=? ORDER BY selection_score DESC
+        """,(ts,)).fetchall()
+        # Preserve unique pairs; old snapshots may contain duplicates only if a prior run was interrupted.
+        seen=set(); pairs=[]; meta={}
+        for pair,mv,gv,vol,score in rows:
+            if pair in seen:
+                continue
+            seen.add(pair); pairs.append(pair)
+            meta[pair]={
+                "pair":pair,"mexc_quote_vol":mv,"gate_quote_vol":gv,
+                "volatility_score":vol,"selection_score":score,
+                "pinned":pair in PINNED
+            }
+        pairs=pairs[:MAX_PAIRS]
+        meta={p:meta[p] for p in pairs}
+        if pairs:
+            with state_lock:
+                state["pairs"]=pairs
+                state["universe_meta"]=meta
+            print(f"[V3.4] Cached universe: {len(pairs)} pairs loaded from {DB_PATH}")
+        return pairs
+    except Exception as e:
+        err(f"Cached universe: {e}")
+        return []
+    finally:
+        if con is not None:
+            con.close()
 
-def load_market_cache():
-    try:
-        with open(MARKET_CACHE, "r", encoding="utf-8") as f:
-            x=json.load(f)
-            if isinstance(x,list) and x: return x
-    except Exception: pass
-    return None
+def discover_universe():
+    mexc_info = fetch_json(MEXC+"/api/v3/exchangeInfo")
+    gate_pairs = fetch_json(GATE+"/spot/currency_pairs")
+    mexc_24 = fetch_json(MEXC+"/api/v3/ticker/24hr")
+    gate_24 = fetch_json(GATE+"/spot/tickers")
 
-def discover_markets():
-    headers={"User-Agent":"Mozilla/5.0 mexc-routes-scanner/1.0", "Accept":"application/json"}
-    # V3 first
-    for i in range(4):
+    mexc_ok={}
+    for s in mexc_info.get("symbols",[]):
+        sym=s.get("symbol","")
+        if sym.endswith("USDT") and s.get("status") in ("1","ENABLED",1):
+            mexc_ok[sym]=s
+    gate_ok={}
+    for x in gate_pairs:
+        if x.get("quote")=="USDT" and x.get("trade_status")=="tradable" and not x.get("st_tag",False):
+            gate_ok[x["id"].replace("_","")]=x
+
+    m24={x.get("symbol"):x for x in mexc_24 if isinstance(x,dict)}
+    g24={x.get("currency_pair","").replace("_",""):x for x in gate_24 if isinstance(x,dict)}
+
+    rows=[]
+    for sym in set(mexc_ok)&set(gate_ok)&set(m24)&set(g24):
+        base=sym[:-4]
+        if base in EXCLUDED_BASES or any(base.endswith(z) for z in EXCLUDED_SUFFIXES):
+            continue
         try:
-            r=requests.get(REST+"/api/v3/exchangeInfo", headers=headers, timeout=15)
-            r.raise_for_status(); data=r.json(); out=[]
-            for s in data.get("symbols",[]):
-                status=str(s.get("status","")).upper()
-                if status not in ("1","ENABLED","TRADING",""): continue
-                base=str(s.get("baseAsset","")).upper(); quote=str(s.get("quoteAsset","")).upper(); sym=str(s.get("symbol","")).upper()
-                if base and quote and sym: out.append({"symbol":sym,"base":base,"quote":quote})
-            if out:
-                save_market_cache(out); state["market_source"]="MEXC v3 exchangeInfo"; return out
-        except Exception as e:
-            logerr(f"exchangeInfo try {i+1}: {e}"); time.sleep(2**i)
-    # Old public endpoint is a useful fallback when WAF blocks v3 exchangeInfo.
-    try:
-        r=requests.get("https://www.mexc.com/open/api/v2/market/symbols",headers=headers,timeout=20)
-        r.raise_for_status(); data=r.json(); out=[]
-        for s in data.get("data",[]):
-            raw=str(s.get("symbol","")).upper()
-            status=str(s.get("state","")).upper()
-            if status not in ("ENABLED","1",""): continue
-            if "_" not in raw: continue
-            base,quote=raw.split("_",1); sym=base+quote
-            out.append({"symbol":sym,"base":base,"quote":quote})
-        if out:
-            save_market_cache(out); state["market_source"]="MEXC v2 symbols fallback"; return out
-    except Exception as e: logerr(f"v2 symbols fallback: {e}")
-    cached=load_market_cache()
-    if cached:
-        state["market_source"]="local market cache"; return cached
-    raise RuntimeError("Impossible de charger la liste des marchés MEXC et aucun cache local n'existe.")
+            mv=float(m24[sym].get("quoteVolume") or 0)
+            gv=float(g24[sym].get("quote_volume") or 0)
+            # 24h % changes; Gate change_percentage already percentage points.
+            mc=abs(float(m24[sym].get("priceChangePercent") or 0))
+            gc=abs(float(g24[sym].get("change_percentage") or 0))
+        except Exception:
+            continue
+        minv=min(mv,gv)
+        maxv=max(mv,gv)
+        if minv < MIN_QUOTE_VOL_24H and sym not in PINNED:
+            continue
+        volscore=(mc+gc)/2.0
+        # Prefer mid/low liquidity + movement. Don't hard-exclude high volume; softly penalize.
+        liquidity_penalty=max(1.0, math.log10(max(minv,10.0)))
+        high_penalty=1.0 if maxv<=MAX_QUOTE_VOL_24H else 1.8
+        score=(volscore+1.0)/(liquidity_penalty*high_penalty)
+        rows.append({
+            "pair":sym,"mexc_quote_vol":mv,"gate_quote_vol":gv,
+            "volatility_score":volscore,"selection_score":score,
+            "pinned": sym in PINNED
+        })
+    # Guaranteed pinned first, then highest inefficiency-potential score.
+    pinned=[r for r in rows if r["pinned"]]
+    others=sorted([r for r in rows if not r["pinned"]], key=lambda x:x["selection_score"], reverse=True)
+    selected=(pinned+others)[:MAX_PAIRS]
+    pairs=[r["pair"] for r in selected]
+    meta={r["pair"]:r for r in selected}
+    with state_lock:
+        state["pairs"]=pairs
+        state["universe_meta"]=meta
+    ts=now_ms()
+    put_db(("universe",[{**r,"ts_ms":ts} for r in selected]))
+    print(f"[V3] Universe: {len(pairs)} common USDT pairs")
+    return pairs
 
-# ---------- Route graph ----------
-def select_symbols_and_routes(markets):
-    # Deduplicate symbols.
-    bysym={m["symbol"]:m for m in markets if m["base"]!=m["quote"]}
-    markets=list(bysym.values())
-    stable_set=set(STABLES)
-    stable_markets=[m for m in markets if m["base"] in stable_set or m["quote"] in stable_set]
-    stable_assets=set()
-    stable_degree=defaultdict(int)
-    for m in stable_markets:
-        other=m["quote"] if m["base"] in stable_set else m["base"]
-        if other not in stable_set:
-            stable_assets.add(other); stable_degree[other]+=1
-    # Dynamically choose bridge assets by graph connectivity, not a hard-coded crypto list.
-    cross_degree=defaultdict(int)
-    for m in markets:
-        if m["base"] in stable_assets and m["quote"] in stable_assets:
-            cross_degree[m["base"]]+=1; cross_degree[m["quote"]]+=1
-    ranked=sorted(stable_assets,key=lambda a:(stable_degree[a],cross_degree[a]),reverse=True)
-    bridge=set(ranked[:MAX_BRIDGE_ASSETS])
-    cross=[m for m in markets if m["base"] in bridge and m["quote"] in bridge]
-    # Stable-linked markets are always first priority; cross markets fill remaining slots.
-    chosen=[]; seen=set()
-    cross.sort(key=lambda m: cross_degree[m["base"]]+cross_degree[m["quote"]], reverse=True)
-    for m in stable_markets+cross:
-        if m["symbol"] not in seen and len(chosen)<MAX_WS_SYMBOLS:
-            chosen.append(m); seen.add(m["symbol"])
-    # Build undirected conversion graph from selected symbols.
-    graph=defaultdict(list); meta={m["symbol"]:m for m in chosen}
-    for m in chosen:
-        graph[m["base"]].append((m["quote"],m["symbol"]))
-        graph[m["quote"]].append((m["base"],m["symbol"]))
-    routes=[]; route_ids=set()
-    # 2-leg: stable -> A -> different stable
-    for s1 in STABLES:
-        for a,sym1 in graph.get(s1,[]):
-            if a in stable_set: continue
-            for s2,sym2 in graph.get(a,[]):
-                if s2 in stable_set and s2!=s1 and sym2!=sym1:
-                    path=(s1,a,s2); rid=">".join(path)
-                    if rid not in route_ids:
-                        route_ids.add(rid); routes.append({"id":rid,"path":path,"symbols":tuple(dict.fromkeys((sym1,sym2))),"type":2})
-    # 3-leg: stable -> A -> B -> stable (A/B discovered dynamically)
-    for s1 in STABLES:
-        for a,sym1 in graph.get(s1,[]):
-            if a in stable_set: continue
-            for b,sym2 in graph.get(a,[]):
-                if b in stable_set or b==s1 or sym2==sym1: continue
-                for s2,sym3 in graph.get(b,[]):
-                    if s2 in stable_set and sym3 not in (sym1,sym2):
-                        path=(s1,a,b,s2); rid=">".join(path)
-                        if rid not in route_ids:
-                            route_ids.add(rid); routes.append({"id":rid,"path":path,"symbols":tuple(dict.fromkeys((sym1,sym2,sym3))),"type":3})
-    return chosen, routes, meta
-
-# ---------- protobuf BBO ----------
-def _pb_varint(data,pos):
+def _pb_varint(data, pos):
     value=0; shift=0
-    while pos<len(data):
-        b=data[pos]; pos+=1; value|=(b&0x7f)<<shift
-        if not (b&0x80): return value,pos
-        shift+=7
-    raise ValueError("truncated varint")
+    while pos < len(data):
+        b=data[pos]; pos+=1
+        value |= (b & 0x7f) << shift
+        if not (b & 0x80):
+            return value,pos
+        shift += 7
+        if shift > 70:
+            raise ValueError("protobuf varint too long")
+    raise ValueError("truncated protobuf varint")
 
 def _pb_fields(data):
+    """Minimal protobuf wire decoder; returns [(field_no, wire_type, value)]."""
     out=[]; pos=0
-    while pos<len(data):
-        key,pos=_pb_varint(data,pos); field=key>>3; wire=key&7
-        if wire==0: val,pos=_pb_varint(data,pos)
-        elif wire==1: val=data[pos:pos+8]; pos+=8
-        elif wire==2:
-            n,pos=_pb_varint(data,pos); val=data[pos:pos+n]; pos+=n
-        elif wire==5: val=data[pos:pos+4]; pos+=4
-        else: raise ValueError(f"wire {wire}")
+    while pos < len(data):
+        key,pos=_pb_varint(data,pos)
+        field=key >> 3; wire=key & 7
+        if wire == 0:
+            val,pos=_pb_varint(data,pos)
+        elif wire == 1:
+            val=data[pos:pos+8]; pos+=8
+        elif wire == 2:
+            n,pos=_pb_varint(data,pos)
+            val=data[pos:pos+n]; pos+=n
+        elif wire == 5:
+            val=data[pos:pos+4]; pos+=4
+        else:
+            raise ValueError(f"unsupported protobuf wire type {wire}")
         out.append((field,wire,val))
     return out
 
-def decode_bookticker(payload):
-    symbol=None; send=None; book=None
-    for f,w,v in _pb_fields(payload):
-        if f==3 and w==2: symbol=v.decode("utf-8","ignore")
-        elif f==6 and w==0: send=v
-        elif f==315 and w==2: book=v
-    if not symbol or book is None: return None
+def decode_mexc_bookticker(payload):
+    """
+    Decode the fields used from MEXC PushDataV3ApiWrapper:
+      symbol=3, sendTime=6, publicAggreBookTicker=315.
+    PublicAggreBookTicker fields: bidPrice=1, bidQuantity=2,
+    askPrice=3, askQuantity=4.
+    """
+    symbol=None; send_time=None; book=None
+    for field,wire,val in _pb_fields(payload):
+        if field == 3 and wire == 2:
+            symbol=val.decode("utf-8","ignore")
+        elif field == 6 and wire == 0:
+            send_time=val
+        elif field == 315 and wire == 2:
+            book=val
+    if not symbol or book is None:
+        return None
     vals={}
-    for f,w,v in _pb_fields(book):
-        if w==2 and f in (1,2,3,4): vals[f]=v.decode("utf-8","ignore")
-    if not all(k in vals for k in (1,2,3,4)): return None
-    return {"symbol":symbol,"bid":float(vals[1]),"bidq":float(vals[2]),"ask":float(vals[3]),"askq":float(vals[4]),"send":int(send or now_ms())}
+    for field,wire,val in _pb_fields(book):
+        if wire == 2 and field in (1,2,3,4):
+            vals[field]=val.decode("utf-8","ignore")
+    if not all(k in vals for k in (1,2,3,4)):
+        return None
+    return {
+        "symbol":symbol,
+        "bid":float(vals[1]), "bidq":float(vals[2]),
+        "ask":float(vals[3]), "askq":float(vals[4]),
+        "ts":int(send_time or now_ms())
+    }
 
-# ---------- Route math ----------
-def conversion_leg(from_asset,to_asset,symbol,amount,books,meta):
-    b=books.get(symbol); m=meta.get(symbol)
-    if not b or not m or now_ms()-b["ts"]>MAX_BBO_AGE_MS: return None
-    base,quote=m["base"],m["quote"]
-    if from_asset==base and to_asset==quote:
-        if amount>b["bidq"]+1e-12: return None
-        return amount*b["bid"]*(1.0-FEE)
-    if from_asset==quote and to_asset==base:
-        max_quote=b["ask"]*b["askq"]
-        if amount>max_quote+1e-9: return None
-        return (amount/b["ask"])*(1.0-FEE)
-    return None
-
-def stable_usdt_value(asset,books,meta):
-    if asset=="USDT": return 1.0
-    # executable mark to USDT using direct book if available
-    for sym,m in meta.items():
-        if {m["base"],m["quote"]}=={asset,"USDT"}:
-            b=books.get(sym)
-            if not b or now_ms()-b["ts"]>MAX_BBO_AGE_MS: break
-            if m["base"]==asset: return b["bid"]*(1.0-FEE)
-            return (1.0/b["ask"])*(1.0-FEE)
-    return 1.0  # fallback peg assumption, shown on dashboard
-
-def route_calc(route,books,meta):
-    # Net return is size-independent at top-of-book. We test the configured sizes to determine capacity.
-    start,end=route["path"][0],route["path"][-1]
-    sv=stable_usdt_value(start,books,meta); ev=stable_usdt_value(end,books,meta)
-    best=0.0; ratio=None
-    for usd in SIZES:
-        amount=usd/max(sv,1e-12); cur=amount; ok=True
-        for i,sym in enumerate(route["symbols"]):
-            cur=conversion_leg(route["path"][i],route["path"][i+1],sym,cur,books,meta)
-            if cur is None: ok=False; break
-        if ok:
-            best=usd; ratio=cur/amount
-    if best<=0 or ratio is None: return None
-    net=ratio*ev/sv-1.0
-    return {"net":net,"best_size":best,"profit":best*net,"out_ratio":ratio}
-
-# ---------- Event aggregation ----------
-def close_event(key,ev,end_ts=None):
-    end_ts=int(end_ts or ev["last_ts"])
-    avg=ev["sum_net"]/max(ev["ticks"],1)
-    payload=(ev["route_id"],ev["type"],ev["path"],ev["start_asset"],ev["end_asset"],
-             ev["start_ts"],end_ts,max(0,end_ts-ev["start_ts"]),ev["ticks"],ev["entry_net"],
-             ev["peak_net"],avg,ev["best_size"],ev["entry_profit"],ev["peak_profit"])
-    put_db(("event",payload))
-
-def process_route(route,ts):
-    with state_lock:
-        books=dict(state["bbo"]); meta=state["market_meta"]
-    x=route_calc(route,books,meta)
-    key=route["id"]
-    with event_lock:
-        ev=active_events.get(key)
-        if x and x["net"]>=MIN_NET:
-            if ev is None:
-                active_events[key]={
-                    "route_id":route["id"],"type":route["type"],"path":">".join(route["path"]),
-                    "start_asset":route["path"][0],"end_asset":route["path"][-1],"start_ts":ts,"last_ts":ts,
-                    "ticks":1,"entry_net":x["net"],"peak_net":x["net"],"sum_net":x["net"],
-                    "best_size":x["best_size"],"entry_profit":x["profit"],"peak_profit":x["profit"]}
-            else:
-                ev["last_ts"]=ts; ev["ticks"]+=1; ev["sum_net"]+=x["net"]
-                if x["net"]>ev["peak_net"]: ev["peak_net"]=x["net"]
-                if x["profit"]>ev["peak_profit"]: ev["peak_profit"]=x["profit"]
-                if x["best_size"]>ev["best_size"]: ev["best_size"]=x["best_size"]
-        elif ev is not None:
-            close_event(key,ev,ev["last_ts"]); active_events.pop(key,None)
-
-def event_sweeper():
-    while True:
-        time.sleep(.5); ts=now_ms()
-        with event_lock:
-            for key,ev in list(active_events.items()):
-                if ts-ev["last_ts"]>EVENT_CLOSE_GAP_MS:
-                    close_event(key,ev,ev["last_ts"]); active_events.pop(key,None)
-
-def enqueue_scan(symbol):
-    with queued_lock:
-        if symbol in queued_symbols: return
-        queued_symbols.add(symbol)
-    try: scanq.put_nowait(symbol)
-    except queue.Full:
-        with queued_lock: queued_symbols.discard(symbol)
-
-def scan_worker():
-    while True:
-        sym=scanq.get()
-        try:
-            with state_lock: routes=list(state["routes_by_symbol"].get(sym,()))[:MAX_ROUTES_PER_SYMBOL_SCAN]
-            ts=now_ms()
-            for r in routes: process_route(r,ts)
-            with state_lock: state["scan_updates"]+=1
-        except Exception as e: logerr(f"scan {sym}: {e}")
-        finally:
-            with queued_lock: queued_symbols.discard(sym)
-            scanq.task_done()
-
-# ---------- WS ----------
-def ws_worker(symbols,worker_id):
+def mexc_ws_worker(pairs, worker_id):
+    # MEXC allows at most 30 subscriptions per WebSocket connection.
     while True:
         opened=False
         try:
             def on_open(ws):
-                nonlocal opened; opened=True
-                with state_lock: state["ws_connected"]+=1
-                params=[f"spot@public.aggre.bookTicker.v3.api.pb@100ms@{s}" for s in symbols]
+                nonlocal opened
+                opened=True
+                with state_lock:
+                    state["mexc_ws_connected"] += 1
+                params=[
+                    f"spot@public.aggre.bookTicker.v3.api.pb@100ms@{sym}"
+                    for sym in pairs
+                ]
                 ws.send(json.dumps({"method":"SUBSCRIPTION","params":params}))
-                print(f"[Routes V{VERSION}] WS {worker_id}: {len(symbols)} symbols")
-            def on_message(ws,msg):
-                if isinstance(msg,str): return
+                print(f"[V3.2] MEXC WS {worker_id}: connected ({len(params)} pairs)")
+
+            def on_message(ws, message):
+                # Subscription/PONG responses are JSON text; market pushes are protobuf bytes.
+                if isinstance(message, str):
+                    return
                 try:
-                    x=decode_bookticker(msg)
-                    if not x: return
+                    x=decode_mexc_bookticker(message)
+                    if not x:
+                        return
                     ts=now_ms()
                     with state_lock:
-                        state["bbo"][x["symbol"]]={"bid":x["bid"],"bidq":x["bidq"],"ask":x["ask"],"askq":x["askq"],"ts":ts,"lat":max(0,ts-x["send"])}
-                        state["last_ws_ms"]=ts
-                    enqueue_scan(x["symbol"])
-                except Exception as e: logerr(f"decode WS {worker_id}: {e}")
-            def on_error(ws,e): logerr(f"WS {worker_id}: {e}")
-            def on_close(ws,code,msg):
+                        prev=state["last_mexc_ms"]
+                        state["mexc"][x["symbol"]]={
+                            "bid":x["bid"],"bidq":x["bidq"],
+                            "ask":x["ask"],"askq":x["askq"],"ts":ts
+                        }
+                        state["last_mexc_ms"]=ts
+                        state["mexc_cycle_ms"]=(ts-prev) if prev else None
+                        state["mexc_latency_ms"]=max(0, ts-x["ts"]) if x["ts"] else None
+                    scan_candidates(ts)
+                except Exception as e:
+                    err(f"MEXC WS decode {worker_id}: {e}")
+
+            def on_error(ws, error):
+                err(f"MEXC WS {worker_id}: {error}")
+
+            def on_close(ws, code, msg):
                 nonlocal opened
                 if opened:
-                    with state_lock: state["ws_connected"]=max(0,state["ws_connected"]-1)
+                    with state_lock:
+                        state["mexc_ws_connected"]=max(0,state["mexc_ws_connected"]-1)
                     opened=False
-            w=websocket.WebSocketApp(WS,on_open=on_open,on_message=on_message,on_error=on_error,on_close=on_close)
-            w.run_forever(ping_interval=20,ping_timeout=10)
-        except Exception as e: logerr(f"WS loop {worker_id}: {e}")
+                err(f"MEXC WS {worker_id} closed: {code} {msg}")
+
+            ws=websocket.WebSocketApp(
+                MEXC_WS,on_open=on_open,on_message=on_message,
+                on_error=on_error,on_close=on_close
+            )
+            # Protocol-level ping plus MEXC application PING via a small helper.
+            stop_ping=threading.Event()
+            def app_ping():
+                while not stop_ping.wait(20):
+                    try:
+                        if ws.sock and ws.sock.connected:
+                            ws.send(json.dumps({"method":"PING"}))
+                    except Exception:
+                        pass
+            threading.Thread(target=app_ping,daemon=True).start()
+            ws.run_forever(ping_interval=25,ping_timeout=10)
+            stop_ping.set()
+        except Exception as e:
+            err(f"MEXC WS worker {worker_id}: {e}")
         time.sleep(2)
 
-# ---------- Dashboard data ----------
-def db_connect():
-    con=sqlite3.connect(DB_PATH,timeout=10); con.row_factory=sqlite3.Row; return con
-
-def daily_rows():
-    start,end,label=local_day_bounds_ms(0); con=db_connect()
-    rows=con.execute("""SELECT route_id,route_type,path,start_asset,end_asset,COUNT(*) n,
-      AVG(avg_net) avg_net,MAX(peak_net) max_net,AVG(duration_ms) avg_dur,MAX(peak_profit) best_profit,
-      SUM(CASE WHEN best_size>=250 THEN 1 ELSE 0 END) s250,
-      SUM(CASE WHEN best_size>=500 THEN 1 ELSE 0 END) s500,
-      SUM(CASE WHEN best_size>=1000 THEN 1 ELSE 0 END) s1000,
-      SUM(CASE WHEN best_size>=2000 THEN 1 ELSE 0 END) s2000
-      FROM opportunities WHERE start_ts_ms>=? AND start_ts_ms<? GROUP BY route_id ORDER BY n DESC""",(start,end)).fetchall()
-    con.close(); d={r["route_id"]:dict(r) for r in rows}; out=[]; used=set()
-    for rid,r in d.items():
-        if rid in used: continue
-        rev=">".join(reversed(rid.split(">"))); rr=d.get(rev)
-        used.add(rid); used.add(rev)
-        a=r["n"]; b=rr["n"] if rr else 0
-        balance=(2*min(a,b)/(a+b)*100) if a+b else 0
-        # show the more active direction first
-        if rr and rr["n"]>r["n"]: r,rr=rr,r; a,b=b,a
-        out.append({**r,"inverse":rr["route_id"] if rr else rev,"n_inverse":b,"balance":balance})
-    out.sort(key=lambda x:x["n"]+x["n_inverse"],reverse=True)
-    return out,label
-
-def paper_simulation():
-    start,end,label=local_day_bounds_ms(0); con=db_connect()
-    rows=con.execute("""SELECT route_id,start_asset,end_asset,start_ts_ms,entry_net,best_size
-      FROM opportunities WHERE start_ts_ms>=? AND start_ts_ms<? ORDER BY start_ts_ms,id""",(start,end)).fetchall(); con.close()
-    if not STABLES: return {}
-    balances={s:SIM_CAPITAL/len(STABLES) for s in STABLES}; trades=0; skipped=0; gross_profit=0.0
-    for r in rows:
-        s,e=r["start_asset"],r["end_asset"]
-        if s not in balances or e not in balances: continue
-        amount=min(balances[s],float(r["best_size"] or 0))
-        if amount<SIM_MIN_TRADE: skipped+=1; continue
-        result=amount*(1.0+float(r["entry_net"]))
-        balances[s]-=amount; balances[e]+=result; gross_profit+=result-amount; trades+=1
-    nav=sum(balances.values()); ret=(nav/SIM_CAPITAL-1)*100 if SIM_CAPITAL else 0
-    return {"capital":SIM_CAPITAL,"nav":nav,"return_pct":ret,"profit":nav-SIM_CAPITAL,"trades":trades,"skipped":skipped,"balances":balances,"label":label}
-
-@app.get("/api/status")
-def api_status():
-    rows,label=daily_rows(); sim=paper_simulation(); now=now_ms()
+def start_mexc_ws():
     with state_lock:
-        age=now-state["last_ws_ms"] if state["last_ws_ms"] else None
-        base={"version":VERSION,"symbols":len(state["symbols"]),"routes":len(state["routes"]),"ws":state["ws_connected"],"ws_expected":state["ws_expected"],"age_ms":age,"market_source":state["market_source"],"errors":list(state["errors"]),"scan_updates":state["scan_updates"]}
-    base.update({"day":label,"rows":rows[:100],"sim":sim,"fee_pct":FEE*100,"stables":STABLES,"sizes":SIZES,"min_net_pct":MIN_NET*100})
-    return jsonify(base)
+        pairs=list(state["pairs"])
+    chunks=[pairs[i:i+30] for i in range(0,len(pairs),30)]
+    with state_lock:
+        state["mexc_ws_total"]=len(chunks)
+    for idx,chunk in enumerate(chunks,1):
+        threading.Thread(target=mexc_ws_worker,args=(chunk,idx),daemon=True).start()
 
-HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MEXC Spot Routes</title>
-<style>body{background:#090d14;color:#e8edf5;font-family:system-ui;margin:0;padding:16px}h2{font-size:18px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px;max-width:900px}.c,.panel{background:#111827;border:1px solid #273248;border-radius:10px;padding:12px}.v{font-weight:800;font-size:20px}.muted{color:#9aa7bd;font-size:12px}.good{color:#22d38a}.bad{color:#ff6677}.panel{margin-top:12px;overflow:auto}table{border-collapse:collapse;width:100%;font-size:12px;min-width:1050px}th,td{padding:8px;border-bottom:1px solid #263044;text-align:right}th:first-child,td:first-child{text-align:left}.route{font-weight:700}.pill{padding:2px 6px;border-radius:8px;background:#1c2940}.warn{color:#ffcc66}</style></head><body>
-<h2>MEXC — Scanner routes Spot V1.0</h2><div class="cards" id="cards"></div><div class="panel" id="sim"></div>
-<div class="panel"><h3>Opportunités — aujourd'hui (00:00 → maintenant, Europe/Paris)</h3><div class="muted">Compteurs fixes par journée : ils repartent visuellement à 0 à minuit. La base conserve tout l'historique.</div><table><thead><tr><th>Route dominante</th><th>Legs</th><th>Opp.</th><th>Inverse</th><th>Opp. inverse</th><th>Équilibre</th><th>Net moy.</th><th>Net max</th><th>Durée moy.</th><th>Meilleur profit</th><th>Capacité 250/500/1k/2k</th></tr></thead><tbody id="rows"></tbody></table></div>
-<div class="panel"><b>Modèle</b><div class="muted" id="model"></div></div>
-<script>function pct(x){return (100*x).toFixed(4)+'%'}; async function refresh(){let d=await fetch('/api/status').then(r=>r.json());
-let s=d.sim; document.getElementById('cards').innerHTML=`<div class=c><div class=v>${d.symbols}</div><div class=muted>marchés WS</div></div><div class=c><div class=v>${d.routes}</div><div class=muted>routes 2/3 legs</div></div><div class=c><div class=v>${d.ws}/${d.ws_expected}</div><div class=muted>WebSockets</div></div><div class=c><div class=v>${d.age_ms??'-'} ms</div><div class=muted>âge dernier BBO</div></div><div class=c><div class=v>${d.fee_pct.toFixed(3)}%</div><div class=muted>taker / leg</div></div>`;
-document.getElementById('sim').innerHTML=`<h3>Simulation rendement — journée fixe</h3><div class=cards><div><div class='v good'>${s.return_pct.toFixed(3)}%</div><div class=muted>rendement paper</div></div><div><div class=v>${s.nav.toFixed(2)} $</div><div class=muted>NAV sur ${s.capital.toFixed(0)} $ initiaux</div></div><div><div class=v>${s.profit.toFixed(2)} $</div><div class=muted>profit théorique</div></div><div><div class=v>${s.trades}</div><div class=muted>opportunités simulées</div></div></div><div class=muted>Capital initial réparti entre les stablecoins. Une route à sens unique déplace réellement le capital du stablecoin de départ vers celui d'arrivée : quand le bucket source est vide, la simulation cesse de prendre ces opportunités jusqu'à ce qu'un sens inverse le réalimente. Soldes: ${Object.entries(s.balances).map(([k,v])=>k+' '+v.toFixed(2)).join(' · ')}</div>`;
-let h=''; for(let r of d.rows){let n=r.n+r.n_inverse; h+=`<tr><td class=route>${r.route_id}</td><td>${r.route_type}</td><td>${r.n}</td><td>${r.inverse}</td><td>${r.n_inverse}</td><td>${r.balance.toFixed(1)}%</td><td class=good>${pct(r.avg_net)}</td><td class=good>${pct(r.max_net)}</td><td>${Math.round(r.avg_dur)} ms</td><td>${r.best_profit.toFixed(3)} $</td><td>${r.s250}/${r.s500}/${r.s1000}/${r.s2000}</td></tr>`} document.getElementById('rows').innerHTML=h;
-document.getElementById('model').innerHTML=`Spot uniquement. Frais conservateurs: ${d.fee_pct}% taker à chaque leg. Seuls bid/ask exécutables au top-of-book sont utilisés; si la quantité BBO ne suffit pas, la taille est rejetée. Tailles testées: ${d.sizes.join(' / ')} $. Stables: ${d.stables.join(', ')}. Seuil d'enregistrement: +${d.min_net_pct.toFixed(3)}% net. La simulation est indicative et n'est pas un backtest d'ordres réellement exécutés.`}
-refresh();setInterval(refresh,3000)</script></body></html>'''
+def gate_ws_loop():
+    while True:
+        try:
+            pairs=[]
+            with state_lock: pairs=list(state["pairs"])
+            def on_open(ws):
+                with state_lock: state["gate_connected"]=True
+                # Gate accepts multiple pairs in one payload.
+                ws.send(json.dumps({
+                    "time":int(time.time()),"channel":"spot.book_ticker","event":"subscribe",
+                    "payload":[p[:-4]+"_USDT" for p in pairs]
+                }))
+            def on_message(ws,msg):
+                try:
+                    j=json.loads(msg)
+                    if j.get("channel")!="spot.book_ticker" or j.get("event")!="update": return
+                    r=j["result"]; sym=r["s"].replace("_",""); ts=int(r.get("t") or now_ms())
+                    with state_lock:
+                        state["gate"][sym]={
+                            "bid":float(r["b"]),"bidq":float(r["B"]),
+                            "ask":float(r["a"]),"askq":float(r["A"]),"ts":ts
+                        }
+                        state["last_gate_ms"]=now_ms()
+                except Exception as e: err(f"Gate msg: {e}")
+            def on_error(ws,e): err(f"Gate WS: {e}")
+            def on_close(ws,a,b):
+                with state_lock: state["gate_connected"]=False
+            ws=websocket.WebSocketApp(GATE_WS,on_open=on_open,on_message=on_message,
+                                      on_error=on_error,on_close=on_close)
+            ws.run_forever(ping_interval=20,ping_timeout=10)
+        except Exception as e:
+            err(f"Gate loop: {e}")
+        with state_lock: state["gate_connected"]=False
+        time.sleep(1)
 
-@app.get("/")
-def index(): return render_template_string(HTML)
+def scan_candidates(ts):
+    with state_lock:
+        pairs=list(state["pairs"])
+        m=dict(state["mexc"]); g=dict(state["gate"])
+    for pair in pairs:
+        a=m.get(pair); b=g.get(pair)
+        if not a or not b or min(a["bid"],a["ask"],b["bid"],b["ask"])<=0: continue
+        # Ignore stale cross-CEX quote.
+        if ts-a["ts"]>1500 or ts-b["ts"]>1500: continue
+        gross_mg=b["bid"]/a["ask"]-1.0
+        gross_gm=a["bid"]/b["ask"]-1.0
+        with state_lock:
+            state["live"][pair]={
+                "pair":pair,"mexc_to_gate_gross":gross_mg,"gate_to_mexc_gross":gross_gm,
+                "mexc_ts":a["ts"],"gate_ts":b["ts"],"ts":ts
+            }
+        if gross_mg>=PREFILTER_GROSS:
+            schedule_verify(pair,"MEXC->GATE",ts)
+        if gross_gm>=PREFILTER_GROSS:
+            schedule_verify(pair,"GATE->MEXC",ts)
+    close_stale_events(ts)
 
+def schedule_verify(pair,direction,ts):
+    key=(pair,direction)
+    prev=last_verify.get(key,0)
+    if ts-prev<VERIFY_COOLDOWN_MS: return
+    last_verify[key]=ts
+    verify_pool.submit(verify_depth,pair,direction,ts)
 
-def bootstrap():
+def verify_depth(pair,direction,trigger_ts):
+    try:
+        gp=pair[:-4]+"_USDT"
+        # Fetch both books concurrently to reduce cross-exchange snapshot skew.
+        mf=depth_http_pool.submit(session.get,MEXC+"/api/v3/depth",params={"symbol":pair,"limit":100},timeout=2.5)
+        gf=depth_http_pool.submit(session.get,GATE+"/spot/order_book",params={"currency_pair":gp,"limit":100},timeout=2.5)
+        mr=mf.result(timeout=3.0); gr=gf.result(timeout=3.0)
+        mr.raise_for_status(); gr.raise_for_status()
+        mj,gj=mr.json(),gr.json()
+        mb={"bids":mj["bids"],"asks":mj["asks"]}
+        gb={"bids":gj["bids"],"asks":gj["asks"]}
+        ts=now_ms()
+        results=[]
+        for size in SIZES:
+            r=depth_result(pair,direction,size,mb,gb)
+            if r:
+                row={**r,"ts_ms":ts,"pair":pair,"direction":direction}
+                results.append(row); put_db(("check",row))
+        positives=[r for r in results if r["net"]>0]
+        with state_lock:
+            state["verify_queue"]=getattr(verify_pool,"_work_queue",queue.Queue()).qsize()
+            live=state["live"].setdefault(pair,{"pair":pair})
+            live[direction]={
+                "verified_ms":ts,
+                "results":results,
+                "positive":bool(positives)
+            }
+        update_event(pair,direction,ts,positives)
+    except Exception as e:
+        err(f"Verify {pair} {direction}: {e}")
+
+def update_event(pair,direction,ts,positives):
+    key=(pair,direction)
+    with event_lock:
+        ev=active_events.get(key)
+        if not positives:
+            if ev and ts-ev["last_positive_ms"]>=EVENT_CLOSE_GAP_MS:
+                finalize_event(key,ev)
+            return
+        # One event tick = the best executable size at this instant.
+        best=max(positives,key=lambda r:r["profit"])
+        if ev is None:
+            ev={
+                "pair":pair,"direction":direction,"start_ms":ts,"last_positive_ms":ts,
+                "ticks":0,"net_sum":0.0,"peak_net":-999.0,"peak_gross":-999.0,
+                "peak_profit":-1e99,"best_size":best["size"]
+            }
+            active_events[key]=ev
+        ev["last_positive_ms"]=ts
+        ev["ticks"]+=1
+        ev["net_sum"]+=best["net"]
+        if best["net"]>ev["peak_net"]: ev["peak_net"]=best["net"]
+        if best["gross"]>ev["peak_gross"]: ev["peak_gross"]=best["gross"]
+        if best["profit"]>ev["peak_profit"]:
+            ev["peak_profit"]=best["profit"]; ev["best_size"]=best["size"]
+
+def close_stale_events(ts):
+    with event_lock:
+        for key,ev in list(active_events.items()):
+            if ts-ev["last_positive_ms"]>=EVENT_CLOSE_GAP_MS:
+                finalize_event(key,ev)
+
+def finalize_event(key,ev):
+    active_events.pop(key,None)
+    end=ev["last_positive_ms"]
+    row={
+        "pair":ev["pair"],"direction":ev["direction"],
+        "start_ms":ev["start_ms"],"end_ms":end,
+        "duration_ms":max(0,end-ev["start_ms"]),
+        "ticks":ev["ticks"],"peak_net":ev["peak_net"],
+        "avg_net":ev["net_sum"]/max(1,ev["ticks"]),
+        "peak_gross":ev["peak_gross"],"peak_profit":ev["peak_profit"],
+        "best_size":ev["best_size"]
+    }
+    put_db(("event",row))
+
+def stats_24h():
+    cutoff=now_ms()-86400000
+    con=sqlite3.connect(DB_PATH,timeout=5)
+    con.row_factory=sqlite3.Row
+    rows=con.execute("""
+    SELECT pair,
+           COUNT(*) AS opportunities,
+           SUM(CASE WHEN direction='MEXC->GATE' THEN 1 ELSE 0 END) AS mexc_to_gate,
+           SUM(CASE WHEN direction='GATE->MEXC' THEN 1 ELSE 0 END) AS gate_to_mexc,
+           ROUND(AVG(peak_net)*100,4) AS avg_net_pct,
+           ROUND(MAX(peak_net)*100,4) AS max_net_pct,
+           ROUND(AVG(duration_ms),0) AS avg_duration_ms,
+           ROUND(MAX(peak_profit),4) AS max_profit_usdt,
+           ROUND(SUM(peak_profit),4) AS sum_peak_profit_usdt,
+           SUM(CASE WHEN best_size=250 THEN 1 ELSE 0 END) AS size_250,
+           SUM(CASE WHEN best_size=500 THEN 1 ELSE 0 END) AS size_500,
+           SUM(CASE WHEN best_size=1000 THEN 1 ELSE 0 END) AS size_1000,
+           SUM(CASE WHEN best_size=2000 THEN 1 ELSE 0 END) AS size_2000
+    FROM opportunities
+    WHERE start_ms>=?
+    GROUP BY pair
+    ORDER BY opportunities DESC, max_net_pct DESC
+    """,(cutoff,)).fetchall()
+    con.close()
+    out=[]
+    for row in rows:
+        r=dict(row)
+        a=int(r.get("mexc_to_gate") or 0); b=int(r.get("gate_to_mexc") or 0)
+        # 100% = perfectly balanced opportunity counts; 0% = entirely one-way.
+        r["balance_pct"]=round((2.0*min(a,b)/(a+b)*100.0),1) if a+b else 0.0
+        out.append(r)
+    return out
+
+HTML = r"""
+<!doctype html><html lang="fr"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="2">
+<title>MEXC ↔ Gate Scanner V3.4</title>
+<style>
+body{font-family:system-ui;background:#0b0e14;color:#e7eaf0;margin:0;padding:16px}
+.wrap{max-width:1280px;margin:auto}.top{display:flex;gap:12px;flex-wrap:wrap}
+.card{background:#131824;border:1px solid #253047;border-radius:12px;padding:12px;margin:8px 0}
+.kpi{min-width:150px}.green{color:#37d67a}.red{color:#ff6262}.muted{color:#9ba7bc}
+table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:8px;border-bottom:1px solid #222b3a;text-align:right}
+th:first-child,td:first-child{text-align:left}h1{font-size:20px;margin:0 0 8px}.badge{padding:2px 7px;border-radius:12px;background:#222b3a}
+</style></head><body><div class="wrap">
+<h1>MEXC ↔ Gate — Scanner V3.4</h1>
+<div class="top">
+ <div class="card kpi"><b>{{pairs}}</b><div class="muted">paires scannées</div></div>
+ <div class="card kpi"><b>{{mexc_age}} ms</b><div class="muted">âge MEXC</div></div>
+ <div class="card kpi"><b>{{gate_age}} ms</b><div class="muted">âge Gate</div></div>
+ <div class="card kpi"><b>{{mexc_ws}}</b><div class="muted">MEXC WS</div></div>
+ <div class="card kpi"><b>{{latency}} ms</b><div class="muted">latence MEXC</div></div>
+ <div class="card kpi"><b>{{opps}}</b><div class="muted">opportunités 24 h</div></div>
+</div>
+<div class="card"><b>Tailles :</b> 250 / 500 / 1 000 / 2 000 USDT ·
+<b>Frais :</b> MEXC 0,05 % (XRP 0 %) + Gate 0,10 % ·
+<span class="{{'green' if gate_connected else 'red'}}">Gate WS {{'connecté' if gate_connected else 'déconnecté'}}</span>
+</div>
+<div class="card"><h3>Classement des opportunités — 24 h</h3>
+<table><tr><th>Token</th><th>Opp. total</th><th>MEXC → Gate</th><th>Gate → MEXC</th><th>Équilibre</th><th>Net moyen</th><th>Net max</th><th>Durée moy.</th><th>Meilleur profit</th><th>Best size 250/500/1k/2k</th><th>Somme pics*</th></tr>
+{% for r in stats %}
+<tr><td><b>{{r.pair}}</b></td><td>{{r.opportunities}}</td><td>{{r.mexc_to_gate}}</td><td>{{r.gate_to_mexc}}</td>
+<td class="{{'green' if r.balance_pct>=70 else ''}}">{{r.balance_pct}}%</td><td class="green">{{r.avg_net_pct}}%</td>
+<td class="green">{{r.max_net_pct}}%</td><td>{{r.avg_duration_ms}} ms</td>
+<td>{{r.max_profit_usdt}} USDT</td><td>{{r.size_250}} / {{r.size_500}} / {{r.size_1000}} / {{r.size_2000}}</td><td>{{r.sum_peak_profit_usdt}} USDT</td></tr>{% endfor %}
+</table><div class="muted">* Somme des meilleurs profits théoriques par événement, pas un backtest d'inventaire.</div></div>
+<div class="card"><h3>Meilleurs spreads BBO actuels</h3>
+<table><tr><th>Token</th><th>MEXC → Gate brut</th><th>Gate → MEXC brut</th><th>Dernière mesure</th></tr>
+{% for r in live %}
+<tr><td>{{r.pair}}</td><td class="{{'green' if r.mg>0 else 'red'}}">{{r.mg}}%</td>
+<td class="{{'green' if r.gm>0 else 'red'}}">{{r.gm}}%</td><td>{{r.age}} ms</td></tr>{% endfor %}
+</table></div>
+</div></body></html>
+"""
+
+@app.route("/")
+def home():
+    ts=now_ms()
+    with state_lock:
+        pairs=len(state["pairs"]); lm=state["last_mexc_ms"]; lg=state["last_gate_ms"]
+        cycle=state["mexc_cycle_ms"]; latency=state["mexc_latency_ms"]; mwc=state["mexc_ws_connected"]; mwt=state["mexc_ws_total"]; gc=state["gate_connected"]
+        live0=list(state["live"].values())
+    stats=stats_24h()
+    live=[]
+    for x in live0:
+        if "mexc_to_gate_gross" not in x: continue
+        live.append({
+            "pair":x["pair"],"mg":round(x["mexc_to_gate_gross"]*100,4),
+            "gm":round(x["gate_to_mexc_gross"]*100,4),
+            "age":ts-x.get("ts",ts)
+        })
+    live=sorted(live,key=lambda x:max(x["mg"],x["gm"]),reverse=True)[:40]
+    return render_template_string(HTML,pairs=pairs,mexc_age=(ts-lm if lm else "-"),
+        gate_age=(ts-lg if lg else "-"),cycle=(cycle if cycle is not None else "-"),mexc_ws=f"{mwc}/{mwt}",latency=(latency if latency is not None else "-"),opps=sum(x["opportunities"] for x in stats),
+        gate_connected=gc,stats=stats,live=live)
+
+@app.route("/api/state")
+def api_state():
+    ts=now_ms()
+    with state_lock:
+        return jsonify({
+            "version":"3.4","pairs":state["pairs"],"pair_count":len(state["pairs"]),
+            "mexc_age_ms":ts-state["last_mexc_ms"] if state["last_mexc_ms"] else None,
+            "gate_age_ms":ts-state["last_gate_ms"] if state["last_gate_ms"] else None,
+            "mexc_cycle_ms":state["mexc_cycle_ms"],"mexc_latency_ms":state["mexc_latency_ms"],"mexc_ws_connected":state["mexc_ws_connected"],"mexc_ws_total":state["mexc_ws_total"],"gate_connected":state["gate_connected"],
+            "sizes":SIZES,"errors":list(state["errors"])
+        })
+
+@app.route("/api/opportunities")
+def api_opps():
+    return jsonify(stats_24h())
+
+@app.route("/api/universe")
+def api_universe():
+    with state_lock: return jsonify(list(state["universe_meta"].values()))
+
+def main():
     threading.Thread(target=db_writer,daemon=True).start()
-    markets=discover_markets(); chosen,routes,meta=select_symbols_and_routes(markets)
-    route_by_id={r["id"]:r for r in routes}; bysym=defaultdict(list)
-    for r in routes:
-        for s in r["symbols"]: bysym[s].append(r)
-    symbols=[m["symbol"] for m in chosen]
-    with state_lock:
-        state["symbols"]=symbols; state["routes"]=routes; state["route_by_id"]=route_by_id; state["routes_by_symbol"]=bysym; state["market_meta"]=meta
-    groups=[symbols[i:i+30] for i in range(0,len(symbols),30)]
-    with state_lock: state["ws_expected"]=len(groups)
-    print(f"[Routes V{VERSION}] market source={state['market_source']} selected={len(symbols)} routes={len(routes)} WS={len(groups)}")
-    put_db(("meta",("version",VERSION))); put_db(("meta",("market_source",state["market_source"])))
-    for i in range(4): threading.Thread(target=scan_worker,daemon=True).start()
-    threading.Thread(target=event_sweeper,daemon=True).start()
-    for i,g in enumerate(groups,1): threading.Thread(target=ws_worker,args=(g,i),daemon=True).start()
+
+    # V3.3: never block startup on MEXC REST. Reuse the last universe saved in SQLite.
+    pairs=load_cached_universe()
+    if not pairs:
+        # First-ever launch fallback only. Existing V3 installations should not enter here.
+        print("[V3.4] No cached universe found; trying live discovery once...")
+        while True:
+            try:
+                discover_universe(); break
+            except Exception as e:
+                err(f"Universe: {e}"); print("Universe error:",e); time.sleep(10)
+
+    threading.Thread(target=gate_ws_loop,daemon=True).start()
+    start_mexc_ws()
+    print(f"[V3.3] Dashboard http://0.0.0.0:{APP_PORT}")
+    app.run(host="0.0.0.0",port=APP_PORT,threaded=True,use_reloader=False)
 
 if __name__=="__main__":
-    bootstrap(); app.run(host=HOST,port=PORT,threaded=True,use_reloader=False)
+    main()
