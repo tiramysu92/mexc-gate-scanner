@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, render_template_string
 import websocket
 
-VERSION = "1.0"
+VERSION = "1.1"
 HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", "8081"))
 DB_PATH = os.getenv("DB_PATH", "mexc_routes.db")
@@ -16,7 +16,8 @@ TZ = ZoneInfo(TZ_NAME)
 
 FEE = float(os.getenv("TAKER_FEE", "0.0005"))  # 0.05% per leg
 STABLES = tuple(x.strip().upper() for x in os.getenv("STABLES", "USDT,USDC,USD1").split(",") if x.strip())
-SIZES = tuple(float(x) for x in os.getenv("SIZES", "250,500,1000,2000").split(","))
+MIN_EXEC_USD = float(os.getenv("MIN_EXEC_USD", "10"))
+MAX_EXEC_USD = float(os.getenv("MAX_EXEC_USD", "0"))  # 0 = no artificial cap; BBO liquidity decides
 MIN_NET = float(os.getenv("MIN_NET_PCT", "0.01")) / 100.0
 MAX_BBO_AGE_MS = int(os.getenv("MAX_BBO_AGE_MS", "1500"))
 EVENT_CLOSE_GAP_MS = int(os.getenv("EVENT_CLOSE_GAP_MS", "1000"))
@@ -276,20 +277,43 @@ def stable_usdt_value(asset,books,meta):
     return 1.0  # fallback peg assumption, shown on dashboard
 
 def route_calc(route,books,meta):
-    # Net return is size-independent at top-of-book. We test the configured sizes to determine capacity.
+    # At a single BBO level the conversion rate is linear. Instead of testing fixed
+    # tickets (250/500/1000/2000), calculate the exact maximum input that can pass
+    # through every leg at the currently displayed best bid/ask.
     start,end=route["path"][0],route["path"][-1]
     sv=stable_usdt_value(start,books,meta); ev=stable_usdt_value(end,books,meta)
-    best=0.0; ratio=None
-    for usd in SIZES:
-        amount=usd/max(sv,1e-12); cur=amount; ok=True
-        for i,sym in enumerate(route["symbols"]):
-            cur=conversion_leg(route["path"][i],route["path"][i+1],sym,cur,books,meta)
-            if cur is None: ok=False; break
-        if ok:
-            best=usd; ratio=cur/amount
-    if best<=0 or ratio is None: return None
-    net=ratio*ev/sv-1.0
-    return {"net":net,"best_size":best,"profit":best*net,"out_ratio":ratio}
+    if sv <= 0 or ev <= 0: return None
+
+    multiplier=1.0          # units of current asset produced per 1 unit of start asset
+    max_start=float("inf") # maximum start-asset units allowed by the bottleneck leg
+    ts=now_ms()
+
+    for i,sym in enumerate(route["symbols"]):
+        b=books.get(sym); m=meta.get(sym)
+        if not b or not m or ts-b["ts"]>MAX_BBO_AGE_MS: return None
+        frm,to=route["path"][i],route["path"][i+1]
+        base,quote=m["base"],m["quote"]
+
+        if frm==base and to==quote:
+            # Sell base into the best bid. bidq is the max input in base units.
+            cap_in=float(b["bidq"]); rate=float(b["bid"])*(1.0-FEE)
+        elif frm==quote and to==base:
+            # Buy base from the best ask. ask*askq is the max input in quote units.
+            cap_in=float(b["ask"])*float(b["askq"]); rate=(1.0/float(b["ask"]))*(1.0-FEE)
+        else:
+            return None
+
+        if cap_in <= 0 or rate <= 0 or multiplier <= 0: return None
+        max_start=min(max_start, cap_in/multiplier)
+        multiplier*=rate
+
+    if not math.isfinite(max_start) or max_start <= 0: return None
+    executable_usd=max_start*sv
+    if MAX_EXEC_USD > 0: executable_usd=min(executable_usd,MAX_EXEC_USD)
+    if executable_usd < MIN_EXEC_USD: return None
+
+    net=multiplier*ev/sv-1.0
+    return {"net":net,"best_size":executable_usd,"profit":executable_usd*net,"out_ratio":multiplier}
 
 # ---------- Event aggregation ----------
 def close_event(key,ev,end_ts=None):
@@ -392,10 +416,7 @@ def daily_rows():
     start,end,label=local_day_bounds_ms(0); con=db_connect()
     rows=con.execute("""SELECT route_id,route_type,path,start_asset,end_asset,COUNT(*) n,
       AVG(avg_net) avg_net,MAX(peak_net) max_net,AVG(duration_ms) avg_dur,MAX(peak_profit) best_profit,
-      SUM(CASE WHEN best_size>=250 THEN 1 ELSE 0 END) s250,
-      SUM(CASE WHEN best_size>=500 THEN 1 ELSE 0 END) s500,
-      SUM(CASE WHEN best_size>=1000 THEN 1 ELSE 0 END) s1000,
-      SUM(CASE WHEN best_size>=2000 THEN 1 ELSE 0 END) s2000
+      AVG(best_size) avg_size,MAX(best_size) max_size,MIN(best_size) min_size
       FROM opportunities WHERE start_ts_ms>=? AND start_ts_ms<? GROUP BY route_id ORDER BY n DESC""",(start,end)).fetchall()
     con.close(); d={r["route_id"]:dict(r) for r in rows}; out=[]; used=set()
     for rid,r in d.items():
@@ -432,19 +453,19 @@ def api_status():
     with state_lock:
         age=now-state["last_ws_ms"] if state["last_ws_ms"] else None
         base={"version":VERSION,"symbols":len(state["symbols"]),"routes":len(state["routes"]),"ws":state["ws_connected"],"ws_expected":state["ws_expected"],"age_ms":age,"market_source":state["market_source"],"errors":list(state["errors"]),"scan_updates":state["scan_updates"]}
-    base.update({"day":label,"rows":rows[:100],"sim":sim,"fee_pct":FEE*100,"stables":STABLES,"sizes":SIZES,"min_net_pct":MIN_NET*100})
+    base.update({"day":label,"rows":rows[:100],"sim":sim,"fee_pct":FEE*100,"stables":STABLES,"min_exec_usd":MIN_EXEC_USD,"max_exec_usd":MAX_EXEC_USD,"min_net_pct":MIN_NET*100})
     return jsonify(base)
 
 HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MEXC Spot Routes</title>
 <style>body{background:#090d14;color:#e8edf5;font-family:system-ui;margin:0;padding:16px}h2{font-size:18px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px;max-width:900px}.c,.panel{background:#111827;border:1px solid #273248;border-radius:10px;padding:12px}.v{font-weight:800;font-size:20px}.muted{color:#9aa7bd;font-size:12px}.good{color:#22d38a}.bad{color:#ff6677}.panel{margin-top:12px;overflow:auto}table{border-collapse:collapse;width:100%;font-size:12px;min-width:1050px}th,td{padding:8px;border-bottom:1px solid #263044;text-align:right}th:first-child,td:first-child{text-align:left}.route{font-weight:700}.pill{padding:2px 6px;border-radius:8px;background:#1c2940}.warn{color:#ffcc66}</style></head><body>
-<h2>MEXC — Scanner routes Spot V1.0</h2><div class="cards" id="cards"></div><div class="panel" id="sim"></div>
-<div class="panel"><h3>Opportunités — aujourd'hui (00:00 → maintenant, Europe/Paris)</h3><div class="muted">Compteurs fixes par journée : ils repartent visuellement à 0 à minuit. La base conserve tout l'historique.</div><table><thead><tr><th>Route dominante</th><th>Legs</th><th>Opp.</th><th>Inverse</th><th>Opp. inverse</th><th>Équilibre</th><th>Net moy.</th><th>Net max</th><th>Durée moy.</th><th>Meilleur profit</th><th>Capacité 250/500/1k/2k</th></tr></thead><tbody id="rows"></tbody></table></div>
+<h2>MEXC — Scanner routes Spot V1.1</h2><div class="cards" id="cards"></div><div class="panel" id="sim"></div>
+<div class="panel"><h3>Opportunités — aujourd'hui (00:00 → maintenant, Europe/Paris)</h3><div class="muted">Compteurs fixes par journée : ils repartent visuellement à 0 à minuit. La base conserve tout l'historique.</div><table><thead><tr><th>Route dominante</th><th>Legs</th><th>Opp.</th><th>Inverse</th><th>Opp. inverse</th><th>Équilibre</th><th>Net moy.</th><th>Net max</th><th>Durée moy.</th><th>Meilleur profit</th><th>Taille exéc. moy.</th><th>Taille exéc. max</th></tr></thead><tbody id="rows"></tbody></table></div>
 <div class="panel"><b>Modèle</b><div class="muted" id="model"></div></div>
 <script>function pct(x){return (100*x).toFixed(4)+'%'}; async function refresh(){let d=await fetch('/api/status').then(r=>r.json());
 let s=d.sim; document.getElementById('cards').innerHTML=`<div class=c><div class=v>${d.symbols}</div><div class=muted>marchés WS</div></div><div class=c><div class=v>${d.routes}</div><div class=muted>routes 2/3 legs</div></div><div class=c><div class=v>${d.ws}/${d.ws_expected}</div><div class=muted>WebSockets</div></div><div class=c><div class=v>${d.age_ms??'-'} ms</div><div class=muted>âge dernier BBO</div></div><div class=c><div class=v>${d.fee_pct.toFixed(3)}%</div><div class=muted>taker / leg</div></div>`;
 document.getElementById('sim').innerHTML=`<h3>Simulation rendement — journée fixe</h3><div class=cards><div><div class='v good'>${s.return_pct.toFixed(3)}%</div><div class=muted>rendement paper</div></div><div><div class=v>${s.nav.toFixed(2)} $</div><div class=muted>NAV sur ${s.capital.toFixed(0)} $ initiaux</div></div><div><div class=v>${s.profit.toFixed(2)} $</div><div class=muted>profit théorique</div></div><div><div class=v>${s.trades}</div><div class=muted>opportunités simulées</div></div></div><div class=muted>Capital initial réparti entre les stablecoins. Une route à sens unique déplace réellement le capital du stablecoin de départ vers celui d'arrivée : quand le bucket source est vide, la simulation cesse de prendre ces opportunités jusqu'à ce qu'un sens inverse le réalimente. Soldes: ${Object.entries(s.balances).map(([k,v])=>k+' '+v.toFixed(2)).join(' · ')}</div>`;
-let h=''; for(let r of d.rows){let n=r.n+r.n_inverse; h+=`<tr><td class=route>${r.route_id}</td><td>${r.route_type}</td><td>${r.n}</td><td>${r.inverse}</td><td>${r.n_inverse}</td><td>${r.balance.toFixed(1)}%</td><td class=good>${pct(r.avg_net)}</td><td class=good>${pct(r.max_net)}</td><td>${Math.round(r.avg_dur)} ms</td><td>${r.best_profit.toFixed(3)} $</td><td>${r.s250}/${r.s500}/${r.s1000}/${r.s2000}</td></tr>`} document.getElementById('rows').innerHTML=h;
-document.getElementById('model').innerHTML=`Spot uniquement. Frais conservateurs: ${d.fee_pct}% taker à chaque leg. Seuls bid/ask exécutables au top-of-book sont utilisés; si la quantité BBO ne suffit pas, la taille est rejetée. Tailles testées: ${d.sizes.join(' / ')} $. Stables: ${d.stables.join(', ')}. Seuil d'enregistrement: +${d.min_net_pct.toFixed(3)}% net. La simulation est indicative et n'est pas un backtest d'ordres réellement exécutés.`}
+let h=''; for(let r of d.rows){let n=r.n+r.n_inverse; h+=`<tr><td class=route>${r.route_id}</td><td>${r.route_type}</td><td>${r.n}</td><td>${r.inverse}</td><td>${r.n_inverse}</td><td>${r.balance.toFixed(1)}%</td><td class=good>${pct(r.avg_net)}</td><td class=good>${pct(r.max_net)}</td><td>${Math.round(r.avg_dur)} ms</td><td>${r.best_profit.toFixed(3)} $</td><td>${r.avg_size.toFixed(2)} $</td><td>${r.max_size.toFixed(2)} $</td></tr>`} document.getElementById('rows').innerHTML=h;
+document.getElementById('model').innerHTML=`Spot uniquement. Frais conservateurs: ${d.fee_pct}% taker à chaque leg. Le scanner calcule dynamiquement la taille maximale exécutable au BBO à travers tous les legs: le leg le moins liquide fixe le montant du trade. Il peut donc retenir 17 $, 50 $, 150 $, etc., sans paliers fixes. Minimum enregistré: ${d.min_exec_usd.toFixed(0)} $. ${d.max_exec_usd>0?'Plafond: '+d.max_exec_usd.toFixed(0)+' $.':'Aucun plafond artificiel.'} Stables: ${d.stables.join(', ')}. Seuil d'enregistrement: +${d.min_net_pct.toFixed(3)}% net. La simulation utilise le moindre de la taille exécutable et du solde stablecoin disponible.`}
 refresh();setInterval(refresh,3000)</script></body></html>'''
 
 @app.get("/")

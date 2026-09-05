@@ -1,4 +1,4 @@
-# MEXC Spot Routes Scanner V1.0
+# MEXC Spot Routes Scanner V1.1.1
 
 Scanner d'observation **spot uniquement** pour MEXC. Il tourne indépendamment du scanner MEXC↔Gate V3.4, par défaut sur le port **8081**, et écrit dans `mexc_routes.db`.
 
@@ -56,10 +56,19 @@ MAX_BRIDGE_ASSETS=80
 
 Le scanner tente d'abord `/api/v3/exchangeInfo`. Si le WAF MEXC renvoie 403, il tente l'ancien endpoint public MEXC v2 pour récupérer la liste des symboles. Une liste réussie est mise en cache dans `mexc_markets_cache.json` pour les démarrages suivants.
 
-## Limites V1
+## Limites V1.1
 
 - observation seulement, aucune clé API et aucun ordre ;
 - BBO/top-of-book uniquement : une taille est rejetée si le meilleur niveau n'a pas assez de quantité ;
 - le rendement paper est une simulation, pas un rendement réalisable garanti ;
 - le risque d'exécution séquentielle (leg 1 exécuté mais leg 2/3 dégradé) devra être modélisé avant tout bot live ;
 - les stablecoins sont valorisés contre USDT lorsqu'une paire directe suivie existe, sinon le scanner utilise temporairement l'hypothèse de parité 1:1.
+
+
+## V1.1 — taille dynamique
+- Suppression des paliers fixes 250/500/1000/2000 pour la détection.
+- Le scanner calcule la **taille maximale réellement exécutable au BBO** à travers tous les legs.
+- Le leg le moins liquide devient le goulot d’étranglement; une opportunité peut donc porter sur 17, 50, 150 USDT, etc.
+- `MIN_EXEC_USD` vaut 10 USDT par défaut. `MAX_EXEC_USD=0` signifie aucun plafond artificiel.
+- Le paper trading utilise `min(solde stablecoin disponible, taille exécutable)`.
+- Le dashboard affiche la taille exécutable moyenne et maximale observée par route.
