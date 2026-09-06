@@ -1,74 +1,63 @@
-# MEXC Spot Routes Scanner V1.1.1
+# MEXC Spot Routes Scanner V2.0
 
-Scanner d'observation **spot uniquement** pour MEXC. Il tourne indépendamment du scanner MEXC↔Gate V3.4, par défaut sur le port **8081**, et écrit dans `mexc_routes.db`.
+Scanner d'observation **spot uniquement** pour routes MEXC 2-leg et 3-leg, avec simulation paper réaliste sur journée fixe Europe/Paris.
 
-## Ce qu'il scanne
+## Changements majeurs vs V1.1
 
-- routes 2 legs : `stable 1 -> crypto A -> stable 2` ;
-- routes 3 legs : `stable 1 -> crypto A -> crypto B -> stable 2` ;
-- les sens inverses sont construits automatiquement quand les marchés existent ;
-- stables par défaut : USDT, USDC, USD1 ;
-- tailles : 250 / 500 / 1000 / 2000 USD-equivalent ;
-- frais conservateurs : 0,05 % taker **par leg** ;
-- prix utilisés : meilleur bid/ask WebSocket MEXC, avec contrôle de la quantité disponible au top-of-book.
+- **Correction des 74 routes** : la V1.1 sélectionnait d'abord jusqu'à 600 marchés liés aux stablecoins puis ajoutait les marchés A/B seulement s'il restait de la place. Le quota était donc presque entièrement consommé avant les cross-pairs nécessaires aux routes `stable → A → B → stable`. V2 construit d'abord **toutes les routes candidates** à partir du graphe complet MEXC, puis choisit des **routes complètes** sous le budget de 600 symboles. Le dashboard affiche candidats/sélectionnés 2-leg et 3-leg pour auditer le résultat.
+- **Taille dynamique** : montant maximal exécutable au meilleur bid/ask sur tous les legs, minimum 10 USD, pas de paliers fixes.
+- **Frais** : 0,05 % taker par leg par défaut.
+- **Journée fixe** : compteurs 00:00 → maintenant, Europe/Paris. La base garde l'historique.
+- **Durée / flashs** : les opportunités 0 ms/1 tick sont enregistrées mais ne sont **pas créditées** à la simulation.
+- **Simulation d'exécution** : une opportunité doit survivre au moins 100 ms et 2 ticks (configurable) avant d'être paper-tradée.
+- **Rééquilibrage intelligent** : stablecoin→stablecoin via carnet réel, seulement si le coût est financé par les profits déjà réalisés depuis le dernier rééquilibrage et si l'opportunité actuelle justifie économiquement ce coût.
+- **Profit-bank** : après un rééquilibrage, le compteur de profit disponible pour financer le prochain repart à zéro.
+- **Marks stablecoin corrigés** : USDC/USD1 sont valorisés au mid contre USDT **sans frais fictifs**. Les frais ne sont appliqués qu'aux vrais trades.
+- **Données de recherche** : snapshots des meilleures routes proches du seuil et quotes stablecoin périodiques, pour permettre de meilleurs backtests ultérieurs.
 
-La liste des cryptos n'est pas figée. Le scanner découvre les marchés MEXC, garde tous les marchés reliés aux stablecoins, puis choisit dynamiquement les actifs les plus connectés pour les routes 3 legs. La limite de symboles WebSocket est configurable.
+## Base
 
-## Journée fixe
+Par défaut : `mexc_routes_v2.db` (séparée de V1.1 pour conserver une baseline propre).
 
-Le dashboard compte les opportunités de **00:00 à maintenant en Europe/Paris**. À minuit les compteurs du dashboard repartent à zéro, mais la base SQLite n'est jamais effacée.
+Tables principales :
+- `opportunities`
+- `paper_trades`
+- `paper_rebalances`
+- `paper_state`
+- `route_snapshots`
+- `stable_quotes`
+- `meta`
 
-## Simulation 24 h / journée fixe
+## Variables utiles
 
-Le dashboard rejoue les opportunités de la journée avec un capital paper par défaut de 2 000 $ réparti entre les stablecoins. Une route `USDT -> A -> USDC` débite le bucket USDT et crédite le bucket USDC. Si les opportunités ne viennent que dans ce sens, l'USDT finit par manquer et la simulation arrête naturellement de prendre ces trades. Un sens inverse ultérieur reconstitue le bucket USDT.
+- `PORT=8081`
+- `TAKER_FEE=0.0005`
+- `STABLES=USDT,USDC,USD1`
+- `MIN_EXEC_USD=10`
+- `MAX_WS_SYMBOLS=600`
+- `SIM_CAPITAL=2000`
+- `SIM_EXEC_LATENCY_MS=100`
+- `SIM_MIN_CONFIRM_TICKS=2`
+- `REBALANCE_MAX_PROFIT_SHARE=0.80`
+- `REBALANCE_EDGE_MULT=1.25`
 
-Cette simulation évite donc l'hypothèse irréaliste d'un capital infini dans chaque stablecoin. Elle reste indicative : aucune exécution réelle, latence d'ordre, rejet d'ordre ou variation entre les legs n'est simulée.
-
-## Installation
-
-Dans un nouveau dossier sur le VPS :
+## Lancement
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
 pip install -r requirements.txt
 python app.py
 ```
 
-Dashboard : `http://IP_DU_VPS:8081`
+Dashboard : `http://<IP_VPS>:8081`
 
-Le scanner MEXC↔Gate peut continuer à tourner sur le port 8080.
+## Interprétation du rendement journalier
 
-## Variables utiles
+Le rendement principal du dashboard n'est plus une somme théorique des spreads. Il reflète le **paper wallet** :
+- soldes réellement disponibles par stablecoin ;
+- opportunités confirmées seulement après la latence configurée ;
+- tailles BBO réellement disponibles ;
+- frais taker par leg ;
+- rééquilibrages et leur coût ;
+- impossibilité de rééquilibrer si le profit passé ne finance pas le coût.
 
-```bash
-PORT=8081
-TAKER_FEE=0.0005
-STABLES=USDT,USDC,USD1
-SIZES=250,500,1000,2000
-SIM_CAPITAL=2000
-MIN_NET_PCT=0.01
-MAX_WS_SYMBOLS=600
-MAX_BRIDGE_ASSETS=80
-```
-
-## Découverte des marchés et WAF
-
-Le scanner tente d'abord `/api/v3/exchangeInfo`. Si le WAF MEXC renvoie 403, il tente l'ancien endpoint public MEXC v2 pour récupérer la liste des symboles. Une liste réussie est mise en cache dans `mexc_markets_cache.json` pour les démarrages suivants.
-
-## Limites V1.1
-
-- observation seulement, aucune clé API et aucun ordre ;
-- BBO/top-of-book uniquement : une taille est rejetée si le meilleur niveau n'a pas assez de quantité ;
-- le rendement paper est une simulation, pas un rendement réalisable garanti ;
-- le risque d'exécution séquentielle (leg 1 exécuté mais leg 2/3 dégradé) devra être modélisé avant tout bot live ;
-- les stablecoins sont valorisés contre USDT lorsqu'une paire directe suivie existe, sinon le scanner utilise temporairement l'hypothèse de parité 1:1.
-
-
-## V1.1 — taille dynamique
-- Suppression des paliers fixes 250/500/1000/2000 pour la détection.
-- Le scanner calcule la **taille maximale réellement exécutable au BBO** à travers tous les legs.
-- Le leg le moins liquide devient le goulot d’étranglement; une opportunité peut donc porter sur 17, 50, 150 USDT, etc.
-- `MIN_EXEC_USD` vaut 10 USDT par défaut. `MAX_EXEC_USD=0` signifie aucun plafond artificiel.
-- Le paper trading utilise `min(solde stablecoin disponible, taille exécutable)`.
-- Le dashboard affiche la taille exécutable moyenne et maximale observée par route.
+Cela reste une simulation : un vrai bot aura encore du risque de latence, de fill partiel et de changement du carnet entre les legs.
