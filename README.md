@@ -1,63 +1,38 @@
-# MEXC Spot Routes Scanner V2.0
+# MEXC Spot 2-leg Scanner V2.1
 
-Scanner d'observation **spot uniquement** pour routes MEXC 2-leg et 3-leg, avec simulation paper réaliste sur journée fixe Europe/Paris.
+V2.1 is deliberately **2-leg only**. 3-leg candidates are counted for diagnostics but are not subscribed or scanned; a separate 3-leg scanner can be built later.
 
-## Changements majeurs vs V1.1
+## What changed from V2.0
 
-- **Correction des 74 routes** : la V1.1 sélectionnait d'abord jusqu'à 600 marchés liés aux stablecoins puis ajoutait les marchés A/B seulement s'il restait de la place. Le quota était donc presque entièrement consommé avant les cross-pairs nécessaires aux routes `stable → A → B → stable`. V2 construit d'abord **toutes les routes candidates** à partir du graphe complet MEXC, puis choisit des **routes complètes** sous le budget de 600 symboles. Le dashboard affiche candidats/sélectionnés 2-leg et 3-leg pour auditer le résultat.
-- **Taille dynamique** : montant maximal exécutable au meilleur bid/ask sur tous les legs, minimum 10 USD, pas de paliers fixes.
-- **Frais** : 0,05 % taker par leg par défaut.
-- **Journée fixe** : compteurs 00:00 → maintenant, Europe/Paris. La base garde l'historique.
-- **Durée / flashs** : les opportunités 0 ms/1 tick sont enregistrées mais ne sont **pas créditées** à la simulation.
-- **Simulation d'exécution** : une opportunité doit survivre au moins 100 ms et 2 ticks (configurable) avant d'être paper-tradée.
-- **Rééquilibrage intelligent** : stablecoin→stablecoin via carnet réel, seulement si le coût est financé par les profits déjà réalisés depuis le dernier rééquilibrage et si l'opportunité actuelle justifie économiquement ce coût.
-- **Profit-bank** : après un rééquilibrage, le compteur de profit disponible pour financer le prochain repart à zéro.
-- **Marks stablecoin corrigés** : USDC/USD1 sont valorisés au mid contre USDT **sans frais fictifs**. Les frais ne sont appliqués qu'aux vrais trades.
-- **Données de recherche** : snapshots des meilleures routes proches du seuil et quotes stablecoin périodiques, pour permettre de meilleurs backtests ultérieurs.
+- Immediate decision at **T0** when a 2-leg opportunity crosses the configured net threshold. There is no artificial 100 ms confirmation wait.
+- Every T0 decision is followed in parallel at **+25 / +50 / +100 / +150 / +200 ms**.
+- Research cohorts are split by maximum BBO age at T0: **50 / 100 / 150 / 200 / 250 / 300 ms**.
+- Once a decision exists, the delayed observation is recorded **positive or negative**. A trade is never removed retrospectively because the opportunity disappeared.
+- Per trial the DB stores T0 net/size/BBO age/BBO skew and delayed net/size/BBO age/BBO skew/PnL.
+- Dashboard exposes a daily matrix (00:00 -> now Europe/Paris) and highlights the default research scenario BBO <=200 ms / +100 ms execution.
+- New DB: `mexc_routes_v21.db`; V2.0 data remains untouched.
 
-## Base
+## Important interpretation
 
-Par défaut : `mexc_routes_v2.db` (séparée de V1.1 pour conserver une baseline propre).
+The execution matrix is intentionally a **market-execution research PnL**, before the capital/rebalancing portfolio model. This avoids hiding latency losses behind the old V2 rebalance engine. The intelligent pre-trade rebalance rule will be backtested from these richer execution records and then applied to the portfolio simulator once its threshold is calibrated.
 
-Tables principales :
-- `opportunities`
-- `paper_trades`
-- `paper_rebalances`
-- `paper_state`
-- `route_snapshots`
-- `stable_quotes`
-- `meta`
+This scanner still uses top-of-book only. If the executable quantity available at the delayed observation is smaller than at T0, the trial uses the smaller BBO quantity. Full multi-level order-book slippage is not yet simulated.
 
-## Variables utiles
+## Defaults
 
-- `PORT=8081`
-- `TAKER_FEE=0.0005`
-- `STABLES=USDT,USDC,USD1`
-- `MIN_EXEC_USD=10`
-- `MAX_WS_SYMBOLS=600`
-- `SIM_CAPITAL=2000`
-- `SIM_EXEC_LATENCY_MS=100`
-- `SIM_MIN_CONFIRM_TICKS=2`
-- `REBALANCE_MAX_PROFIT_SHARE=0.80`
-- `REBALANCE_EDGE_MULT=1.25`
+- Spot only
+- 0.05% taker fee per leg
+- Min detected net: +0.01%
+- Min BBO executable size: $10
+- Stablecoins: USDT, USDC, USD1
+- 600 WebSocket symbols maximum
+- Decision cooldown per route: 250 ms
+- Delayed BBO observation accepted up to 1500 ms only to avoid fabricating a price when data is missing; such unresolved cases are explicitly counted rather than silently discarded.
 
-## Lancement
+## Run
 
 ```bash
-pip install -r requirements.txt
-python app.py
+nohup python mexc-spot-routes/app.py > routes_v21_live.log 2>&1 &
 ```
 
-Dashboard : `http://<IP_VPS>:8081`
-
-## Interprétation du rendement journalier
-
-Le rendement principal du dashboard n'est plus une somme théorique des spreads. Il reflète le **paper wallet** :
-- soldes réellement disponibles par stablecoin ;
-- opportunités confirmées seulement après la latence configurée ;
-- tailles BBO réellement disponibles ;
-- frais taker par leg ;
-- rééquilibrages et leur coût ;
-- impossibilité de rééquilibrer si le profit passé ne finance pas le coût.
-
-Cela reste une simulation : un vrai bot aura encore du risque de latence, de fill partiel et de changement du carnet entre les legs.
+Dashboard: port 8081.

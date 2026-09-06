@@ -6,10 +6,10 @@ from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, render_template_string
 import websocket
 
-VERSION = "2.0"
+VERSION = "2.1"
 HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", "8081"))
-DB_PATH = os.getenv("DB_PATH", "mexc_routes_v2.db")
+DB_PATH = os.getenv("DB_PATH", "mexc_routes_v21.db")
 MARKET_CACHE = os.getenv("MARKET_CACHE", "mexc_markets_cache.json")
 TZ_NAME = os.getenv("TZ_NAME", "Europe/Paris")
 TZ = ZoneInfo(TZ_NAME)
@@ -28,8 +28,14 @@ MAX_ROUTES_PER_SYMBOL_SCAN = int(os.getenv("MAX_ROUTES_PER_SYMBOL_SCAN", "10000"
 # Realistic paper-execution model
 SIM_CAPITAL = float(os.getenv("SIM_CAPITAL", "2000"))
 SIM_MIN_TRADE_USD = float(os.getenv("SIM_MIN_TRADE_USD", "10"))
-SIM_EXEC_LATENCY_MS = int(os.getenv("SIM_EXEC_LATENCY_MS", "100"))
-SIM_MIN_CONFIRM_TICKS = int(os.getenv("SIM_MIN_CONFIRM_TICKS", "2"))
+# V2.1: no artificial confirmation wait. Decision is immediate at T0.
+# Primary paper portfolio: BBO age <= 200 ms, execution observed 100 ms later.
+PRIMARY_BBO_AGE_MS = int(os.getenv("PRIMARY_BBO_AGE_MS", "200"))
+PRIMARY_EXEC_LATENCY_MS = int(os.getenv("PRIMARY_EXEC_LATENCY_MS", "100"))
+RESEARCH_BBO_AGES_MS = tuple(int(x) for x in os.getenv("RESEARCH_BBO_AGES_MS", "50,100,150,200,250,300").split(","))
+RESEARCH_LATENCIES_MS = tuple(int(x) for x in os.getenv("RESEARCH_LATENCIES_MS", "25,50,100,150,200").split(","))
+EXEC_OBSERVE_MAX_AGE_MS = int(os.getenv("EXEC_OBSERVE_MAX_AGE_MS", "1500"))
+REBALANCE_COVER_MULT = float(os.getenv("REBALANCE_COVER_MULT", "1.50"))
 SIM_DONOR_RESERVE_PCT = float(os.getenv("SIM_DONOR_RESERVE_PCT", "0.10"))
 REBALANCE_MAX_PROFIT_SHARE = float(os.getenv("REBALANCE_MAX_PROFIT_SHARE", "0.80"))
 REBALANCE_EDGE_MULT = float(os.getenv("REBALANCE_EDGE_MULT", "1.25"))
@@ -177,6 +183,16 @@ def db_writer():
       mark_to_usdt REAL NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_stable_ts ON stable_quotes(ts_ms);
+
+    CREATE TABLE IF NOT EXISTS execution_trials(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, day TEXT NOT NULL, decision_id TEXT NOT NULL, route_id TEXT NOT NULL,
+      decision_ts_ms INTEGER NOT NULL, exec_ts_ms INTEGER NOT NULL, bbo_age_limit_ms INTEGER NOT NULL, latency_ms INTEGER NOT NULL,
+      decision_net REAL NOT NULL, decision_size_usd REAL NOT NULL, decision_max_bbo_age_ms INTEGER NOT NULL, decision_bbo_skew_ms INTEGER NOT NULL,
+      exec_net REAL, exec_size_usd REAL, exec_max_bbo_age_ms INTEGER, exec_bbo_skew_ms INTEGER,
+      pnl_usd REAL, status TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_trials_day ON execution_trials(day,decision_ts_ms);
+    CREATE INDEX IF NOT EXISTS idx_trials_matrix ON execution_trials(day,bbo_age_limit_ms,latency_ms);
     """)
     con.commit()
     while True:
@@ -205,6 +221,10 @@ def db_writer():
                 con.executemany("INSERT INTO route_snapshots(ts_ms,route_id,route_type,net,executable_usd,max_bbo_age_ms) VALUES(?,?,?,?,?,?)", payload)
             elif typ == "stable_many":
                 con.executemany("INSERT INTO stable_quotes(ts_ms,from_asset,to_asset,rate_after_fee,max_input_units,mark_from_usdt,mark_to_usdt) VALUES(?,?,?,?,?,?,?)", payload)
+            elif typ == "trial":
+                con.execute("""INSERT INTO execution_trials(day,decision_id,route_id,decision_ts_ms,exec_ts_ms,bbo_age_limit_ms,latency_ms,
+                    decision_net,decision_size_usd,decision_max_bbo_age_ms,decision_bbo_skew_ms,exec_net,exec_size_usd,exec_max_bbo_age_ms,
+                    exec_bbo_skew_ms,pnl_usd,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", payload)
             con.commit()
         except Exception as e:
             logerr(f"DB: {e}")
@@ -315,61 +335,23 @@ def select_routes_under_symbol_budget(markets):
     candidates,bysym,graph=build_all_candidate_routes(markets)
     r2=[r for r in candidates if r["type"]==2]
     r3=[r for r in candidates if r["type"]==3]
-
-    selected=[]; selected_ids=set(); symbols=set()
-
-    # Always include direct stable/stable markets if available: needed for marks and intelligent rebalancing.
-    direct_stable=[]
-    for m in bysym.values():
-        if m["base"] in STABLES and m["quote"] in STABLES:
-            direct_stable.append(m["symbol"])
-    for s in direct_stable:
-        if len(symbols)<MAX_WS_SYMBOLS: symbols.add(s)
-
-    # V1.1's bug was market-first selection. V2 selects complete ROUTES.
-    # First preserve every 2-leg route that fits. They are cheap (normally 2 symbols) and directly useful.
-    # Prefer routes reusing already selected symbols.
+    # V2.1 is deliberately 2-leg only. 3-leg candidates are counted for diagnostics
+    # but never subscribed/scanned; they will live in a separate scanner later.
+    selected=[]; symbols=set()
+    direct_stable=[m["symbol"] for m in bysym.values() if m["base"] in STABLES and m["quote"] in STABLES]
+    symbols.update(direct_stable[:MAX_WS_SYMBOLS])
     remaining=list(r2)
     while remaining:
         remaining.sort(key=lambda r:(len(set(r["symbols"])-symbols), r["id"]))
-        r=remaining.pop(0)
-        new=set(r["symbols"])-symbols
+        r=remaining.pop(0); new=set(r["symbols"])-symbols
         if len(symbols)+len(new)>MAX_WS_SYMBOLS: continue
-        selected.append(r); selected_ids.add(r["id"]); symbols.update(r["symbols"])
-
-    # Then add 3-leg routes. Score once by graph reuse/connectivity so startup remains fast
-    # even if the full MEXC graph produces tens of thousands of candidates.
-    freq=defaultdict(int)
-    for r in r3:
-        for s in r["symbols"]: freq[s]+=1
-    remaining=[r for r in r3 if r["id"] not in selected_ids]
-    remaining.sort(key=lambda r:(
-        sum(1 for s in r["symbols"] if s in symbols),
-        1 if r["path"][0]==r["path"][-1] else 0,
-        sum(freq[s] for s in r["symbols"])
-    ), reverse=True)
-    for r in remaining:
-        if len(symbols)>=MAX_WS_SYMBOLS: break
-        new=set(r["symbols"])-symbols
-        if len(symbols)+len(new)>MAX_WS_SYMBOLS: continue
-        selected.append(r); selected_ids.add(r["id"]); symbols.update(r["symbols"])
-
-    chosen=[bysym[s] for s in symbols if s in bysym]
-    selected2=sum(1 for r in selected if r["type"]==2)
-    selected3=sum(1 for r in selected if r["type"]==3)
-    diag={
-        "all_markets":len(bysym),
-        "candidate_routes":len(candidates),
-        "candidate_2leg":len(r2),
-        "candidate_3leg":len(r3),
-        "selected_symbols":len(chosen),
-        "selected_routes":len(selected),
-        "selected_2leg":selected2,
-        "selected_3leg":selected3,
-        "dropped_routes":len(candidates)-len(selected),
-        "direct_stable_symbols":len(direct_stable),
-    }
-    return chosen, selected, bysym, diag
+        selected.append(r); symbols.update(r["symbols"])
+    chosen=[bysym[x] for x in symbols if x in bysym]
+    diag={"all_markets":len(bysym),"candidate_routes":len(candidates),"candidate_2leg":len(r2),
+          "candidate_3leg":len(r3),"selected_symbols":len(chosen),"selected_routes":len(selected),
+          "selected_2leg":len(selected),"selected_3leg":0,"dropped_routes":len(candidates)-len(selected),
+          "direct_stable_symbols":len(direct_stable),"mode":"2-leg only"}
+    return chosen,selected,bysym,diag
 
 # ---------- protobuf BBO ----------
 def _pb_varint(data,pos):
@@ -423,18 +405,19 @@ def stable_mark_usdt(asset,books,meta):
             return mid if m["base"]==asset else 1.0/mid
     return 1.0
 
-def route_calc(route,books,meta):
+def route_calc(route,books,meta, age_limit_ms=None):
     start,end=route["path"][0],route["path"][-1]
     sv=stable_mark_usdt(start,books,meta); ev=stable_mark_usdt(end,books,meta)
     if sv<=0 or ev<=0: return None
-    multiplier=1.0; max_start=float("inf"); ts=now_ms(); max_age=0
+    multiplier=1.0; max_start=float("inf"); ts=now_ms(); max_age=0; leg_ts=[]
+    age_limit_ms = MAX_BBO_AGE_MS if age_limit_ms is None else age_limit_ms
     symbols=route["symbols"]
     if len(symbols)!=len(route["path"])-1: return None
     for i,sym in enumerate(symbols):
         b=books.get(sym); m=meta.get(sym)
         if not b or not m: return None
-        age=ts-b["ts"]; max_age=max(max_age,age)
-        if age>MAX_BBO_AGE_MS: return None
+        age=ts-b["ts"]; max_age=max(max_age,age); leg_ts.append(b["ts"])
+        if age>age_limit_ms: return None
         frm,to=route["path"][i],route["path"][i+1]
         if frm==m["base"] and to==m["quote"]:
             cap_in=b["bidq"]; rate=b["bid"]*(1.0-FEE)
@@ -449,7 +432,8 @@ def route_calc(route,books,meta):
     if executable_usd<MIN_EXEC_USD: return None
     net=multiplier*ev/sv-1.0
     return {"net":net,"size":executable_usd,"profit":executable_usd*net,"out_ratio":multiplier,
-            "start_mark":sv,"end_mark":ev,"max_age":int(max_age)}
+            "start_mark":sv,"end_mark":ev,"max_age":int(max_age),
+            "bbo_skew":int(max(leg_ts)-min(leg_ts)) if leg_ts else 0}
 
 def stable_conversion(frm,to,input_units,books,meta):
     if frm==to: return None
@@ -577,6 +561,51 @@ def paper_execute_confirmed(route,event_x,event_start_ts):
                                 event_x["net"]*100.0,profit,event_start_ts)))
         persist_paper(); return True
 
+# ---------- V2.1 immediate-decision / delayed-execution research ----------
+pending_trials=[]
+pending_lock=threading.RLock()
+last_decision_ms={}
+DECISION_COOLDOWN_MS=int(os.getenv("DECISION_COOLDOWN_MS","250"))
+
+def schedule_decision(route,x,ts):
+    # One T0 decision per route per cooldown. All matrix cohorts share the SAME T0.
+    if ts-last_decision_ms.get(route["id"],0)<DECISION_COOLDOWN_MS: return
+    last_decision_ms[route["id"]]=ts
+    _,_,day=local_day_bounds_ms(0)
+    did=f"{route['id']}@{ts}"
+    with pending_lock:
+        for age_lim in RESEARCH_BBO_AGES_MS:
+            if x["max_age"]>age_lim: continue
+            for lat in RESEARCH_LATENCIES_MS:
+                pending_trials.append({"due":ts+lat,"day":day,"did":did,"route":route,"t0":ts,
+                    "age_lim":age_lim,"lat":lat,"x0":dict(x)})
+
+def execution_trial_worker():
+    while True:
+        time.sleep(.005); ts=now_ms(); due=[]
+        with pending_lock:
+            keep=[]
+            for q in pending_trials:
+                (due if q["due"]<=ts else keep).append(q)
+            pending_trials[:] = keep
+        if not due: continue
+        with state_lock:
+            books=dict(state["bbo"]); meta=state["market_meta"]
+        for q in due:
+            # IMPORTANT: once T0 fired, the result is recorded even when negative.
+            # We observe the current BBO after the requested latency; no positivity filter here.
+            xe=route_calc(q["route"],books,meta,age_limit_ms=EXEC_OBSERVE_MAX_AGE_MS)
+            x0=q["x0"]; status="executed" if xe else "unresolved_book"
+            pnl=None
+            if xe:
+                # BBO-only conservative fill: size cannot exceed the BBO capacity still visible at execution.
+                fill_usd=min(x0["size"],xe["size"])
+                pnl=fill_usd*xe["net"]
+            else: fill_usd=None
+            put_db(("trial",(q["day"],q["did"],q["route"]["id"],q["t0"],ts,q["age_lim"],q["lat"],
+                x0["net"],x0["size"],x0["max_age"],x0.get("bbo_skew",0),
+                xe["net"] if xe else None,fill_usd,xe["max_age"] if xe else None,xe.get("bbo_skew",0) if xe else None,pnl,status)))
+
 # ---------- Event aggregation ----------
 def close_event(key,ev,end_ts=None):
     end_ts=int(end_ts or ev["last_ts"]); avg=ev["sum_net"]/max(ev["ticks"],1)
@@ -596,6 +625,8 @@ def process_route(route,ts):
     with event_lock:
         ev=active_events.get(key)
         if x and x["net"]>=MIN_NET:
+            # V2.1 decision is immediate at T0; duration is observed, never waited for.
+            schedule_decision(route,x,ts)
             if ev is None:
                 ev={"route_id":route["id"],"type":route["type"],"path":">".join(route["path"]),"start_asset":route["path"][0],
                     "end_asset":route["path"][-1],"start_ts":ts,"last_ts":ts,"ticks":1,"entry_net":x["net"],"peak_net":x["net"],
@@ -606,14 +637,11 @@ def process_route(route,ts):
                 ev["last_ts"]=ts; ev["ticks"]+=1; ev["sum_net"]+=x["net"]; ev["max_bbo_age"]=max(ev["max_bbo_age"],x["max_age"])
                 ev["peak_net"]=max(ev["peak_net"],x["net"]); ev["max_size"]=max(ev["max_size"],x["size"]); ev["peak_profit"]=max(ev["peak_profit"],x["profit"])
 
-            if (not ev["confirmed"] and ev["ticks"]>=SIM_MIN_CONFIRM_TICKS and ts-ev["start_ts"]>=SIM_EXEC_LATENCY_MS):
-                ev["confirmed"]=True; ev["confirm_ts"]=ts; ev["confirm_net"]=x["net"]; ev["confirm_size"]=x["size"]
-                ev["confirm_profit"]=x["profit"]; ev["confirm_ticks"]=ev["ticks"]
-                paper_execute_confirmed(route,x,ev["start_ts"])
+            # No 100 ms confirmation gate in V2.1. Event duration remains descriptive only.
+            if not ev["confirmed"]:
+                ev["confirmed"]=True; ev["confirm_ts"]=ev["start_ts"]; ev["confirm_net"]=ev["entry_net"]; ev["confirm_size"]=ev["entry_size"]
+                ev["confirm_profit"]=ev["entry_profit"]; ev["confirm_ticks"]=1
         elif ev is not None:
-            if not ev.get("confirmed"):
-                with paper_lock:
-                    ensure_paper_day(); paper["skipped_flash"]+=1; persist_paper()
             close_event(key,ev,ev["last_ts"]); active_events.pop(key,None)
 
 def event_sweeper():
@@ -622,9 +650,6 @@ def event_sweeper():
         with event_lock:
             for key,ev in list(active_events.items()):
                 if ts-ev["last_ts"]>EVENT_CLOSE_GAP_MS:
-                    if not ev.get("confirmed"):
-                        with paper_lock:
-                            ensure_paper_day(); paper["skipped_flash"]+=1; persist_paper()
                     close_event(key,ev,ev["last_ts"]); active_events.pop(key,None)
 
 # ---------- Historical snapshots ----------
@@ -739,6 +764,15 @@ def paper_status():
     p["nav"]=nav; p["capital"]=SIM_CAPITAL; p["profit"]=nav-SIM_CAPITAL; p["return_pct"]=(nav/SIM_CAPITAL-1)*100 if SIM_CAPITAL else 0
     return p
 
+def execution_matrix():
+    start,end,label=local_day_bounds_ms(0); con=db_connect()
+    rows=con.execute("""SELECT bbo_age_limit_ms age,latency_ms lat,COUNT(*) n,
+      SUM(CASE WHEN status='executed' THEN 1 ELSE 0 END) executed,
+      SUM(CASE WHEN pnl_usd>0 THEN 1 ELSE 0 END) wins, SUM(CASE WHEN pnl_usd<0 THEN 1 ELSE 0 END) losses,
+      COALESCE(SUM(pnl_usd),0) pnl, AVG(exec_net) avg_exec_net
+      FROM execution_trials WHERE decision_ts_ms>=? AND decision_ts_ms<? GROUP BY age,lat ORDER BY age,lat""",(start,end)).fetchall()
+    con.close(); return [dict(r) for r in rows]
+
 @app.get("/api/status")
 def api_status():
     rows,label=daily_rows(); sim=paper_status(); now=now_ms()
@@ -748,22 +782,16 @@ def api_status():
               "ws_expected":state["ws_expected"],"age_ms":age,"market_source":state["market_source"],"errors":list(state["errors"]),
               "scan_updates":state["scan_updates"],"diag":state["route_diag"]}
     base.update({"day":label,"rows":rows[:100],"sim":sim,"fee_pct":FEE*100,"stables":STABLES,"min_exec_usd":MIN_EXEC_USD,
-                 "max_exec_usd":MAX_EXEC_USD,"min_net_pct":MIN_NET*100,"latency_ms":SIM_EXEC_LATENCY_MS,"confirm_ticks":SIM_MIN_CONFIRM_TICKS,
-                 "rebalance_share":REBALANCE_MAX_PROFIT_SHARE*100,"rebalance_edge_mult":REBALANCE_EDGE_MULT})
+                 "max_exec_usd":MAX_EXEC_USD,"min_net_pct":MIN_NET*100,"primary_age_ms":PRIMARY_BBO_AGE_MS,"primary_latency_ms":PRIMARY_EXEC_LATENCY_MS,
+                 "research_ages":RESEARCH_BBO_AGES_MS,"research_latencies":RESEARCH_LATENCIES_MS,
+                 "matrix":execution_matrix(),"rebalance_cover_mult":REBALANCE_COVER_MULT})
     return jsonify(base)
 
-HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MEXC Spot Routes V2</title>
-<style>body{background:#090d14;color:#e8edf5;font-family:system-ui;margin:0;padding:16px}h2{font-size:18px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.c,.panel{background:#111827;border:1px solid #273248;border-radius:10px;padding:12px}.v{font-weight:800;font-size:20px}.muted{color:#9aa7bd;font-size:12px}.good{color:#22d38a}.warn{color:#ffcc66}.bad{color:#ff6677}.panel{margin-top:12px;overflow:auto}table{border-collapse:collapse;width:100%;font-size:12px;min-width:1300px}th,td{padding:8px;border-bottom:1px solid #263044;text-align:right}th:first-child,td:first-child{text-align:left}.route{font-weight:700}.tag{padding:2px 6px;border-radius:7px;background:#1c2940}</style></head><body>
-<h2>MEXC — Scanner routes Spot V2.0</h2><div class="cards" id="cards"></div><div class="panel" id="sim"></div><div class="panel" id="diag"></div>
-<div class="panel"><h3>Opportunités — aujourd'hui (00:00 → maintenant, Europe/Paris)</h3><div class="muted">Journée fixe. La base n'est jamais remise à zéro. La simulation réaliste n'exécute qu'une opportunité confirmée après la latence configurée.</div><table><thead><tr><th>Route dominante</th><th>Legs</th><th>Opp.</th><th>Inverse</th><th>Opp. inv.</th><th>Équilibre</th><th>Confirmées</th><th>Flash 1 tick</th><th>Net moy.</th><th>Net max</th><th>Durée moy.</th><th>Meilleur profit</th><th>Taille moy.</th><th>Taille max</th><th>Âge BBO moy.</th></tr></thead><tbody id="rows"></tbody></table></div>
-<div class="panel"><b>Modèle V2</b><div class="muted" id="model"></div></div>
-<script>function pct(x){return (100*x).toFixed(4)+'%'}; async function refresh(){let d=await fetch('/api/status').then(r=>r.json()); let s=d.sim, g=d.diag;
-document.getElementById('cards').innerHTML=`<div class=c><div class=v>${d.symbols}</div><div class=muted>marchés WS</div></div><div class=c><div class=v>${d.routes}</div><div class=muted>routes sélectionnées</div></div><div class=c><div class=v>${d.ws}/${d.ws_expected}</div><div class=muted>WebSockets</div></div><div class=c><div class=v>${d.age_ms??'-'} ms</div><div class=muted>âge dernier BBO</div></div><div class=c><div class=v>${d.latency_ms} ms</div><div class=muted>latence paper</div></div>`;
-document.getElementById('sim').innerHTML=`<h3>Simulation nette — journée fixe</h3><div class=cards><div><div class='v ${s.return_pct>=0?'good':'bad'}'>${s.return_pct.toFixed(3)}%</div><div class=muted>rendement paper net</div></div><div><div class=v>${s.nav.toFixed(2)} $</div><div class=muted>NAV / ${s.capital.toFixed(0)} $ initiaux</div></div><div><div class=v>${s.profit.toFixed(2)} $</div><div class=muted>profit net simulé</div></div><div><div class=v>${s.trades}</div><div class=muted>trades confirmés</div></div><div><div class=v>${s.rebalances}</div><div class=muted>rééquilibrages</div></div><div><div class=v>${s.rebalance_cost.toFixed(3)} $</div><div class=muted>coût rééquilibrage</div></div></div><div class=muted>Soldes: ${Object.entries(s.balances).map(([k,v])=>k+' '+v.toFixed(2)).join(' · ')} · Profit-bank depuis dernier rééquilibrage: ${s.profit_bank.toFixed(3)} $ · Flashs rejetés: ${s.skipped_flash} · Manque de solde: ${s.skipped_balance} · Rééquilibrage refusé: ${s.skipped_rebalance}</div>`;
-document.getElementById('diag').innerHTML=`<h3>Univers & diagnostic routes</h3><div class=cards><div><div class=v>${g.all_markets}</div><div class=muted>marchés découverts</div></div><div><div class=v>${g.candidate_routes}</div><div class=muted>routes candidates totales</div></div><div><div class=v>${g.candidate_2leg}</div><div class=muted>candidates 2-leg</div></div><div><div class=v>${g.candidate_3leg}</div><div class=muted>candidates 3-leg</div></div><div><div class=v>${g.selected_2leg}</div><div class=muted>2-leg suivies</div></div><div><div class=v>${g.selected_3leg}</div><div class=muted>3-leg suivies</div></div></div><div class=muted>V2 sélectionne des routes complètes avant les symboles. Cela corrige la V1.1 qui remplissait d'abord le quota WS avec des marchés liés aux stablecoins et laissait presque aucune place aux marchés A/B nécessaires aux triangles 3-leg.</div>`;
-let h=''; for(let r of d.rows){h+=`<tr><td class=route>${r.route_id}</td><td>${r.route_type}</td><td>${r.n}</td><td>${r.inverse}</td><td>${r.n_inverse}</td><td>${r.balance.toFixed(1)}%</td><td>${r.confirmed_n}</td><td>${r.flash_n}</td><td class=good>${pct(r.avg_net)}</td><td class=good>${pct(r.max_net)}</td><td>${Math.round(r.avg_dur)} ms</td><td>${r.best_profit.toFixed(3)} $</td><td>${r.avg_size.toFixed(2)} $</td><td>${r.max_size.toFixed(2)} $</td><td>${Math.round(r.avg_age)} ms</td></tr>`} document.getElementById('rows').innerHTML=h;
-document.getElementById('model').innerHTML=`Spot uniquement · ${d.fee_pct.toFixed(3)}% taker/leg · taille dynamique au BBO · minimum ${d.min_exec_usd.toFixed(0)} $ · confirmation paper après ${d.latency_ms} ms et au moins ${d.confirm_ticks} ticks. Les événements 0 ms/1 tick restent enregistrés mais ne sont pas crédités comme exécutables. Rééquilibrage direct entre stablecoins uniquement si son coût réel au BBO est <= ${d.rebalance_share.toFixed(0)}% du profit déjà gagné depuis le précédent rééquilibrage ET si le profit de l'opportunité actuellement débloquée couvre au moins ${d.rebalance_edge_mult.toFixed(2)}x ce coût. Après un rééquilibrage, le profit-bank repart à zéro. Les marks USDT/USDC/USD1 utilisent le mid sans ajouter de frais fictifs.`}
-refresh();setInterval(refresh,3000)</script></body></html>'''
+HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MEXC 2-Leg V2.1</title>
+<style>body{background:#090d14;color:#e8edf5;font-family:system-ui;margin:0;padding:16px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.c,.panel{background:#111827;border:1px solid #273248;border-radius:10px;padding:12px}.v{font-weight:800;font-size:20px}.muted{color:#9aa7bd;font-size:12px}.good{color:#22d38a}.bad{color:#ff6677}.panel{margin-top:12px;overflow:auto}table{border-collapse:collapse;width:100%;font-size:12px}th,td{padding:8px;border-bottom:1px solid #263044;text-align:right}th:first-child,td:first-child{text-align:left}</style></head><body>
+<h2>MEXC — Scanner Spot 2-leg V2.1</h2><div class=cards id=cards></div><div class=panel id=primary></div><div class=panel><h3>Matrice exécution — journée fixe</h3><div class=muted>Décision immédiate à T0. Chaque trade engagé est évalué après la latence indiquée, gain OU perte. Aucun filtre de survie positive. PnL brut d'exécution avant moteur de rééquilibrage.</div><table><thead><tr><th>Âge BBO max à T0</th><th>Latence</th><th>Décisions</th><th>Résolues</th><th>Gagnantes</th><th>Perdantes</th><th>PnL brut</th><th>Net exec moy.</th></tr></thead><tbody id=matrix></tbody></table></div><div class=panel id=diag></div>
+<script>async function refresh(){let d=await fetch('/api/status').then(r=>r.json()),g=d.diag;document.getElementById('cards').innerHTML=`<div class=c><div class=v>${d.symbols}</div><div class=muted>marchés WS</div></div><div class=c><div class=v>${d.routes}</div><div class=muted>routes 2-leg</div></div><div class=c><div class=v>${d.ws}/${d.ws_expected}</div><div class=muted>WebSockets</div></div><div class=c><div class=v>${d.age_ms??'-'} ms</div><div class=muted>dernier BBO</div></div>`;let m=d.matrix||[],p=m.find(x=>x.age==d.primary_age_ms&&x.lat==d.primary_latency_ms);document.getElementById('primary').innerHTML=`<h3>Scénario principal — BBO ≤${d.primary_age_ms} ms / exécution +${d.primary_latency_ms} ms</h3><div class=cards><div><div class='v ${(p?.pnl||0)>=0?'good':'bad'}'>${(p?.pnl||0).toFixed(2)} $</div><div class=muted>PnL brut exécuté</div></div><div><div class=v>${p?.executed||0}</div><div class=muted>trades résolus</div></div><div><div class=v>${p?.wins||0}</div><div class=muted>gagnants</div></div><div><div class=v>${p?.losses||0}</div><div class=muted>perdants</div></div></div><div class=muted>La matrice mesure d'abord la réalité latence/BBO. Le moteur capital + provision de rééquilibrage sera calibré sur ces données sans effacer les pertes.</div>`;let h='';for(let x of m){h+=`<tr><td>${x.age} ms</td><td>${x.lat} ms</td><td>${x.n}</td><td>${x.executed}</td><td>${x.wins||0}</td><td>${x.losses||0}</td><td class='${x.pnl>=0?'good':'bad'}'>${x.pnl.toFixed(3)} $</td><td>${x.avg_exec_net==null?'-':(100*x.avg_exec_net).toFixed(4)+'%'}</td></tr>`}document.getElementById('matrix').innerHTML=h;document.getElementById('diag').innerHTML=`<h3>Univers</h3><div class=cards><div><div class=v>${g.all_markets}</div><div class=muted>marchés découverts</div></div><div><div class=v>${g.candidate_2leg}</div><div class=muted>2-leg candidates</div></div><div><div class=v>${g.selected_2leg}</div><div class=muted>2-leg suivies</div></div><div><div class=v>${g.candidate_3leg}</div><div class=muted>3-leg détectées mais volontairement ignorées</div></div></div>`}refresh();setInterval(refresh,3000)</script></body></html>'''
+
 
 @app.get("/")
 def index(): return render_template_string(HTML)
@@ -789,6 +817,7 @@ def bootstrap():
     put_db(("meta",("route_diag",json.dumps(diag,sort_keys=True))))
     for _ in range(6): threading.Thread(target=scan_worker,daemon=True).start()
     threading.Thread(target=event_sweeper,daemon=True).start()
+    threading.Thread(target=execution_trial_worker,daemon=True).start()
     threading.Thread(target=snapshot_worker,daemon=True).start()
     threading.Thread(target=stable_quote_worker,daemon=True).start()
     for i,g in enumerate(groups,1): threading.Thread(target=ws_worker,args=(g,i),daemon=True).start()
