@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, render_template_string
 import websocket
 
-VERSION = "2.3-depth-strict"
+VERSION = "2.3.1-depth-strict"
 HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", "8081"))
 DB_PATH = os.getenv("DB_PATH", "mexc_routes_v23.db")
@@ -80,6 +80,7 @@ paper_consumed_events = set()
 paper_route_armed = defaultdict(lambda: True)
 paper_route_neutral_since = {}
 paper_route_last_trade = defaultdict(int)
+paper_open_exposures = {}
 active_traces = {}
 trace_lock = threading.RLock()
 ws_latency_last_sample = {}
@@ -162,6 +163,14 @@ def db_writer():
     );
     CREATE INDEX IF NOT EXISTS idx_paper_attempt_day ON paper_execution_attempts(day,ts_ms);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_attempt_decision ON paper_execution_attempts(decision_id);
+
+    CREATE TABLE IF NOT EXISTS paper_open_exposures(
+      decision_id TEXT PRIMARY KEY, day TEXT NOT NULL, route_id TEXT NOT NULL, opened_ts_ms INTEGER NOT NULL, updated_ts_ms INTEGER NOT NULL,
+      symbol TEXT NOT NULL, mid_asset TEXT NOT NULL, start_asset TEXT NOT NULL, units REAL NOT NULL,
+      recovered_start_units REAL NOT NULL DEFAULT 0, input_usd REAL NOT NULL DEFAULT 0, cash_output_usd REAL NOT NULL DEFAULT 0,
+      recovered_usd REAL NOT NULL DEFAULT 0, last_mark_usd REAL NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'open'
+    );
+    CREATE INDEX IF NOT EXISTS idx_open_exposure_day ON paper_open_exposures(day,updated_ts_ms);
 
     CREATE TABLE IF NOT EXISTS paper_rebalances(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -272,6 +281,12 @@ def db_writer():
                 con.execute("""INSERT OR IGNORE INTO paper_execution_attempts(day,ts_ms,decision_id,route_id,event_start_ts_ms,status,input_usd,
                     leg1_input_units,leg1_mid_units,leg2_mid_used,leg2_output_units,unwind_mid_used,unwind_start_units,stranded_mid_units,
                     output_usd_total,profit_usd) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", payload)
+            elif typ == "open_exposure":
+                con.execute("""INSERT OR REPLACE INTO paper_open_exposures(decision_id,day,route_id,opened_ts_ms,updated_ts_ms,symbol,mid_asset,start_asset,units,recovered_start_units,input_usd,cash_output_usd,recovered_usd,last_mark_usd,status)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", payload)
+            elif typ == "close_exposure":
+                con.execute("UPDATE paper_open_exposures SET updated_ts_ms=?,units=0,recovered_start_units=?,recovered_usd=?,last_mark_usd=0,status='closed' WHERE decision_id=?", payload[:4])
+                con.execute("UPDATE paper_execution_attempts SET status='forced_unwind_later',output_usd_total=?,profit_usd=? WHERE decision_id=?", (payload[4],payload[5],payload[6]))
             elif typ == "paper_rebalance":
                 con.execute("""INSERT INTO paper_rebalances(day,ts_ms,from_asset,to_asset,input_units,output_units,
                     input_usd,output_usd,cost_usd,profit_bank_before,unlocked_expected_profit) VALUES(?,?,?,?,?,?,?,?,?,?,?)""", payload)
@@ -584,6 +599,19 @@ def depth_walk(symbol, frm, to, input_units, meta):
     if used<=0: return None
     return {"input_used":used,"output":out,"fill_ratio":used/input_units,"book_ts":book_ts,"send_ts":send_ts}
 
+def exposure_mark_usd(exp, books, meta):
+    """Mark an open intermediate exposure without ever forcing it to zero."""
+    units=max(0.0,float(exp.get("units",0.0)))
+    if units<=0: return 0.0
+    sym=exp.get("symbol"); mid=exp.get("mid_asset"); start=exp.get("start_asset")
+    m=meta.get(sym); b=books.get(sym); start_mark=stable_mark_usdt(start,books,meta) if start else 1.0
+    if m and b and now_ms()-b.get("ts",0)<=MAX_BBO_AGE_MS:
+        if mid==m["base"] and start==m["quote"] and b.get("bid",0)>0:
+            return units*b["bid"]*(1.0-FEE)*start_mark
+        if mid==m["quote"] and start==m["base"] and b.get("ask",0)>0:
+            return (units/b["ask"])*(1.0-FEE)*start_mark
+    return max(0.0,float(exp.get("last_mark_usd",0.0)))
+
 # ---------- Route math ----------
 def direct_pair(asset1,asset2,meta):
     for sym,m in meta.items():
@@ -664,14 +692,19 @@ def load_paper_state():
     _,_,day=local_day_bounds_ms(0)
     try:
         con=sqlite3.connect(DB_PATH,timeout=10)
-        row=con.execute("SELECT * FROM paper_state WHERE day=?",(day,)).fetchone(); con.close()
+        row=con.execute("SELECT * FROM paper_state WHERE day=?",(day,)).fetchone()
         if row:
-            # sqlite default tuple order follows schema
             paper={"day":row[0],"balances":json.loads(row[2]),"profit_bank":float(row[3]),"trades":int(row[4]),
                    "rebalances":int(row[5]),"rebalance_cost":float(row[6]),"skipped_flash":int(row[7]),
                    "skipped_balance":int(row[8]),"skipped_rebalance":int(row[9])}
-        else: paper=paper_default(day)
-    except Exception:
+        else:
+            paper=paper_default(day)
+        paper_open_exposures.clear()
+        for r in con.execute("SELECT decision_id,day,route_id,opened_ts_ms,updated_ts_ms,symbol,mid_asset,start_asset,units,recovered_start_units,input_usd,cash_output_usd,recovered_usd,last_mark_usd,status FROM paper_open_exposures WHERE day=? AND status='open' AND units>0",(day,)).fetchall():
+            paper_open_exposures[r[0]]={"decision_id":r[0],"day":r[1],"route_id":r[2],"opened_ts_ms":r[3],"updated_ts_ms":r[4],"symbol":r[5],"mid_asset":r[6],"start_asset":r[7],"units":float(r[8]),"recovered_start_units":float(r[9]),"input_usd":float(r[10]),"cash_output_usd":float(r[11]),"recovered_usd":float(r[12]),"last_mark_usd":float(r[13]),"status":r[14]}
+        con.close()
+    except Exception as e:
+        logerr(f"paper restore: {e}")
         paper=paper_default(day)
 
 def ensure_paper_day():
@@ -774,10 +807,9 @@ def paper_leg1(q,ts):
     return True
 
 def settle_paper_trade(q,exec_ts):
-    """Irreversible paper execution. Once leg 1 fills, every outcome is booked.
-    If leg 2 is missing/partial, remaining intermediate inventory is emergency-unwound
-    through leg 1 in reverse. Any still-stranded intermediate units are valued at zero
-    (deliberately conservative) so a failed second leg can never disappear from PnL.
+    """Irreversible paper execution. Once leg 1 fills, every outcome remains in NAV/PnL.
+    If leg 2 is partial, immediately unwind what the current reverse depth can absorb.
+    Any remainder becomes a real open paper exposure and is retried until liquidated; it is never valued at zero.
     """
     with paper_lock:
         ensure_paper_day(); s,e=q["start_asset"],q["end_asset"]; reserved=q["reserved_units"]
@@ -792,27 +824,72 @@ def settle_paper_trade(q,exec_ts):
         unwind=depth_walk(sym1,mid,s,remaining,meta) if remaining>1e-12 else None
         unwind_used=unwind["input_used"] if unwind else 0.0
         start_back=unwind["output"] if unwind else 0.0
-        stranded=max(0.0,remaining-unwind_used)
+        open_units=max(0.0,remaining-unwind_used)
         paper_reserved[s]=max(0.0,paper_reserved.get(s,0.0)-reserved)
 
-        # Book the economic result unconditionally after leg 1.
         paper["balances"][s]-=input_units
         paper["balances"][s]+=start_back
         paper["balances"][e]+=end_out
         sm=stable_mark_usdt(s,books,meta); em=stable_mark_usdt(e,books,meta)
-        output_usd=start_back*sm + end_out*em  # stranded mid deliberately worth zero
-        profit=output_usd-input_usd
-        status="completed" if remaining<=1e-12 else ("forced_unwind" if stranded<=1e-12 else "forced_unwind_stranded")
-        paper["trades"]+=1; paper["profit_bank"]+=profit
+        cash_output_usd=start_back*sm + end_out*em
+        realized_delta=cash_output_usd-input_usd
+        paper["trades"]+=1
+        paper["profit_bank"]+=realized_delta
+
+        status="completed" if remaining<=1e-12 else ("forced_unwind" if open_units<=1e-12 else "open_exposure")
+        mark_usd=0.0
+        if open_units>1e-12:
+            exp={"decision_id":q["decision_id"],"day":paper["day"],"route_id":r["id"],"opened_ts_ms":exec_ts,"updated_ts_ms":exec_ts,
+                 "symbol":sym1,"mid_asset":mid,"start_asset":s,"units":open_units,"recovered_start_units":0.0,"input_usd":input_usd,"cash_output_usd":cash_output_usd,"recovered_usd":0.0,"last_mark_usd":0.0,"status":"open"}
+            mark_usd=exposure_mark_usd(exp,books,meta)
+            exp["last_mark_usd"]=mark_usd
+            paper_open_exposures[q["decision_id"]]=exp
+            put_db(("open_exposure",(exp["decision_id"],exp["day"],exp["route_id"],exp["opened_ts_ms"],exp["updated_ts_ms"],exp["symbol"],exp["mid_asset"],exp["start_asset"],exp["units"],0.0,input_usd,cash_output_usd,0.0,mark_usd,"open")))
+
+        economic_output_usd=cash_output_usd+mark_usd
+        economic_profit=economic_output_usd-input_usd
         put_db(("paper_attempt",(paper["day"],exec_ts,q["decision_id"],r["id"],q["event_start_ts"],status,input_usd,
-            input_units,mid_total,leg2_used,end_out,unwind_used,start_back,stranded,output_usd,profit)))
-        # Keep the legacy completed-trade table only for fully completed 2-leg routes.
+            input_units,mid_total,leg2_used,end_out,unwind_used,start_back,open_units,economic_output_usd,economic_profit)))
         if status=="completed":
             put_db(("paper_trade",(paper["day"],exec_ts,r["id"],s,e,input_units,input_usd,end_out,end_out*em,
-                ((end_out*em/input_usd)-1.0)*100.0 if input_usd else 0.0,profit,q["event_start_ts"])))
-        else:
-            paper["skipped_flash"]+=1
+                ((end_out*em/input_usd)-1.0)*100.0 if input_usd else 0.0,economic_profit,q["event_start_ts"])))
         persist_paper(); return True
+
+def open_exposure_worker():
+    """Continuously liquidate residual intermediate inventory through the reverse first leg."""
+    while True:
+        time.sleep(0.10)
+        with paper_lock:
+            if not paper_open_exposures: continue
+            with state_lock:
+                meta=state["market_meta"]; books=dict(state["bbo"])
+            for did,exp in list(paper_open_exposures.items()):
+                units=max(0.0,float(exp.get("units",0.0)))
+                if units<=1e-12:
+                    paper_open_exposures.pop(did,None); continue
+                fill=depth_walk(exp["symbol"],exp["mid_asset"],exp["start_asset"],units,meta)
+                if not fill: 
+                    exp["last_mark_usd"]=exposure_mark_usd(exp,books,meta)
+                    continue
+                used=fill["input_used"]; recovered=fill["output"]
+                if used<=0: continue
+                exp["units"]=max(0.0,units-used)
+                exp["recovered_start_units"]+=recovered
+                exp["updated_ts_ms"]=now_ms()
+                paper["balances"][exp["start_asset"]]=paper["balances"].get(exp["start_asset"],0.0)+recovered
+                recovered_usd=recovered*stable_mark_usdt(exp["start_asset"],books,meta)
+                paper["profit_bank"]+=recovered_usd
+                exp["recovered_usd"]+=recovered_usd
+                exp["last_mark_usd"]=exposure_mark_usd(exp,books,meta) if exp["units"]>1e-12 else 0.0
+                if exp["units"]<=1e-12:
+                    final_output=exp["cash_output_usd"]+exp["recovered_usd"]
+                    final_profit=final_output-exp["input_usd"]
+                    put_db(("close_exposure",(exp["updated_ts_ms"],exp["recovered_start_units"],exp["recovered_usd"],did,final_output,final_profit,did)))
+                    paper_open_exposures.pop(did,None)
+                else:
+                    put_db(("open_exposure",(did,exp["day"],exp["route_id"],exp["opened_ts_ms"],exp["updated_ts_ms"],exp["symbol"],exp["mid_asset"],exp["start_asset"],exp["units"],exp["recovered_start_units"],exp["input_usd"],exp["cash_output_usd"],exp["recovered_usd"],exp["last_mark_usd"],"open")))
+                persist_paper()
+
 
 # ---------- V2.1 immediate-decision / delayed-execution research ----------
 pending_trials=[]
@@ -1085,6 +1162,11 @@ def paper_status():
         books=dict(state["bbo"]); meta=state["market_meta"]
     nav=0.0
     for s,v in p["balances"].items(): nav+=v*stable_mark_usdt(s,books,meta)
+    with paper_lock:
+        exposures=[dict(x) for x in paper_open_exposures.values()]
+    exposure_nav=sum(exposure_mark_usd(x,books,meta) for x in exposures)
+    nav+=exposure_nav
+    p["open_exposures"]=len(exposures); p["open_exposure_nav"]=exposure_nav
     p["nav"]=nav; p["capital"]=SIM_CAPITAL; p["profit"]=nav-SIM_CAPITAL; p["return_pct"]=(nav/SIM_CAPITAL-1)*100 if SIM_CAPITAL else 0
     p["reserved"]={s:paper_reserved.get(s,0.0) for s in STABLES}
     p["free_balances"]={s:max(0.0,p["balances"].get(s,0.0)-paper_reserved.get(s,0.0)) for s in STABLES}
@@ -1143,14 +1225,14 @@ def api_status():
                  "recent_decisions":recent_v22_decisions()})
     return jsonify(base)
 
-HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MEXC 2-Leg V2.3 Depth Strict</title>
+HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MEXC 2-Leg V2.3.1 Depth Strict</title>
 <style>body{background:#090d14;color:#e8edf5;font-family:system-ui;margin:0;padding:16px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.c,.panel{background:#111827;border:1px solid #273248;border-radius:10px;padding:12px}.compare{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;margin-top:12px}.v{font-weight:800;font-size:20px}.big{font-size:28px}.muted{color:#9aa7bd;font-size:12px}.good{color:#22d38a}.bad{color:#ff6677}.panel{margin-top:12px;overflow:auto}.compare .panel{margin-top:0}table{border-collapse:collapse;width:100%;font-size:12px}th,td{padding:8px;border-bottom:1px solid #263044;text-align:right}th:first-child,td:first-child{text-align:left}.tag{display:inline-block;border:1px solid #334155;border-radius:999px;padding:3px 7px;font-size:11px;color:#bac6d8}</style></head><body>
-<h2>MEXC — Scanner Spot 2-leg V2.2 Depth</h2><div class=cards id=cards></div>
+<h2>MEXC — Scanner Spot 2-leg V2.3.1 Depth Strict</h2><div class=cards id=cards></div>
 <div class=compare><div class=panel id=paper></div><div class=panel id=raw></div></div>
 <div class=panel><h3>Décisions récentes — trace 0→300 ms</h3><table><thead><tr><th>Heure</th><th>Route</th><th>Edge T0</th><th>Taille BBO</th><th>Âge échange</th><th>Skew échange</th></tr></thead><tbody id=recent></tbody></table></div>
 <div class=panel><h3>Matrice brute exécution — journée fixe</h3><div class=muted>Sans capital de base : mesure du signal et de la latence. Carnet local depth 10 ms pour le flux marché; décision immédiate à T0, gains et pertes conservés. Le PnL brut peut utiliser une taille BBO supérieure à 2 000 $.</div><table><thead><tr><th>Âge réception max</th><th>Latence</th><th>Décisions</th><th>Résolues</th><th>Gagnantes</th><th>Perdantes</th><th>PnL brut</th><th>Net exec moy.</th></tr></thead><tbody id=matrix></tbody></table></div><div class=panel id=diag></div>
 <script>async function refresh(){let d=await fetch('/api/status').then(r=>r.json()),g=d.diag,s=d.sim,r=d.raw_primary||{};document.getElementById('cards').innerHTML=`<div class=c><div class=v>${d.symbols}</div><div class=muted>marchés WS</div></div><div class=c><div class=v>${d.routes}</div><div class=muted>routes 2-leg</div></div><div class=c><div class=v>${d.ws}/${d.ws_expected}</div><div class=muted>WebSockets</div></div><div class=c><div class=v>${d.age_ms??'-'} ms</div><div class=muted>dernier BBO reçu</div></div><div class=c><div class=v>${d.depth_ready||0}/${d.symbols}</div><div class=muted>carnets depth prêts</div></div><div class=c><div class=v>${d.v22?.decisions||0}</div><div class=muted>décisions tracées</div></div><div class=c><div class=v>${d.v22?.trace_points||0}</div><div class=muted>points trajectoire</div></div><div class=c><div class=v>${d.v22?.avg_ws_transport_ms==null?'-':d.v22.avg_ws_transport_ms.toFixed(1)+' ms'}</div><div class=muted>MEXC → VPS brut (horloges non corrigées)</div></div>`;
-let bals=Object.entries(s.balances||{}).map(([k,v])=>`${k}: ${v.toFixed(2)}`).join(' · ');document.getElementById('paper').innerHTML=`<div class=tag>SIMULATION CAPITAL RÉEL</div><h3>Paper bot — capital initial ${s.capital.toFixed(0)} $</h3><div class='v big ${s.profit>=0?'good':'bad'}'>${s.profit>=0?'+':''}${s.profit.toFixed(2)} $</div><div class='v ${s.return_pct>=0?'good':'bad'}'>${s.return_pct>=0?'+':''}${s.return_pct.toFixed(3)} %</div><div class=muted>NAV actuelle : ${s.nav.toFixed(2)} $ · profits/pertes réalloués automatiquement au capital</div><div class=cards style='margin-top:12px'><div><div class=v>${s.trades}</div><div class=muted>trades exécutés</div></div><div><div class=v>${s.rebalances}</div><div class=muted>rebalances</div></div><div><div class=v>${s.rebalance_cost.toFixed(3)} $</div><div class=muted>coût rebalance</div></div><div><div class=v>${s.skipped_balance}</div><div class=muted>refus capital</div></div></div><div class=muted style='margin-top:10px'>Buckets : ${bals}<br>Règles live : âge local ≤${d.primary_age_ms} ms · skew ≤${d.primary_max_skew_ms} ms · depth multi-niveaux · leg 1 vers +${Math.floor(d.primary_latency_ms/2)} ms · leg 2 vers +${d.primary_latency_ms} ms · capital réservé à T0 · 1 entrée max par événement.</div>`;
+let bals=Object.entries(s.balances||{}).map(([k,v])=>`${k}: ${v.toFixed(2)}`).join(' · ');document.getElementById('paper').innerHTML=`<div class=tag>SIMULATION CAPITAL RÉEL</div><h3>Paper bot — capital initial ${s.capital.toFixed(0)} $</h3><div class='v big ${s.profit>=0?'good':'bad'}'>${s.profit>=0?'+':''}${s.profit.toFixed(2)} $</div><div class='v ${s.return_pct>=0?'good':'bad'}'>${s.return_pct>=0?'+':''}${s.return_pct.toFixed(3)} %</div><div class=muted>NAV actuelle : ${s.nav.toFixed(2)} $ · profits/pertes réalloués automatiquement au capital</div><div class=cards style='margin-top:12px'><div><div class=v>${s.trades}</div><div class=muted>trades exécutés</div></div><div><div class=v>${s.rebalances}</div><div class=muted>rebalances</div></div><div><div class=v>${s.open_exposures||0}</div><div class=muted>expositions ouvertes</div></div><div><div class=v>${s.rebalance_cost.toFixed(3)} $</div><div class=muted>coût rebalance</div></div><div><div class=v>${s.skipped_balance}</div><div class=muted>refus capital</div></div></div><div class=muted style='margin-top:10px'>Buckets : ${bals}<br>Règles live : âge local ≤${d.primary_age_ms} ms · skew ≤${d.primary_max_skew_ms} ms · depth multi-niveaux · leg 1 vers +${Math.floor(d.primary_latency_ms/2)} ms · leg 2 vers +${d.primary_latency_ms} ms · capital réservé à T0 · 1 entrée max par événement · reliquat conservé en exposition puis liquidé sur depth.</div>`;
 document.getElementById('raw').innerHTML=`<div class=tag>DONNÉES BRUTES — SANS CAPITAL</div><h3>Même filtre bot, taille BBO brute</h3><div class='v big ${(r.pnl||0)>=0?'good':'bad'}'>${(r.pnl||0)>=0?'+':''}${(r.pnl||0).toFixed(2)} $</div><div class=muted>Pas de capital initial, pas de contrainte de buckets : ce PnL sert uniquement à comparer le signal brut à ce que les 2 000 $ peuvent réellement exploiter.</div><div class=cards style='margin-top:12px'><div><div class=v>${r.executed||0}</div><div class=muted>résolues</div></div><div><div class=v>${r.wins||0}</div><div class=muted>gagnantes</div></div><div><div class=v>${r.losses||0}</div><div class=muted>perdantes</div></div><div><div class=v>${r.avg_exec_net==null?'-':(100*r.avg_exec_net).toFixed(4)+'%'}</div><div class=muted>net exec moyen</div></div></div><div class=muted style='margin-top:10px'>Même condition : âge échange ≤${d.primary_age_ms} ms · skew ≤${d.primary_max_skew_ms} ms · +${d.primary_latency_ms} ms.</div>`;
 let m=d.matrix||[],h='';for(let x of m){h+=`<tr><td>${x.age} ms</td><td>${x.lat} ms</td><td>${x.n}</td><td>${x.executed}</td><td>${x.wins||0}</td><td>${x.losses||0}</td><td class='${x.pnl>=0?'good':'bad'}'>${x.pnl.toFixed(3)} $</td><td>${x.avg_exec_net==null?'-':(100*x.avg_exec_net).toFixed(4)+'%'}</td></tr>`}document.getElementById('matrix').innerHTML=h;let rh='';for(let q of (d.recent_decisions||[])){let t=new Date(q.ts_ms);rh+=`<tr><td>${t.toLocaleTimeString()}</td><td>${q.route_id}</td><td class='good'>${(100*q.decision_net).toFixed(4)}%</td><td>${q.decision_size_usd.toFixed(2)} $</td><td>${q.exchange_age_max_ms} ms</td><td>${q.exchange_skew_ms} ms</td></tr>`}document.getElementById('recent').innerHTML=rh;document.getElementById('diag').innerHTML=`<h3>Univers</h3><div class=cards><div><div class=v>${g.all_markets}</div><div class=muted>marchés découverts</div></div><div><div class=v>${g.candidate_2leg}</div><div class=muted>2-leg candidates</div></div><div><div class=v>${g.selected_2leg}</div><div class=muted>2-leg suivies</div></div><div><div class=v>${g.candidate_3leg}</div><div class=muted>3-leg détectées mais ignorées</div></div></div>`}refresh();setInterval(refresh,3000)</script></body></html>'''
 
@@ -1176,11 +1258,12 @@ def bootstrap():
     print(f"[Routes V{VERSION}] source={state['market_source']} markets={diag['all_markets']} candidates={diag['candidate_routes']} "
           f"(2L={diag['candidate_2leg']},3L={diag['candidate_3leg']}) selected_symbols={len(symbols)} selected_routes={len(routes)} "
           f"(2L={diag['selected_2leg']},3L={diag['selected_3leg']}) WS={len(groups)}")
-    put_db(("meta",("version",VERSION))); put_db(("meta",("paper_rearm_neutral_ms",str(PAPER_REARM_NEUTRAL_MS)))); put_db(("meta",("paper_hard_cooldown_ms",str(PAPER_HARD_COOLDOWN_MS)))); put_db(("meta",("paper_failed_leg_policy","reverse_leg1_then_zero_value_stranded"))); put_db(("meta",("ws_depth_interval","10ms"))); put_db(("meta",("depth_snapshot_levels","100"))); put_db(("meta",("trace_window_ms",str(TRACE_WINDOW_MS)))); put_db(("meta",("market_source",state["market_source"])))
+    put_db(("meta",("version",VERSION))); put_db(("meta",("paper_rearm_neutral_ms",str(PAPER_REARM_NEUTRAL_MS)))); put_db(("meta",("paper_hard_cooldown_ms",str(PAPER_HARD_COOLDOWN_MS)))); put_db(("meta",("paper_failed_leg_policy","reverse_leg1_then_persist_open_exposure_until_liquidated"))); put_db(("meta",("ws_depth_interval","10ms"))); put_db(("meta",("depth_snapshot_levels","100"))); put_db(("meta",("trace_window_ms",str(TRACE_WINDOW_MS)))); put_db(("meta",("market_source",state["market_source"])))
     put_db(("meta",("route_diag",json.dumps(diag,sort_keys=True))))
     for _ in range(6): threading.Thread(target=scan_worker,daemon=True).start()
     threading.Thread(target=event_sweeper,daemon=True).start()
     threading.Thread(target=execution_trial_worker,daemon=True).start()
+    threading.Thread(target=open_exposure_worker,daemon=True).start()
     threading.Thread(target=snapshot_worker,daemon=True).start()
     threading.Thread(target=stable_quote_worker,daemon=True).start()
     for i,g in enumerate(groups,1): threading.Thread(target=ws_worker,args=(g,i),daemon=True).start()
