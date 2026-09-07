@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, render_template_string
 import websocket
 
-VERSION = "2.2"
+VERSION = "2.2-depth"
 HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", "8081"))
 DB_PATH = os.getenv("DB_PATH", "mexc_routes_v22.db")
@@ -29,7 +29,7 @@ MAX_ROUTES_PER_SYMBOL_SCAN = int(os.getenv("MAX_ROUTES_PER_SYMBOL_SCAN", "10000"
 SIM_CAPITAL = float(os.getenv("SIM_CAPITAL", "2000"))
 SIM_MIN_TRADE_USD = float(os.getenv("SIM_MIN_TRADE_USD", "10"))
 # V2.1: no artificial confirmation wait. Decision is immediate at T0.
-# Primary paper portfolio: BBO age <= 200 ms, execution observed 100 ms later.
+# Primary paper portfolio: depth-walk sequential execution; total latency split leg1/leg2.
 PRIMARY_BBO_AGE_MS = int(os.getenv("PRIMARY_BBO_AGE_MS", "150"))
 PRIMARY_EXEC_LATENCY_MS = int(os.getenv("PRIMARY_EXEC_LATENCY_MS", "150"))
 PRIMARY_MAX_SKEW_MS = int(os.getenv("PRIMARY_MAX_SKEW_MS", "50"))
@@ -63,6 +63,7 @@ state = {
     "symbols": [], "routes": [], "routes_by_symbol": defaultdict(list), "market_meta": {},
     "errors": deque(maxlen=30), "started_ms": int(time.time()*1000), "market_source": "",
     "scan_updates": 0, "latest_routes": {}, "route_diag": {},
+    "depth": {}, "depth_ready": 0,
 }
 active_events = {}
 dbq = queue.Queue(maxsize=50000)
@@ -75,6 +76,8 @@ paper_consumed_events = set()
 active_traces = {}
 trace_lock = threading.RLock()
 ws_latency_last_sample = {}
+depth_lock = threading.RLock()
+depth_buffers = defaultdict(lambda: deque(maxlen=5000))
 
 
 def now_ms(): return int(time.time()*1000)
@@ -436,6 +439,129 @@ def decode_bookticker(payload):
     if not all(k in vals for k in (1,2,3,4)): return None
     return {"symbol":symbol,"bid":float(vals[1]),"bidq":float(vals[2]),"ask":float(vals[3]),"askq":float(vals[4]),"send":int(send or now_ms())}
 
+
+def _decode_level(blob):
+    vals={}
+    for f,w,v in _pb_fields(blob):
+        if w==2 and f in (1,2): vals[f]=v.decode("utf-8","ignore")
+    try: return float(vals[1]),float(vals[2])
+    except Exception: return None
+
+def decode_depth(payload):
+    symbol=None; send=None; body=None
+    for f,w,v in _pb_fields(payload):
+        if f==3 and w==2: symbol=v.decode("utf-8","ignore")
+        elif f==6 and w==0: send=v
+        elif f==313 and w==2: body=v
+    if not symbol or body is None: return None
+    asks=[]; bids=[]; fv=None; tv=None
+    for f,w,v in _pb_fields(body):
+        if w==2 and f==1:
+            z=_decode_level(v); asks.append(z) if z else None
+        elif w==2 and f==2:
+            z=_decode_level(v); bids.append(z) if z else None
+        elif w==2 and f==4:
+            try: fv=int(v.decode())
+            except: pass
+        elif w==2 and f==5:
+            try: tv=int(v.decode())
+            except: pass
+    return {"symbol":symbol,"send":int(send or now_ms()),"asks":asks,"bids":bids,"from":fv,"to":tv}
+
+def _publish_depth_bbo(sym, send_ts):
+    with depth_lock:
+        ob=state["depth"].get(sym)
+        if not ob or not ob.get("ready") or not ob["bids"] or not ob["asks"]: return
+        bp=max(ob["bids"]); ap=min(ob["asks"]); bq=ob["bids"][bp]; aq=ob["asks"][ap]
+    ts=now_ms()
+    with state_lock:
+        state["bbo"][sym]={"bid":bp,"bidq":bq,"ask":ap,"askq":aq,"ts":ts,"send_ts":send_ts,"lat":max(0,ts-send_ts)}
+        state["last_ws_ms"]=ts
+    enqueue_scan(sym)
+
+def apply_depth_update(x):
+    sym=x["symbol"]
+    with depth_lock:
+        ob=state["depth"].get(sym)
+        if not ob or not ob.get("ready"):
+            depth_buffers[sym].append(x); return False
+        prev=ob.get("version")
+        fv=x.get("from"); tv=x.get("to")
+        if tv is not None and prev is not None and tv<=prev: return False
+        if fv is not None and prev is not None and fv>prev+1:
+            ob["ready"]=False; depth_buffers[sym].append(x)
+            threading.Thread(target=init_depth_symbol,args=(sym,),daemon=True).start(); return False
+        for side in ("asks","bids"):
+            book=ob[side]
+            for price,qty in x[side]:
+                if qty<=0: book.pop(price,None)
+                else: book[price]=qty
+        if tv is not None: ob["version"]=tv
+        ob["send_ts"]=x["send"]; ob["ts"]=now_ms()
+    _publish_depth_bbo(sym,x["send"]); return True
+
+def init_depth_symbol(sym):
+    try:
+        r=requests.get(REST+"/api/v3/depth",params={"symbol":sym,"limit":100},timeout=8); r.raise_for_status(); j=r.json()
+        bids={float(a):float(b) for a,b in j.get("bids",[]) if float(b)>0}; asks={float(a):float(b) for a,b in j.get("asks",[]) if float(b)>0}
+        ver=int(j.get("lastUpdateId",0)); send=now_ms()
+        with depth_lock:
+            ob={"bids":bids,"asks":asks,"version":ver,"ready":True,"ts":send,"send_ts":send}
+            state["depth"][sym]=ob
+            buf=list(depth_buffers.pop(sym,[]))
+            for x in buf:
+                tv=x.get("to")
+                if tv is not None and tv<=ob["version"]: continue
+                fv=x.get("from")
+                if fv is not None and fv>ob["version"]+1:
+                    ob["ready"]=False; break
+                for side in ("asks","bids"):
+                    for price,qty in x[side]:
+                        if qty<=0: ob[side].pop(price,None)
+                        else: ob[side][price]=qty
+                if tv is not None: ob["version"]=tv
+                send=x["send"]
+            if ob["ready"]: state["depth_ready"]=sum(1 for z in state["depth"].values() if z.get("ready"))
+        if ob.get("ready"): _publish_depth_bbo(sym,send)
+    except Exception as e:
+        logerr(f"depth snapshot {sym}: {e}")
+
+def depth_bootstrap_worker(symbols):
+    # WS buffers deltas while REST snapshots are built, matching MEXC's documented local-book procedure.
+    for sym in symbols:
+        with depth_lock:
+            if sym not in state["depth"]: state["depth"][sym]={"bids":{},"asks":{},"version":None,"ready":False}
+        init_depth_symbol(sym)
+        time.sleep(.03)
+
+def depth_walk(symbol, frm, to, input_units, meta):
+    m=meta.get(symbol)
+    if not m or input_units<=0: return None
+    with depth_lock:
+        ob=state["depth"].get(symbol)
+        if not ob or not ob.get("ready"): return None
+        bids=sorted(ob["bids"].items(), reverse=True)
+        asks=sorted(ob["asks"].items())
+        book_ts=ob.get("ts",0); send_ts=ob.get("send_ts",book_ts)
+    remain=float(input_units); out=0.0; used=0.0; notional=0.0
+    if frm==m["base"] and to==m["quote"]:
+        for price,qty in bids:
+            take=min(remain,qty);
+            if take<=0: continue
+            used+=take; out+=take*price; notional+=take*price; remain-=take
+            if remain<=1e-12: break
+        out*=1.0-FEE
+    elif frm==m["quote"] and to==m["base"]:
+        for price,qty in asks:
+            max_quote=price*qty; takeq=min(remain,max_quote)
+            if takeq<=0: continue
+            base=takeq/price; used+=takeq; out+=base; notional+=takeq; remain-=takeq
+            if remain<=1e-12: break
+        out*=1.0-FEE
+    else: return None
+    if used<=0: return None
+    return {"input_used":used,"output":out,"fill_ratio":used/input_units,"book_ts":book_ts,"send_ts":send_ts}
+
 # ---------- Route math ----------
 def direct_pair(asset1,asset2,meta):
     for sym,m in meta.items():
@@ -613,38 +739,39 @@ def reserve_paper_trade(route,event_x,event_start_ts,decision_id,decision_ts):
         persist_paper()
         return {"decision_id":decision_id,"route":route,"event_start_ts":event_start_ts,"t0":decision_ts,
                 "x0":dict(event_x),"start_asset":s,"end_asset":e,"reserved_units":input_units,
-                "reserved_usd":input_usd,"due":decision_ts+PRIMARY_EXEC_LATENCY_MS}
+                "reserved_usd":input_usd,"leg1_due":decision_ts+max(1,PRIMARY_EXEC_LATENCY_MS//2),"leg2_due":decision_ts+PRIMARY_EXEC_LATENCY_MS,"stage":1}
 
 
-def settle_paper_trade(q,exec_x,exec_ts):
-    """Settle a reserved trade at T+latency. Negative execution net is kept; unresolved data returns reservation."""
+def paper_leg1(q,ts):
+    r=q["route"]; sym=r["symbols"][0]; frm,to=r["path"][0],r["path"][1]
+    with state_lock: meta=state["market_meta"]
+    fill=depth_walk(sym,frm,to,q["reserved_units"],meta)
+    if not fill or fill["input_used"]*q["x0"]["start_mark"]<SIM_MIN_TRADE_USD:
+        return False
+    q["leg1"]=fill; q["stage"]=2
+    return True
+
+def settle_paper_trade(q,exec_ts):
+    """Sequential depth execution: leg 1 is walked first; leg 2 later uses exactly the intermediate asset actually obtained."""
     with paper_lock:
-        ensure_paper_day()
-        s,e=q["start_asset"],q["end_asset"]
-        reserved=q["reserved_units"]
+        ensure_paper_day(); s,e=q["start_asset"],q["end_asset"]; reserved=q["reserved_units"]
+        r=q["route"]; sym2=r["symbols"][1]; mid=r["path"][1]
+        with state_lock: meta=state["market_meta"]; books=dict(state["bbo"])
+        fill2=depth_walk(sym2,mid,e,q["leg1"]["output"],meta)
         paper_reserved[s]=max(0.0,paper_reserved.get(s,0.0)-reserved)
-        if not exec_x:
-            paper["skipped_flash"]+=1
-            persist_paper(); return False
-        sm=q["x0"]["start_mark"]
-        # Keep intended size fixed, but never claim more than BBO capacity still visible at execution.
-        fill_usd=min(q["reserved_usd"],exec_x["size"])
-        input_units=fill_usd/max(sm,1e-12)
-        if fill_usd<SIM_MIN_TRADE_USD:
+        if not fill2:
             paper["skipped_flash"]+=1; persist_paper(); return False
-        # Balance may have moved only through earlier settled trades; reservation guaranteed this amount was protected.
-        input_units=min(input_units,paper["balances"].get(s,0.0))
-        input_usd=input_units*sm
-        output_units=input_units*exec_x["out_ratio"]
-        em=exec_x["end_mark"]
-        output_usd=output_units*em
+        # If leg 2 cannot consume all intermediate units, treat as unresolved/risk event rather than inventing a fill.
+        if fill2["fill_ratio"]<0.999999:
+            paper["skipped_flash"]+=1; persist_paper(); return False
+        input_units=q["leg1"]["input_used"]; input_units=min(input_units,paper["balances"].get(s,0.0))
+        input_usd=input_units*q["x0"]["start_mark"]
+        output_units=fill2["output"]; em=stable_mark_usdt(e,books,meta); output_usd=output_units*em
         profit=output_usd-input_usd
-        paper["balances"][s]-=input_units
-        paper["balances"][e]+=output_units
-        paper["trades"]+=1
-        paper["profit_bank"]+=profit
-        put_db(("paper_trade",(paper["day"],exec_ts,q["route"]["id"],s,e,input_units,input_usd,output_units,output_usd,
-                                exec_x["net"]*100.0,profit,q["event_start_ts"])))
+        paper["balances"][s]-=input_units; paper["balances"][e]+=output_units
+        paper["trades"]+=1; paper["profit_bank"]+=profit
+        put_db(("paper_trade",(paper["day"],exec_ts,r["id"],s,e,input_units,input_usd,output_units,output_usd,
+                                (output_usd/input_usd-1.0)*100.0 if input_usd else 0.0,profit,q["event_start_ts"])))
         persist_paper(); return True
 
 # ---------- V2.1 immediate-decision / delayed-execution research ----------
@@ -719,7 +846,7 @@ def execution_trial_worker():
             pending_trials[:] = keep
             pkeep=[]
             for q in pending_paper_trials:
-                (paper_due if q["due"]<=ts else pkeep).append(q)
+                (paper_due if (q["leg1_due"] if q.get("stage",1)==1 else q["leg2_due"])<=ts else pkeep).append(q)
             pending_paper_trials[:] = pkeep
         if not due and not paper_due: continue
         with state_lock:
@@ -739,8 +866,15 @@ def execution_trial_worker():
                 x0["net"],x0["size"],x0["max_age"],x0.get("bbo_skew",0),
                 xe["net"] if xe else None,fill_usd,xe["max_age"] if xe else None,xe.get("bbo_skew",0) if xe else None,pnl,status)))
         for q in paper_due:
-            xe=route_calc(q["route"],books,meta,age_limit_ms=EXEC_OBSERVE_MAX_AGE_MS)
-            settle_paper_trade(q,xe,ts)
+            if q.get("stage",1)==1:
+                if paper_leg1(q,ts):
+                    with pending_lock: pending_paper_trials.append(q)
+                else:
+                    with paper_lock:
+                        paper_reserved[q["start_asset"]]=max(0.0,paper_reserved.get(q["start_asset"],0.0)-q["reserved_units"])
+                        paper["skipped_flash"]+=1; persist_paper()
+            else:
+                settle_paper_trade(q,ts)
 
 # ---------- Event aggregation ----------
 def close_event(key,ev,end_ts=None):
@@ -846,23 +980,20 @@ def ws_worker(symbols,worker_id):
             def on_open(ws):
                 nonlocal opened; opened=True
                 with state_lock: state["ws_connected"]+=1
-                params=[f"spot@public.aggre.bookTicker.v3.api.pb@10ms@{s}" for s in symbols]
+                params=[f"spot@public.aggre.depth.v3.api.pb@10ms@{s}" for s in symbols]
                 ws.send(json.dumps({"method":"SUBSCRIPTION","params":params}))
                 print(f"[Routes V{VERSION}] WS {worker_id}: {len(symbols)} symbols")
             def on_message(ws,msg):
                 if isinstance(msg,str): return
                 try:
-                    x=decode_bookticker(msg)
+                    x=decode_depth(msg)
                     if not x: return
                     ts=now_ms()
-                    with state_lock:
-                        state["bbo"][x["symbol"]]={"bid":x["bid"],"bidq":x["bidq"],"ask":x["ask"],"askq":x["askq"],"ts":ts,"send_ts":x["send"],"lat":max(0,ts-x["send"])}
-                        state["last_ws_ms"]=ts
                     last_lat=ws_latency_last_sample.get(x["symbol"],0)
                     if ts-last_lat>=1000:
                         ws_latency_last_sample[x["symbol"]]=ts
                         put_db(("ws_lat_v22",(ts,x["symbol"],x["send"],ts,max(0,ts-x["send"]))))
-                    enqueue_scan(x["symbol"])
+                    apply_depth_update(x)
                 except Exception as e: logerr(f"decode WS {worker_id}: {e}")
             def on_error(ws,e): logerr(f"WS {worker_id}: {e}")
             def on_close(ws,code,msg):
@@ -953,7 +1084,7 @@ def api_status():
         age=now-state["last_ws_ms"] if state["last_ws_ms"] else None
         base={"version":VERSION,"symbols":len(state["symbols"]),"routes":len(state["routes"]),"ws":state["ws_connected"],
               "ws_expected":state["ws_expected"],"age_ms":age,"market_source":state["market_source"],"errors":list(state["errors"]),
-              "scan_updates":state["scan_updates"],"diag":state["route_diag"]}
+              "scan_updates":state["scan_updates"],"diag":state["route_diag"],"depth_ready":state.get("depth_ready",0)}
     base.update({"day":label,"rows":rows[:100],"sim":sim,"fee_pct":FEE*100,"stables":STABLES,"min_exec_usd":MIN_EXEC_USD,
                  "max_exec_usd":MAX_EXEC_USD,"min_net_pct":MIN_NET*100,"primary_age_ms":PRIMARY_BBO_AGE_MS,"primary_latency_ms":PRIMARY_EXEC_LATENCY_MS,
                  "research_ages":RESEARCH_BBO_AGES_MS,"research_latencies":RESEARCH_LATENCIES_MS,
@@ -964,12 +1095,12 @@ def api_status():
 
 HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MEXC 2-Leg V2.2</title>
 <style>body{background:#090d14;color:#e8edf5;font-family:system-ui;margin:0;padding:16px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.c,.panel{background:#111827;border:1px solid #273248;border-radius:10px;padding:12px}.compare{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;margin-top:12px}.v{font-weight:800;font-size:20px}.big{font-size:28px}.muted{color:#9aa7bd;font-size:12px}.good{color:#22d38a}.bad{color:#ff6677}.panel{margin-top:12px;overflow:auto}.compare .panel{margin-top:0}table{border-collapse:collapse;width:100%;font-size:12px}th,td{padding:8px;border-bottom:1px solid #263044;text-align:right}th:first-child,td:first-child{text-align:left}.tag{display:inline-block;border:1px solid #334155;border-radius:999px;padding:3px 7px;font-size:11px;color:#bac6d8}</style></head><body>
-<h2>MEXC — Scanner Spot 2-leg V2.2</h2><div class=cards id=cards></div>
+<h2>MEXC — Scanner Spot 2-leg V2.2 Depth</h2><div class=cards id=cards></div>
 <div class=compare><div class=panel id=paper></div><div class=panel id=raw></div></div>
 <div class=panel><h3>Décisions récentes — trace 0→300 ms</h3><table><thead><tr><th>Heure</th><th>Route</th><th>Edge T0</th><th>Taille BBO</th><th>Âge échange</th><th>Skew échange</th></tr></thead><tbody id=recent></tbody></table></div>
-<div class=panel><h3>Matrice brute exécution — journée fixe</h3><div class=muted>Sans capital de base : mesure du signal et de la latence. Flux BBO 10 ms, décision immédiate à T0, gains et pertes conservés. Le PnL brut peut utiliser une taille BBO supérieure à 2 000 $.</div><table><thead><tr><th>Âge réception max</th><th>Latence</th><th>Décisions</th><th>Résolues</th><th>Gagnantes</th><th>Perdantes</th><th>PnL brut</th><th>Net exec moy.</th></tr></thead><tbody id=matrix></tbody></table></div><div class=panel id=diag></div>
-<script>async function refresh(){let d=await fetch('/api/status').then(r=>r.json()),g=d.diag,s=d.sim,r=d.raw_primary||{};document.getElementById('cards').innerHTML=`<div class=c><div class=v>${d.symbols}</div><div class=muted>marchés WS</div></div><div class=c><div class=v>${d.routes}</div><div class=muted>routes 2-leg</div></div><div class=c><div class=v>${d.ws}/${d.ws_expected}</div><div class=muted>WebSockets</div></div><div class=c><div class=v>${d.age_ms??'-'} ms</div><div class=muted>dernier BBO reçu</div></div><div class=c><div class=v>${d.v22?.decisions||0}</div><div class=muted>décisions tracées</div></div><div class=c><div class=v>${d.v22?.trace_points||0}</div><div class=muted>points trajectoire</div></div><div class=c><div class=v>${d.v22?.avg_ws_transport_ms==null?'-':d.v22.avg_ws_transport_ms.toFixed(1)+' ms'}</div><div class=muted>MEXC → VPS moyen</div></div>`;
-let bals=Object.entries(s.balances||{}).map(([k,v])=>`${k}: ${v.toFixed(2)}`).join(' · ');document.getElementById('paper').innerHTML=`<div class=tag>SIMULATION CAPITAL RÉEL</div><h3>Paper bot — capital initial ${s.capital.toFixed(0)} $</h3><div class='v big ${s.profit>=0?'good':'bad'}'>${s.profit>=0?'+':''}${s.profit.toFixed(2)} $</div><div class='v ${s.return_pct>=0?'good':'bad'}'>${s.return_pct>=0?'+':''}${s.return_pct.toFixed(3)} %</div><div class=muted>NAV actuelle : ${s.nav.toFixed(2)} $ · profits/pertes réalloués automatiquement au capital</div><div class=cards style='margin-top:12px'><div><div class=v>${s.trades}</div><div class=muted>trades exécutés</div></div><div><div class=v>${s.rebalances}</div><div class=muted>rebalances</div></div><div><div class=v>${s.rebalance_cost.toFixed(3)} $</div><div class=muted>coût rebalance</div></div><div><div class=v>${s.skipped_balance}</div><div class=muted>refus capital</div></div></div><div class=muted style='margin-top:10px'>Buckets : ${bals}<br>Règles live : âge échange ≤${d.primary_age_ms} ms · skew ≤${d.primary_max_skew_ms} ms · exécution +${d.primary_latency_ms} ms · capital réservé à T0 · 1 entrée max par événement.</div>`;
+<div class=panel><h3>Matrice brute exécution — journée fixe</h3><div class=muted>Sans capital de base : mesure du signal et de la latence. Carnet local depth 10 ms pour le flux marché; décision immédiate à T0, gains et pertes conservés. Le PnL brut peut utiliser une taille BBO supérieure à 2 000 $.</div><table><thead><tr><th>Âge réception max</th><th>Latence</th><th>Décisions</th><th>Résolues</th><th>Gagnantes</th><th>Perdantes</th><th>PnL brut</th><th>Net exec moy.</th></tr></thead><tbody id=matrix></tbody></table></div><div class=panel id=diag></div>
+<script>async function refresh(){let d=await fetch('/api/status').then(r=>r.json()),g=d.diag,s=d.sim,r=d.raw_primary||{};document.getElementById('cards').innerHTML=`<div class=c><div class=v>${d.symbols}</div><div class=muted>marchés WS</div></div><div class=c><div class=v>${d.routes}</div><div class=muted>routes 2-leg</div></div><div class=c><div class=v>${d.ws}/${d.ws_expected}</div><div class=muted>WebSockets</div></div><div class=c><div class=v>${d.age_ms??'-'} ms</div><div class=muted>dernier BBO reçu</div></div><div class=c><div class=v>${d.depth_ready||0}/${d.symbols}</div><div class=muted>carnets depth prêts</div></div><div class=c><div class=v>${d.v22?.decisions||0}</div><div class=muted>décisions tracées</div></div><div class=c><div class=v>${d.v22?.trace_points||0}</div><div class=muted>points trajectoire</div></div><div class=c><div class=v>${d.v22?.avg_ws_transport_ms==null?'-':d.v22.avg_ws_transport_ms.toFixed(1)+' ms'}</div><div class=muted>MEXC → VPS moyen</div></div>`;
+let bals=Object.entries(s.balances||{}).map(([k,v])=>`${k}: ${v.toFixed(2)}`).join(' · ');document.getElementById('paper').innerHTML=`<div class=tag>SIMULATION CAPITAL RÉEL</div><h3>Paper bot — capital initial ${s.capital.toFixed(0)} $</h3><div class='v big ${s.profit>=0?'good':'bad'}'>${s.profit>=0?'+':''}${s.profit.toFixed(2)} $</div><div class='v ${s.return_pct>=0?'good':'bad'}'>${s.return_pct>=0?'+':''}${s.return_pct.toFixed(3)} %</div><div class=muted>NAV actuelle : ${s.nav.toFixed(2)} $ · profits/pertes réalloués automatiquement au capital</div><div class=cards style='margin-top:12px'><div><div class=v>${s.trades}</div><div class=muted>trades exécutés</div></div><div><div class=v>${s.rebalances}</div><div class=muted>rebalances</div></div><div><div class=v>${s.rebalance_cost.toFixed(3)} $</div><div class=muted>coût rebalance</div></div><div><div class=v>${s.skipped_balance}</div><div class=muted>refus capital</div></div></div><div class=muted style='margin-top:10px'>Buckets : ${bals}<br>Règles live : âge échange ≤${d.primary_age_ms} ms · skew ≤${d.primary_max_skew_ms} ms · depth multi-niveaux · leg 1 vers +${Math.floor(d.primary_latency_ms/2)} ms · leg 2 vers +${d.primary_latency_ms} ms · capital réservé à T0 · 1 entrée max par événement.</div>`;
 document.getElementById('raw').innerHTML=`<div class=tag>DONNÉES BRUTES — SANS CAPITAL</div><h3>Même filtre bot, taille BBO brute</h3><div class='v big ${(r.pnl||0)>=0?'good':'bad'}'>${(r.pnl||0)>=0?'+':''}${(r.pnl||0).toFixed(2)} $</div><div class=muted>Pas de capital initial, pas de contrainte de buckets : ce PnL sert uniquement à comparer le signal brut à ce que les 2 000 $ peuvent réellement exploiter.</div><div class=cards style='margin-top:12px'><div><div class=v>${r.executed||0}</div><div class=muted>résolues</div></div><div><div class=v>${r.wins||0}</div><div class=muted>gagnantes</div></div><div><div class=v>${r.losses||0}</div><div class=muted>perdantes</div></div><div><div class=v>${r.avg_exec_net==null?'-':(100*r.avg_exec_net).toFixed(4)+'%'}</div><div class=muted>net exec moyen</div></div></div><div class=muted style='margin-top:10px'>Même condition : âge échange ≤${d.primary_age_ms} ms · skew ≤${d.primary_max_skew_ms} ms · +${d.primary_latency_ms} ms.</div>`;
 let m=d.matrix||[],h='';for(let x of m){h+=`<tr><td>${x.age} ms</td><td>${x.lat} ms</td><td>${x.n}</td><td>${x.executed}</td><td>${x.wins||0}</td><td>${x.losses||0}</td><td class='${x.pnl>=0?'good':'bad'}'>${x.pnl.toFixed(3)} $</td><td>${x.avg_exec_net==null?'-':(100*x.avg_exec_net).toFixed(4)+'%'}</td></tr>`}document.getElementById('matrix').innerHTML=h;let rh='';for(let q of (d.recent_decisions||[])){let t=new Date(q.ts_ms);rh+=`<tr><td>${t.toLocaleTimeString()}</td><td>${q.route_id}</td><td class='good'>${(100*q.decision_net).toFixed(4)}%</td><td>${q.decision_size_usd.toFixed(2)} $</td><td>${q.exchange_age_max_ms} ms</td><td>${q.exchange_skew_ms} ms</td></tr>`}document.getElementById('recent').innerHTML=rh;document.getElementById('diag').innerHTML=`<h3>Univers</h3><div class=cards><div><div class=v>${g.all_markets}</div><div class=muted>marchés découverts</div></div><div><div class=v>${g.candidate_2leg}</div><div class=muted>2-leg candidates</div></div><div><div class=v>${g.selected_2leg}</div><div class=muted>2-leg suivies</div></div><div><div class=v>${g.candidate_3leg}</div><div class=muted>3-leg détectées mais ignorées</div></div></div>`}refresh();setInterval(refresh,3000)</script></body></html>'''
 
@@ -995,7 +1126,7 @@ def bootstrap():
     print(f"[Routes V{VERSION}] source={state['market_source']} markets={diag['all_markets']} candidates={diag['candidate_routes']} "
           f"(2L={diag['candidate_2leg']},3L={diag['candidate_3leg']}) selected_symbols={len(symbols)} selected_routes={len(routes)} "
           f"(2L={diag['selected_2leg']},3L={diag['selected_3leg']}) WS={len(groups)}")
-    put_db(("meta",("version",VERSION))); put_db(("meta",("ws_bookticker_interval","10ms"))); put_db(("meta",("trace_window_ms",str(TRACE_WINDOW_MS)))); put_db(("meta",("market_source",state["market_source"])))
+    put_db(("meta",("version",VERSION))); put_db(("meta",("ws_depth_interval","10ms"))); put_db(("meta",("depth_snapshot_levels","100"))); put_db(("meta",("trace_window_ms",str(TRACE_WINDOW_MS)))); put_db(("meta",("market_source",state["market_source"])))
     put_db(("meta",("route_diag",json.dumps(diag,sort_keys=True))))
     for _ in range(6): threading.Thread(target=scan_worker,daemon=True).start()
     threading.Thread(target=event_sweeper,daemon=True).start()
@@ -1003,6 +1134,8 @@ def bootstrap():
     threading.Thread(target=snapshot_worker,daemon=True).start()
     threading.Thread(target=stable_quote_worker,daemon=True).start()
     for i,g in enumerate(groups,1): threading.Thread(target=ws_worker,args=(g,i),daemon=True).start()
+    time.sleep(1.0)
+    threading.Thread(target=depth_bootstrap_worker,args=(symbols,),daemon=True).start()
 
 if __name__=="__main__":
     bootstrap(); app.run(host=HOST,port=PORT,threaded=True,use_reloader=False)
