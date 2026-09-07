@@ -6,10 +6,10 @@ from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, render_template_string
 import websocket
 
-VERSION = "2.1"
+VERSION = "2.2"
 HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", "8081"))
-DB_PATH = os.getenv("DB_PATH", "mexc_routes_v21.db")
+DB_PATH = os.getenv("DB_PATH", "mexc_routes_v22.db")
 MARKET_CACHE = os.getenv("MARKET_CACHE", "mexc_markets_cache.json")
 TZ_NAME = os.getenv("TZ_NAME", "Europe/Paris")
 TZ = ZoneInfo(TZ_NAME)
@@ -30,11 +30,17 @@ SIM_CAPITAL = float(os.getenv("SIM_CAPITAL", "2000"))
 SIM_MIN_TRADE_USD = float(os.getenv("SIM_MIN_TRADE_USD", "10"))
 # V2.1: no artificial confirmation wait. Decision is immediate at T0.
 # Primary paper portfolio: BBO age <= 200 ms, execution observed 100 ms later.
-PRIMARY_BBO_AGE_MS = int(os.getenv("PRIMARY_BBO_AGE_MS", "200"))
-PRIMARY_EXEC_LATENCY_MS = int(os.getenv("PRIMARY_EXEC_LATENCY_MS", "100"))
+PRIMARY_BBO_AGE_MS = int(os.getenv("PRIMARY_BBO_AGE_MS", "150"))
+PRIMARY_EXEC_LATENCY_MS = int(os.getenv("PRIMARY_EXEC_LATENCY_MS", "150"))
+PRIMARY_MAX_SKEW_MS = int(os.getenv("PRIMARY_MAX_SKEW_MS", "50"))
 RESEARCH_BBO_AGES_MS = tuple(int(x) for x in os.getenv("RESEARCH_BBO_AGES_MS", "50,100,150,200,250,300").split(","))
-RESEARCH_LATENCIES_MS = tuple(int(x) for x in os.getenv("RESEARCH_LATENCIES_MS", "25,50,100,150,200").split(","))
-EXEC_OBSERVE_MAX_AGE_MS = int(os.getenv("EXEC_OBSERVE_MAX_AGE_MS", "1500"))
+RESEARCH_LATENCIES_MS = tuple(int(x) for x in os.getenv("RESEARCH_LATENCIES_MS", "10,25,50,75,100,125,150,175,200,250,300").split(","))
+EXEC_OBSERVE_MAX_AGE_MS = int(os.getenv("EXEC_OBSERVE_MAX_AGE_MS", "1000"))
+TRACE_WINDOW_MS = int(os.getenv("TRACE_WINDOW_MS", "300"))
+TRACE_MIN_STEP_MS = int(os.getenv("TRACE_MIN_STEP_MS", "2"))
+DECISION_MAX_EXCHANGE_AGE_MS = int(os.getenv("DECISION_MAX_EXCHANGE_AGE_MS", "300"))
+DECISION_MAX_RECV_AGE_MS = int(os.getenv("DECISION_MAX_RECV_AGE_MS", "300"))
+DECISION_MAX_SKEW_MS = int(os.getenv("DECISION_MAX_SKEW_MS", "250"))
 REBALANCE_COVER_MULT = float(os.getenv("REBALANCE_COVER_MULT", "1.50"))
 SIM_DONOR_RESERVE_PCT = float(os.getenv("SIM_DONOR_RESERVE_PCT", "0.10"))
 REBALANCE_MAX_PROFIT_SHARE = float(os.getenv("REBALANCE_MAX_PROFIT_SHARE", "0.80"))
@@ -64,6 +70,11 @@ scanq = queue.Queue(maxsize=30000)
 queued_symbols = set()
 queued_lock = threading.Lock()
 paper = {}
+paper_reserved = defaultdict(float)
+paper_consumed_events = set()
+active_traces = {}
+trace_lock = threading.RLock()
+ws_latency_last_sample = {}
 
 
 def now_ms(): return int(time.time()*1000)
@@ -184,6 +195,32 @@ def db_writer():
     );
     CREATE INDEX IF NOT EXISTS idx_stable_ts ON stable_quotes(ts_ms);
 
+    CREATE TABLE IF NOT EXISTS decisions_v22(
+      decision_id TEXT PRIMARY KEY, day TEXT NOT NULL, route_id TEXT NOT NULL, path TEXT NOT NULL,
+      ts_ms INTEGER NOT NULL, decision_net REAL NOT NULL, decision_size_usd REAL NOT NULL,
+      recv_age_max_ms INTEGER NOT NULL, exchange_age_max_ms INTEGER NOT NULL,
+      recv_skew_ms INTEGER NOT NULL, exchange_skew_ms INTEGER NOT NULL,
+      leg1_symbol TEXT NOT NULL, leg2_symbol TEXT NOT NULL,
+      leg1_send_ts_ms INTEGER, leg1_recv_ts_ms INTEGER, leg2_send_ts_ms INTEGER, leg2_recv_ts_ms INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_dec_v22_day ON decisions_v22(day,ts_ms);
+
+    CREATE TABLE IF NOT EXISTS decision_trace_v22(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, decision_id TEXT NOT NULL, route_id TEXT NOT NULL,
+      ts_ms INTEGER NOT NULL, elapsed_ms INTEGER NOT NULL, net REAL, executable_usd REAL,
+      recv_age_max_ms INTEGER, exchange_age_max_ms INTEGER, recv_skew_ms INTEGER, exchange_skew_ms INTEGER,
+      leg1_bid REAL, leg1_ask REAL, leg1_bidq REAL, leg1_askq REAL, leg1_send_ts_ms INTEGER, leg1_recv_ts_ms INTEGER,
+      leg2_bid REAL, leg2_ask REAL, leg2_bidq REAL, leg2_askq REAL, leg2_send_ts_ms INTEGER, leg2_recv_ts_ms INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_trace_v22_dec ON decision_trace_v22(decision_id,elapsed_ms);
+    CREATE INDEX IF NOT EXISTS idx_trace_v22_ts ON decision_trace_v22(ts_ms);
+
+    CREATE TABLE IF NOT EXISTS ws_latency_v22(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER NOT NULL, symbol TEXT NOT NULL, send_ts_ms INTEGER NOT NULL,
+      recv_ts_ms INTEGER NOT NULL, transport_ms INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_ws_lat_v22_ts ON ws_latency_v22(ts_ms);
+
     CREATE TABLE IF NOT EXISTS execution_trials(
       id INTEGER PRIMARY KEY AUTOINCREMENT, day TEXT NOT NULL, decision_id TEXT NOT NULL, route_id TEXT NOT NULL,
       decision_ts_ms INTEGER NOT NULL, exec_ts_ms INTEGER NOT NULL, bbo_age_limit_ms INTEGER NOT NULL, latency_ms INTEGER NOT NULL,
@@ -221,6 +258,17 @@ def db_writer():
                 con.executemany("INSERT INTO route_snapshots(ts_ms,route_id,route_type,net,executable_usd,max_bbo_age_ms) VALUES(?,?,?,?,?,?)", payload)
             elif typ == "stable_many":
                 con.executemany("INSERT INTO stable_quotes(ts_ms,from_asset,to_asset,rate_after_fee,max_input_units,mark_from_usdt,mark_to_usdt) VALUES(?,?,?,?,?,?,?)", payload)
+            elif typ == "decision_v22":
+                con.execute("""INSERT OR IGNORE INTO decisions_v22(decision_id,day,route_id,path,ts_ms,decision_net,decision_size_usd,
+                    recv_age_max_ms,exchange_age_max_ms,recv_skew_ms,exchange_skew_ms,leg1_symbol,leg2_symbol,
+                    leg1_send_ts_ms,leg1_recv_ts_ms,leg2_send_ts_ms,leg2_recv_ts_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", payload)
+            elif typ == "trace_v22":
+                con.execute("""INSERT INTO decision_trace_v22(decision_id,route_id,ts_ms,elapsed_ms,net,executable_usd,
+                    recv_age_max_ms,exchange_age_max_ms,recv_skew_ms,exchange_skew_ms,
+                    leg1_bid,leg1_ask,leg1_bidq,leg1_askq,leg1_send_ts_ms,leg1_recv_ts_ms,
+                    leg2_bid,leg2_ask,leg2_bidq,leg2_askq,leg2_send_ts_ms,leg2_recv_ts_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", payload)
+            elif typ == "ws_lat_v22":
+                con.execute("INSERT INTO ws_latency_v22(ts_ms,symbol,send_ts_ms,recv_ts_ms,transport_ms) VALUES(?,?,?,?,?)", payload)
             elif typ == "trial":
                 con.execute("""INSERT INTO execution_trials(day,decision_id,route_id,decision_ts_ms,exec_ts_ms,bbo_age_limit_ms,latency_ms,
                     decision_net,decision_size_usd,decision_max_bbo_age_ms,decision_bbo_skew_ms,exec_net,exec_size_usd,exec_max_bbo_age_ms,
@@ -409,14 +457,15 @@ def route_calc(route,books,meta, age_limit_ms=None):
     start,end=route["path"][0],route["path"][-1]
     sv=stable_mark_usdt(start,books,meta); ev=stable_mark_usdt(end,books,meta)
     if sv<=0 or ev<=0: return None
-    multiplier=1.0; max_start=float("inf"); ts=now_ms(); max_age=0; leg_ts=[]
+    multiplier=1.0; max_start=float("inf"); ts=now_ms(); max_age=0; max_exchange_age=0; leg_ts=[]; leg_send_ts=[]; leg_books=[]
     age_limit_ms = MAX_BBO_AGE_MS if age_limit_ms is None else age_limit_ms
     symbols=route["symbols"]
     if len(symbols)!=len(route["path"])-1: return None
     for i,sym in enumerate(symbols):
         b=books.get(sym); m=meta.get(sym)
         if not b or not m: return None
-        age=ts-b["ts"]; max_age=max(max_age,age); leg_ts.append(b["ts"])
+        age=ts-b["ts"]; exch_age=max(0,ts-int(b.get("send_ts",b["ts"])))
+        max_age=max(max_age,age); max_exchange_age=max(max_exchange_age,exch_age); leg_ts.append(b["ts"]); leg_send_ts.append(int(b.get("send_ts",b["ts"]))); leg_books.append(dict(b))
         if age>age_limit_ms: return None
         frm,to=route["path"][i],route["path"][i+1]
         if frm==m["base"] and to==m["quote"]:
@@ -432,8 +481,10 @@ def route_calc(route,books,meta, age_limit_ms=None):
     if executable_usd<MIN_EXEC_USD: return None
     net=multiplier*ev/sv-1.0
     return {"net":net,"size":executable_usd,"profit":executable_usd*net,"out_ratio":multiplier,
-            "start_mark":sv,"end_mark":ev,"max_age":int(max_age),
-            "bbo_skew":int(max(leg_ts)-min(leg_ts)) if leg_ts else 0}
+            "start_mark":sv,"end_mark":ev,"max_age":int(max_age), "exchange_max_age":int(max_exchange_age),
+            "bbo_skew":int(max(leg_ts)-min(leg_ts)) if leg_ts else 0,
+            "exchange_skew":int(max(leg_send_ts)-min(leg_send_ts)) if leg_send_ts else 0,
+            "leg_books":leg_books}
 
 def stable_conversion(frm,to,input_units,books,meta):
     if frm==to: return None
@@ -518,61 +569,131 @@ def choose_rebalance(target_asset,needed_units,event_x,books,meta):
     _,donor,conv,expected=candidates[0]
     return donor,conv,expected
 
-def paper_execute_confirmed(route,event_x,event_start_ts):
+def reserve_paper_trade(route,event_x,event_start_ts,decision_id,decision_ts):
+    """Reserve real portfolio capital at T0. Profit already sits in balances, so it compounds automatically."""
     with paper_lock:
         ensure_paper_day()
         with state_lock:
             books=dict(state["bbo"]); meta=state["market_meta"]
         s,e=route["path"][0],route["path"][-1]
-        if s not in paper["balances"] or e not in paper["balances"]: return False
-        sm=event_x["start_mark"]; em=event_x["end_mark"]
+        if s not in paper["balances"] or e not in paper["balances"]: return None
+        sm=event_x["start_mark"]
         max_input_units=event_x["size"]/max(sm,1e-12)
-        have=paper["balances"].get(s,0.0)
+        free=max(0.0,paper["balances"].get(s,0.0)-paper_reserved.get(s,0.0))
         desired=max_input_units
-        shortage=max(0.0,desired-have)
+        shortage=max(0.0,desired-free)
 
+        # Try an economically-financed rebalance before giving up on size.
         if shortage>0:
             rb=choose_rebalance(s,shortage,event_x,books,meta)
             if rb:
                 donor,conv,expected=rb
                 bank_before=paper["profit_bank"]
-                paper["balances"][donor]-=conv["input"]
-                paper["balances"][s]+=conv["output"]
-                paper["rebalances"]+=1; paper["rebalance_cost"]+=conv["cost"]
-                # Conservative rule requested: every rebalance must be financed by profits earned since the previous one.
-                # After using that interval's profit bank, reset it; next rebalance needs fresh profits.
-                paper["profit_bank"]=0.0
-                put_db(("paper_rebalance",(paper["day"],now_ms(),donor,s,conv["input"],conv["output"],conv["input_usd"],
-                    conv["output_usd"],conv["cost"],bank_before,expected)))
-                have=paper["balances"].get(s,0.0)
+                # Do not spend donor capital already reserved by another in-flight trade.
+                donor_free=max(0.0,paper["balances"].get(donor,0.0)-paper_reserved.get(donor,0.0))
+                if conv["input"]<=donor_free+1e-12:
+                    paper["balances"][donor]-=conv["input"]
+                    paper["balances"][s]+=conv["output"]
+                    paper["rebalances"]+=1; paper["rebalance_cost"]+=conv["cost"]
+                    # profit_bank is only a financing ledger; economic profit remains in balances/NAV and compounds.
+                    paper["profit_bank"]=max(0.0,paper["profit_bank"]-conv["cost"]*REBALANCE_COVER_MULT)
+                    put_db(("paper_rebalance",(paper["day"],decision_ts,donor,s,conv["input"],conv["output"],conv["input_usd"],
+                        conv["output_usd"],conv["cost"],bank_before,expected)))
+                    free=max(0.0,paper["balances"].get(s,0.0)-paper_reserved.get(s,0.0))
+                else:
+                    paper["skipped_rebalance"]+=1
             else:
                 paper["skipped_rebalance"]+=1
 
-        input_units=min(have,max_input_units)
+        input_units=min(free,max_input_units)
         input_usd=input_units*sm
         if input_usd<SIM_MIN_TRADE_USD:
-            paper["skipped_balance"]+=1; persist_paper(); return False
-        output_units=input_units*event_x["out_ratio"]
+            paper["skipped_balance"]+=1; persist_paper(); return None
+        paper_reserved[s]+=input_units
+        persist_paper()
+        return {"decision_id":decision_id,"route":route,"event_start_ts":event_start_ts,"t0":decision_ts,
+                "x0":dict(event_x),"start_asset":s,"end_asset":e,"reserved_units":input_units,
+                "reserved_usd":input_usd,"due":decision_ts+PRIMARY_EXEC_LATENCY_MS}
+
+
+def settle_paper_trade(q,exec_x,exec_ts):
+    """Settle a reserved trade at T+latency. Negative execution net is kept; unresolved data returns reservation."""
+    with paper_lock:
+        ensure_paper_day()
+        s,e=q["start_asset"],q["end_asset"]
+        reserved=q["reserved_units"]
+        paper_reserved[s]=max(0.0,paper_reserved.get(s,0.0)-reserved)
+        if not exec_x:
+            paper["skipped_flash"]+=1
+            persist_paper(); return False
+        sm=q["x0"]["start_mark"]
+        # Keep intended size fixed, but never claim more than BBO capacity still visible at execution.
+        fill_usd=min(q["reserved_usd"],exec_x["size"])
+        input_units=fill_usd/max(sm,1e-12)
+        if fill_usd<SIM_MIN_TRADE_USD:
+            paper["skipped_flash"]+=1; persist_paper(); return False
+        # Balance may have moved only through earlier settled trades; reservation guaranteed this amount was protected.
+        input_units=min(input_units,paper["balances"].get(s,0.0))
+        input_usd=input_units*sm
+        output_units=input_units*exec_x["out_ratio"]
+        em=exec_x["end_mark"]
         output_usd=output_units*em
         profit=output_usd-input_usd
-        paper["balances"][s]-=input_units; paper["balances"][e]+=output_units
-        paper["trades"]+=1; paper["profit_bank"]+=profit
-        put_db(("paper_trade",(paper["day"],now_ms(),route["id"],s,e,input_units,input_usd,output_units,output_usd,
-                                event_x["net"]*100.0,profit,event_start_ts)))
+        paper["balances"][s]-=input_units
+        paper["balances"][e]+=output_units
+        paper["trades"]+=1
+        paper["profit_bank"]+=profit
+        put_db(("paper_trade",(paper["day"],exec_ts,q["route"]["id"],s,e,input_units,input_usd,output_units,output_usd,
+                                exec_x["net"]*100.0,profit,q["event_start_ts"])))
         persist_paper(); return True
 
 # ---------- V2.1 immediate-decision / delayed-execution research ----------
 pending_trials=[]
+pending_paper_trials=[]
 pending_lock=threading.RLock()
 last_decision_ms={}
 DECISION_COOLDOWN_MS=int(os.getenv("DECISION_COOLDOWN_MS","250"))
 
-def schedule_decision(route,x,ts):
-    # One T0 decision per route per cooldown. All matrix cohorts share the SAME T0.
+def _trace_payload(did,route,ts,x):
+    lbs=x.get("leg_books") or []
+    if len(lbs)<2: return None
+    a,b=lbs[0],lbs[1]
+    return (did,route["id"],ts,max(0,ts-int(did.rsplit("@",1)[1])),x.get("net"),x.get("size"),
+            x.get("max_age"),x.get("exchange_max_age"),x.get("bbo_skew"),x.get("exchange_skew"),
+            a.get("bid"),a.get("ask"),a.get("bidq"),a.get("askq"),a.get("send_ts"),a.get("ts"),
+            b.get("bid"),b.get("ask"),b.get("bidq"),b.get("askq"),b.get("send_ts"),b.get("ts"))
+
+def record_active_trace(route,ts,x):
+    with trace_lock:
+        q=active_traces.get(route["id"],[])
+        if not q: return
+        keep=[]
+        for tr in q:
+            if ts-tr["t0"]>TRACE_WINDOW_MS: continue
+            if ts-tr.get("last_sample",0)<TRACE_MIN_STEP_MS: keep.append(tr); continue
+            tr["last_sample"]=ts; keep.append(tr)
+            if x:
+                payload=_trace_payload(tr["did"],route,ts,x)
+                if payload: put_db(("trace_v22",payload))
+        if keep: active_traces[route["id"]]=keep
+        else: active_traces.pop(route["id"],None)
+
+def schedule_decision(route,x,ts,event_start_ts):
+    # V2.2: T0 is immediate, based on 10 ms WebSocket BBO. Broad research limits preserve data for offline replay.
     if ts-last_decision_ms.get(route["id"],0)<DECISION_COOLDOWN_MS: return
+    if x.get("max_age",999999)>DECISION_MAX_RECV_AGE_MS: return
+    if x.get("exchange_max_age",999999)>DECISION_MAX_EXCHANGE_AGE_MS: return
+    if x.get("exchange_skew",999999)>DECISION_MAX_SKEW_MS: return
     last_decision_ms[route["id"]]=ts
-    _,_,day=local_day_bounds_ms(0)
-    did=f"{route['id']}@{ts}"
+    _,_,day=local_day_bounds_ms(0); did=f"{route['id']}@{ts}"; lbs=x.get("leg_books") or []
+    if len(lbs)>=2:
+        put_db(("decision_v22",(did,day,route["id"],">".join(route["path"]),ts,x["net"],x["size"],x["max_age"],
+            x.get("exchange_max_age",0),x.get("bbo_skew",0),x.get("exchange_skew",0),route["symbols"][0],route["symbols"][1],
+            lbs[0].get("send_ts"),lbs[0].get("ts"),lbs[1].get("send_ts"),lbs[1].get("ts"))))
+        p=_trace_payload(did,route,ts,x)
+        if p: put_db(("trace_v22",p))
+    with trace_lock:
+        active_traces.setdefault(route["id"],[]).append({"did":did,"t0":ts,"last_sample":ts})
     with pending_lock:
         for age_lim in RESEARCH_BBO_AGES_MS:
             if x["max_age"]>age_lim: continue
@@ -580,15 +701,27 @@ def schedule_decision(route,x,ts):
                 pending_trials.append({"due":ts+lat,"day":day,"did":did,"route":route,"t0":ts,
                     "age_lim":age_lim,"lat":lat,"x0":dict(x)})
 
+    # Separate $2k portfolio simulation: one executable entry per arbitrage event, real capital reserved at T0.
+    event_key=(route["id"],int(event_start_ts))
+    if event_key not in paper_consumed_events and x.get("exchange_max_age",999999)<=PRIMARY_BBO_AGE_MS and x.get("exchange_skew",999999)<=PRIMARY_MAX_SKEW_MS:
+        q=reserve_paper_trade(route,x,event_start_ts,did,ts)
+        if q:
+            paper_consumed_events.add(event_key)
+            with pending_lock: pending_paper_trials.append(q)
+
 def execution_trial_worker():
     while True:
-        time.sleep(.005); ts=now_ms(); due=[]
+        time.sleep(.005); ts=now_ms(); due=[]; paper_due=[]
         with pending_lock:
             keep=[]
             for q in pending_trials:
                 (due if q["due"]<=ts else keep).append(q)
             pending_trials[:] = keep
-        if not due: continue
+            pkeep=[]
+            for q in pending_paper_trials:
+                (paper_due if q["due"]<=ts else pkeep).append(q)
+            pending_paper_trials[:] = pkeep
+        if not due and not paper_due: continue
         with state_lock:
             books=dict(state["bbo"]); meta=state["market_meta"]
         for q in due:
@@ -598,13 +731,16 @@ def execution_trial_worker():
             x0=q["x0"]; status="executed" if xe else "unresolved_book"
             pnl=None
             if xe:
-                # BBO-only conservative fill: size cannot exceed the BBO capacity still visible at execution.
+                # Raw research has no portfolio cap; it remains the comparison reference requested by the user.
                 fill_usd=min(x0["size"],xe["size"])
                 pnl=fill_usd*xe["net"]
             else: fill_usd=None
             put_db(("trial",(q["day"],q["did"],q["route"]["id"],q["t0"],ts,q["age_lim"],q["lat"],
                 x0["net"],x0["size"],x0["max_age"],x0.get("bbo_skew",0),
                 xe["net"] if xe else None,fill_usd,xe["max_age"] if xe else None,xe.get("bbo_skew",0) if xe else None,pnl,status)))
+        for q in paper_due:
+            xe=route_calc(q["route"],books,meta,age_limit_ms=EXEC_OBSERVE_MAX_AGE_MS)
+            settle_paper_trade(q,xe,ts)
 
 # ---------- Event aggregation ----------
 def close_event(key,ev,end_ts=None):
@@ -614,6 +750,7 @@ def close_event(key,ev,end_ts=None):
              ev["entry_profit"],ev["peak_profit"],ev["max_bbo_age"],1 if ev.get("confirmed") else 0,
              ev.get("confirm_ts"),ev.get("confirm_net"),ev.get("confirm_size"),ev.get("confirm_profit"),ev.get("confirm_ticks"))
     put_db(("event",payload))
+    paper_consumed_events.discard((ev["route_id"],int(ev["start_ts"])))
 
 def process_route(route,ts):
     with state_lock:
@@ -622,11 +759,10 @@ def process_route(route,ts):
     with state_lock:
         if x: state["latest_routes"][route["id"]]={"ts":ts,"net":x["net"],"size":x["size"],"type":route["type"],"max_age":x["max_age"]}
     key=route["id"]
+    record_active_trace(route,ts,x)
     with event_lock:
         ev=active_events.get(key)
         if x and x["net"]>=MIN_NET:
-            # V2.1 decision is immediate at T0; duration is observed, never waited for.
-            schedule_decision(route,x,ts)
             if ev is None:
                 ev={"route_id":route["id"],"type":route["type"],"path":">".join(route["path"]),"start_asset":route["path"][0],
                     "end_asset":route["path"][-1],"start_ts":ts,"last_ts":ts,"ticks":1,"entry_net":x["net"],"peak_net":x["net"],
@@ -637,7 +773,10 @@ def process_route(route,ts):
                 ev["last_ts"]=ts; ev["ticks"]+=1; ev["sum_net"]+=x["net"]; ev["max_bbo_age"]=max(ev["max_bbo_age"],x["max_age"])
                 ev["peak_net"]=max(ev["peak_net"],x["net"]); ev["max_size"]=max(ev["max_size"],x["size"]); ev["peak_profit"]=max(ev["peak_profit"],x["profit"])
 
-            # No 100 ms confirmation gate in V2.1. Event duration remains descriptive only.
+            # Decision is immediate at T0. The $2k simulation can enter once per event when its stricter BBO/skew rules are met.
+            schedule_decision(route,x,ts,ev["start_ts"])
+
+            # No confirmation gate. Event duration remains descriptive only.
             if not ev["confirmed"]:
                 ev["confirmed"]=True; ev["confirm_ts"]=ev["start_ts"]; ev["confirm_net"]=ev["entry_net"]; ev["confirm_size"]=ev["entry_size"]
                 ev["confirm_profit"]=ev["entry_profit"]; ev["confirm_ticks"]=1
@@ -707,7 +846,7 @@ def ws_worker(symbols,worker_id):
             def on_open(ws):
                 nonlocal opened; opened=True
                 with state_lock: state["ws_connected"]+=1
-                params=[f"spot@public.aggre.bookTicker.v3.api.pb@100ms@{s}" for s in symbols]
+                params=[f"spot@public.aggre.bookTicker.v3.api.pb@10ms@{s}" for s in symbols]
                 ws.send(json.dumps({"method":"SUBSCRIPTION","params":params}))
                 print(f"[Routes V{VERSION}] WS {worker_id}: {len(symbols)} symbols")
             def on_message(ws,msg):
@@ -717,8 +856,12 @@ def ws_worker(symbols,worker_id):
                     if not x: return
                     ts=now_ms()
                     with state_lock:
-                        state["bbo"][x["symbol"]]={"bid":x["bid"],"bidq":x["bidq"],"ask":x["ask"],"askq":x["askq"],"ts":ts,"lat":max(0,ts-x["send"])}
+                        state["bbo"][x["symbol"]]={"bid":x["bid"],"bidq":x["bidq"],"ask":x["ask"],"askq":x["askq"],"ts":ts,"send_ts":x["send"],"lat":max(0,ts-x["send"])}
                         state["last_ws_ms"]=ts
+                    last_lat=ws_latency_last_sample.get(x["symbol"],0)
+                    if ts-last_lat>=1000:
+                        ws_latency_last_sample[x["symbol"]]=ts
+                        put_db(("ws_lat_v22",(ts,x["symbol"],x["send"],ts,max(0,ts-x["send"]))))
                     enqueue_scan(x["symbol"])
                 except Exception as e: logerr(f"decode WS {worker_id}: {e}")
             def on_error(ws,e): logerr(f"WS {worker_id}: {e}")
@@ -762,7 +905,24 @@ def paper_status():
     nav=0.0
     for s,v in p["balances"].items(): nav+=v*stable_mark_usdt(s,books,meta)
     p["nav"]=nav; p["capital"]=SIM_CAPITAL; p["profit"]=nav-SIM_CAPITAL; p["return_pct"]=(nav/SIM_CAPITAL-1)*100 if SIM_CAPITAL else 0
+    p["reserved"]={s:paper_reserved.get(s,0.0) for s in STABLES}
+    p["free_balances"]={s:max(0.0,p["balances"].get(s,0.0)-paper_reserved.get(s,0.0)) for s in STABLES}
     return p
+
+def raw_primary_status():
+    """Raw BBO PnL for the exact same primary exchange-age/skew/latency conditions, without a capital base."""
+    start,end,_=local_day_bounds_ms(0); con=db_connect()
+    r=con.execute("""SELECT COUNT(*) n,
+      SUM(CASE WHEN t.status='executed' THEN 1 ELSE 0 END) executed,
+      SUM(CASE WHEN t.pnl_usd>0 THEN 1 ELSE 0 END) wins,
+      SUM(CASE WHEN t.pnl_usd<0 THEN 1 ELSE 0 END) losses,
+      COALESCE(SUM(t.pnl_usd),0) pnl, AVG(t.exec_net) avg_exec_net
+      FROM execution_trials t JOIN decisions_v22 d ON d.decision_id=t.decision_id
+      WHERE t.decision_ts_ms>=? AND t.decision_ts_ms<? AND t.latency_ms=? AND t.bbo_age_limit_ms=300
+        AND d.exchange_age_max_ms<=? AND d.exchange_skew_ms<=?""",
+        (start,end,PRIMARY_EXEC_LATENCY_MS,PRIMARY_BBO_AGE_MS,PRIMARY_MAX_SKEW_MS)).fetchone()
+    con.close()
+    return {"n":r[0] or 0,"executed":r[1] or 0,"wins":r[2] or 0,"losses":r[3] or 0,"pnl":r[4] or 0.0,"avg_exec_net":r[5]}
 
 def execution_matrix():
     start,end,label=local_day_bounds_ms(0); con=db_connect()
@@ -772,6 +932,19 @@ def execution_matrix():
       COALESCE(SUM(pnl_usd),0) pnl, AVG(exec_net) avg_exec_net
       FROM execution_trials WHERE decision_ts_ms>=? AND decision_ts_ms<? GROUP BY age,lat ORDER BY age,lat""",(start,end)).fetchall()
     con.close(); return [dict(r) for r in rows]
+
+def recent_v22_decisions(limit=30):
+    start,end,_=local_day_bounds_ms(0); con=db_connect()
+    rows=con.execute("""SELECT decision_id,route_id,ts_ms,decision_net,decision_size_usd,recv_age_max_ms,exchange_age_max_ms,
+        recv_skew_ms,exchange_skew_ms FROM decisions_v22 WHERE ts_ms>=? AND ts_ms<? ORDER BY ts_ms DESC LIMIT ?""",(start,end,limit)).fetchall()
+    con.close(); return [dict(r) for r in rows]
+
+def v22_stats():
+    start,end,_=local_day_bounds_ms(0); con=db_connect()
+    d=con.execute("SELECT COUNT(*) n, COUNT(DISTINCT route_id) routes, AVG(exchange_age_max_ms) age, AVG(exchange_skew_ms) skew FROM decisions_v22 WHERE ts_ms>=? AND ts_ms<?",(start,end)).fetchone()
+    w=con.execute("SELECT AVG(transport_ms) av, MAX(transport_ms) mx FROM ws_latency_v22 WHERE ts_ms>=? AND ts_ms<?",(start,end)).fetchone()
+    tr=con.execute("SELECT COUNT(*) n FROM decision_trace_v22 WHERE ts_ms>=? AND ts_ms<?",(start,end)).fetchone()
+    con.close(); return {"decisions":d[0] or 0,"routes":d[1] or 0,"avg_exchange_age_ms":d[2],"avg_exchange_skew_ms":d[3],"avg_ws_transport_ms":w[0],"max_ws_transport_ms":w[1],"trace_points":tr[0] or 0}
 
 @app.get("/api/status")
 def api_status():
@@ -784,13 +957,22 @@ def api_status():
     base.update({"day":label,"rows":rows[:100],"sim":sim,"fee_pct":FEE*100,"stables":STABLES,"min_exec_usd":MIN_EXEC_USD,
                  "max_exec_usd":MAX_EXEC_USD,"min_net_pct":MIN_NET*100,"primary_age_ms":PRIMARY_BBO_AGE_MS,"primary_latency_ms":PRIMARY_EXEC_LATENCY_MS,
                  "research_ages":RESEARCH_BBO_AGES_MS,"research_latencies":RESEARCH_LATENCIES_MS,
-                 "matrix":execution_matrix(),"rebalance_cover_mult":REBALANCE_COVER_MULT})
+                 "matrix":execution_matrix(),"raw_primary":raw_primary_status(),"rebalance_cover_mult":REBALANCE_COVER_MULT,"v22":v22_stats(),
+                 "trace_window_ms":TRACE_WINDOW_MS,"decision_max_exchange_age_ms":DECISION_MAX_EXCHANGE_AGE_MS,"decision_max_skew_ms":DECISION_MAX_SKEW_MS,"primary_max_skew_ms":PRIMARY_MAX_SKEW_MS,
+                 "recent_decisions":recent_v22_decisions()})
     return jsonify(base)
 
-HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MEXC 2-Leg V2.1</title>
-<style>body{background:#090d14;color:#e8edf5;font-family:system-ui;margin:0;padding:16px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.c,.panel{background:#111827;border:1px solid #273248;border-radius:10px;padding:12px}.v{font-weight:800;font-size:20px}.muted{color:#9aa7bd;font-size:12px}.good{color:#22d38a}.bad{color:#ff6677}.panel{margin-top:12px;overflow:auto}table{border-collapse:collapse;width:100%;font-size:12px}th,td{padding:8px;border-bottom:1px solid #263044;text-align:right}th:first-child,td:first-child{text-align:left}</style></head><body>
-<h2>MEXC — Scanner Spot 2-leg V2.1</h2><div class=cards id=cards></div><div class=panel id=primary></div><div class=panel><h3>Matrice exécution — journée fixe</h3><div class=muted>Décision immédiate à T0. Chaque trade engagé est évalué après la latence indiquée, gain OU perte. Aucun filtre de survie positive. PnL brut d'exécution avant moteur de rééquilibrage.</div><table><thead><tr><th>Âge BBO max à T0</th><th>Latence</th><th>Décisions</th><th>Résolues</th><th>Gagnantes</th><th>Perdantes</th><th>PnL brut</th><th>Net exec moy.</th></tr></thead><tbody id=matrix></tbody></table></div><div class=panel id=diag></div>
-<script>async function refresh(){let d=await fetch('/api/status').then(r=>r.json()),g=d.diag;document.getElementById('cards').innerHTML=`<div class=c><div class=v>${d.symbols}</div><div class=muted>marchés WS</div></div><div class=c><div class=v>${d.routes}</div><div class=muted>routes 2-leg</div></div><div class=c><div class=v>${d.ws}/${d.ws_expected}</div><div class=muted>WebSockets</div></div><div class=c><div class=v>${d.age_ms??'-'} ms</div><div class=muted>dernier BBO</div></div>`;let m=d.matrix||[],p=m.find(x=>x.age==d.primary_age_ms&&x.lat==d.primary_latency_ms);document.getElementById('primary').innerHTML=`<h3>Scénario principal — BBO ≤${d.primary_age_ms} ms / exécution +${d.primary_latency_ms} ms</h3><div class=cards><div><div class='v ${(p?.pnl||0)>=0?'good':'bad'}'>${(p?.pnl||0).toFixed(2)} $</div><div class=muted>PnL brut exécuté</div></div><div><div class=v>${p?.executed||0}</div><div class=muted>trades résolus</div></div><div><div class=v>${p?.wins||0}</div><div class=muted>gagnants</div></div><div><div class=v>${p?.losses||0}</div><div class=muted>perdants</div></div></div><div class=muted>La matrice mesure d'abord la réalité latence/BBO. Le moteur capital + provision de rééquilibrage sera calibré sur ces données sans effacer les pertes.</div>`;let h='';for(let x of m){h+=`<tr><td>${x.age} ms</td><td>${x.lat} ms</td><td>${x.n}</td><td>${x.executed}</td><td>${x.wins||0}</td><td>${x.losses||0}</td><td class='${x.pnl>=0?'good':'bad'}'>${x.pnl.toFixed(3)} $</td><td>${x.avg_exec_net==null?'-':(100*x.avg_exec_net).toFixed(4)+'%'}</td></tr>`}document.getElementById('matrix').innerHTML=h;document.getElementById('diag').innerHTML=`<h3>Univers</h3><div class=cards><div><div class=v>${g.all_markets}</div><div class=muted>marchés découverts</div></div><div><div class=v>${g.candidate_2leg}</div><div class=muted>2-leg candidates</div></div><div><div class=v>${g.selected_2leg}</div><div class=muted>2-leg suivies</div></div><div><div class=v>${g.candidate_3leg}</div><div class=muted>3-leg détectées mais volontairement ignorées</div></div></div>`}refresh();setInterval(refresh,3000)</script></body></html>'''
+HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MEXC 2-Leg V2.2</title>
+<style>body{background:#090d14;color:#e8edf5;font-family:system-ui;margin:0;padding:16px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.c,.panel{background:#111827;border:1px solid #273248;border-radius:10px;padding:12px}.compare{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;margin-top:12px}.v{font-weight:800;font-size:20px}.big{font-size:28px}.muted{color:#9aa7bd;font-size:12px}.good{color:#22d38a}.bad{color:#ff6677}.panel{margin-top:12px;overflow:auto}.compare .panel{margin-top:0}table{border-collapse:collapse;width:100%;font-size:12px}th,td{padding:8px;border-bottom:1px solid #263044;text-align:right}th:first-child,td:first-child{text-align:left}.tag{display:inline-block;border:1px solid #334155;border-radius:999px;padding:3px 7px;font-size:11px;color:#bac6d8}</style></head><body>
+<h2>MEXC — Scanner Spot 2-leg V2.2</h2><div class=cards id=cards></div>
+<div class=compare><div class=panel id=paper></div><div class=panel id=raw></div></div>
+<div class=panel><h3>Décisions récentes — trace 0→300 ms</h3><table><thead><tr><th>Heure</th><th>Route</th><th>Edge T0</th><th>Taille BBO</th><th>Âge échange</th><th>Skew échange</th></tr></thead><tbody id=recent></tbody></table></div>
+<div class=panel><h3>Matrice brute exécution — journée fixe</h3><div class=muted>Sans capital de base : mesure du signal et de la latence. Flux BBO 10 ms, décision immédiate à T0, gains et pertes conservés. Le PnL brut peut utiliser une taille BBO supérieure à 2 000 $.</div><table><thead><tr><th>Âge réception max</th><th>Latence</th><th>Décisions</th><th>Résolues</th><th>Gagnantes</th><th>Perdantes</th><th>PnL brut</th><th>Net exec moy.</th></tr></thead><tbody id=matrix></tbody></table></div><div class=panel id=diag></div>
+<script>async function refresh(){let d=await fetch('/api/status').then(r=>r.json()),g=d.diag,s=d.sim,r=d.raw_primary||{};document.getElementById('cards').innerHTML=`<div class=c><div class=v>${d.symbols}</div><div class=muted>marchés WS</div></div><div class=c><div class=v>${d.routes}</div><div class=muted>routes 2-leg</div></div><div class=c><div class=v>${d.ws}/${d.ws_expected}</div><div class=muted>WebSockets</div></div><div class=c><div class=v>${d.age_ms??'-'} ms</div><div class=muted>dernier BBO reçu</div></div><div class=c><div class=v>${d.v22?.decisions||0}</div><div class=muted>décisions tracées</div></div><div class=c><div class=v>${d.v22?.trace_points||0}</div><div class=muted>points trajectoire</div></div><div class=c><div class=v>${d.v22?.avg_ws_transport_ms==null?'-':d.v22.avg_ws_transport_ms.toFixed(1)+' ms'}</div><div class=muted>MEXC → VPS moyen</div></div>`;
+let bals=Object.entries(s.balances||{}).map(([k,v])=>`${k}: ${v.toFixed(2)}`).join(' · ');document.getElementById('paper').innerHTML=`<div class=tag>SIMULATION CAPITAL RÉEL</div><h3>Paper bot — capital initial ${s.capital.toFixed(0)} $</h3><div class='v big ${s.profit>=0?'good':'bad'}'>${s.profit>=0?'+':''}${s.profit.toFixed(2)} $</div><div class='v ${s.return_pct>=0?'good':'bad'}'>${s.return_pct>=0?'+':''}${s.return_pct.toFixed(3)} %</div><div class=muted>NAV actuelle : ${s.nav.toFixed(2)} $ · profits/pertes réalloués automatiquement au capital</div><div class=cards style='margin-top:12px'><div><div class=v>${s.trades}</div><div class=muted>trades exécutés</div></div><div><div class=v>${s.rebalances}</div><div class=muted>rebalances</div></div><div><div class=v>${s.rebalance_cost.toFixed(3)} $</div><div class=muted>coût rebalance</div></div><div><div class=v>${s.skipped_balance}</div><div class=muted>refus capital</div></div></div><div class=muted style='margin-top:10px'>Buckets : ${bals}<br>Règles live : âge échange ≤${d.primary_age_ms} ms · skew ≤${d.primary_max_skew_ms} ms · exécution +${d.primary_latency_ms} ms · capital réservé à T0 · 1 entrée max par événement.</div>`;
+document.getElementById('raw').innerHTML=`<div class=tag>DONNÉES BRUTES — SANS CAPITAL</div><h3>Même filtre bot, taille BBO brute</h3><div class='v big ${(r.pnl||0)>=0?'good':'bad'}'>${(r.pnl||0)>=0?'+':''}${(r.pnl||0).toFixed(2)} $</div><div class=muted>Pas de capital initial, pas de contrainte de buckets : ce PnL sert uniquement à comparer le signal brut à ce que les 2 000 $ peuvent réellement exploiter.</div><div class=cards style='margin-top:12px'><div><div class=v>${r.executed||0}</div><div class=muted>résolues</div></div><div><div class=v>${r.wins||0}</div><div class=muted>gagnantes</div></div><div><div class=v>${r.losses||0}</div><div class=muted>perdantes</div></div><div><div class=v>${r.avg_exec_net==null?'-':(100*r.avg_exec_net).toFixed(4)+'%'}</div><div class=muted>net exec moyen</div></div></div><div class=muted style='margin-top:10px'>Même condition : âge échange ≤${d.primary_age_ms} ms · skew ≤${d.primary_max_skew_ms} ms · +${d.primary_latency_ms} ms.</div>`;
+let m=d.matrix||[],h='';for(let x of m){h+=`<tr><td>${x.age} ms</td><td>${x.lat} ms</td><td>${x.n}</td><td>${x.executed}</td><td>${x.wins||0}</td><td>${x.losses||0}</td><td class='${x.pnl>=0?'good':'bad'}'>${x.pnl.toFixed(3)} $</td><td>${x.avg_exec_net==null?'-':(100*x.avg_exec_net).toFixed(4)+'%'}</td></tr>`}document.getElementById('matrix').innerHTML=h;let rh='';for(let q of (d.recent_decisions||[])){let t=new Date(q.ts_ms);rh+=`<tr><td>${t.toLocaleTimeString()}</td><td>${q.route_id}</td><td class='good'>${(100*q.decision_net).toFixed(4)}%</td><td>${q.decision_size_usd.toFixed(2)} $</td><td>${q.exchange_age_max_ms} ms</td><td>${q.exchange_skew_ms} ms</td></tr>`}document.getElementById('recent').innerHTML=rh;document.getElementById('diag').innerHTML=`<h3>Univers</h3><div class=cards><div><div class=v>${g.all_markets}</div><div class=muted>marchés découverts</div></div><div><div class=v>${g.candidate_2leg}</div><div class=muted>2-leg candidates</div></div><div><div class=v>${g.selected_2leg}</div><div class=muted>2-leg suivies</div></div><div><div class=v>${g.candidate_3leg}</div><div class=muted>3-leg détectées mais ignorées</div></div></div>`}refresh();setInterval(refresh,3000)</script></body></html>'''
+
 
 
 @app.get("/")
@@ -813,7 +995,7 @@ def bootstrap():
     print(f"[Routes V{VERSION}] source={state['market_source']} markets={diag['all_markets']} candidates={diag['candidate_routes']} "
           f"(2L={diag['candidate_2leg']},3L={diag['candidate_3leg']}) selected_symbols={len(symbols)} selected_routes={len(routes)} "
           f"(2L={diag['selected_2leg']},3L={diag['selected_3leg']}) WS={len(groups)}")
-    put_db(("meta",("version",VERSION))); put_db(("meta",("market_source",state["market_source"])))
+    put_db(("meta",("version",VERSION))); put_db(("meta",("ws_bookticker_interval","10ms"))); put_db(("meta",("trace_window_ms",str(TRACE_WINDOW_MS)))); put_db(("meta",("market_source",state["market_source"])))
     put_db(("meta",("route_diag",json.dumps(diag,sort_keys=True))))
     for _ in range(6): threading.Thread(target=scan_worker,daemon=True).start()
     threading.Thread(target=event_sweeper,daemon=True).start()
