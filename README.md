@@ -1,86 +1,35 @@
-# V3.4 — démarrage sans MEXC REST
+# MEXC Spot Routes V2.3 — Depth Strict
 
-Au démarrage, le scanner charge les 150 paires du dernier `universe_snapshots` de `scanner_v3.db`. Il ouvre ensuite immédiatement Gate WS et MEXC WS. `exchangeInfo` n'est plus appelé au démarrage normal. Si aucune base/univers en cache n'existe, la découverte REST reste uniquement comme solution de secours.
+Version préparée après audit de la V2.2 TopBook LocalAge.
 
-# V3.2 — MEXC WebSocket
+## Objectif
+Scanner spot-only MEXC, routes 2 jambes entre USDT/USDC/USD1, avec carnet local multi-niveaux reconstruit via snapshot REST + diff-depth WebSocket 10 ms. Aucun futures/perp.
 
-MEXC BBO passe en WebSocket protobuf natif, réparti sur 5 connexions max de 30 souscriptions. Gate reste en WebSocket. Le REST MEXC n'est plus utilisé pour le flux BBO continu; il reste utilisé ponctuellement pour la découverte initiale et la vérification de profondeur.
+## Corrections V2.3
+- DB séparée: `mexc_routes_v23.db`.
+- Admission Paper basée sur âge/skew **locaux de réception**, jamais sur `sendtime MEXC -> VPS` non corrigé.
+- Snapshot REST `/api/v3/depth?limit=100` + deltas WS versionnés avant qu'un carnet soit `ready`.
+- Exécution séquentielle: leg 1 vers +75 ms, leg 2 vers +150 ms, `depth_walk` multi-niveaux.
+- Une fois leg 1 exécutée, le résultat est irréversible: succès, perte ou échec de leg 2 est compté.
+- Si leg 2 est partielle/impossible: emergency unwind du reliquat via la leg 1 en sens inverse. Tout reliquat encore impossible à liquider est valorisé à zéro (hypothèse volontairement conservatrice).
+- Nouvelle table `paper_execution_attempts` contenant aussi les forced unwinds et pertes; `paper_trades` reste la table legacy des 2-leg complètes.
+- Anti-répétition économique: après une entrée, route désarmée; réarmement seulement après spread <=0% pendant 1000 ms continus + cooldown dur 5000 ms.
+- Capital réservé à T0; profits/pertes restent dans les balances; rebalances et coûts conservés.
+- WS latency brute conservée uniquement en diagnostic et échantillonnée toutes les 10 s/symbole pour éviter une DB gigantesque.
 
-# V3.1 — correctif MEXC 403
+## Paramètres par défaut importants
+- Capital Paper: 2000 USD, partagé entre USDT/USDC/USD1.
+- Fee: 0.05% taker par leg.
+- Signal min net: +0.01%.
+- Paper local BBO age <=150 ms, local skew <=50 ms.
+- 599/600 symboles max; 30 subscriptions max par WS.
+- REST requis. Si les snapshots REST échouent, les carnets ne deviennent pas prêts et le Paper Bot ne doit pas trader.
 
-Cette version remplace le polling MEXC 100 ms par un intervalle par défaut de 250 ms
-et ajoute un backoff exponentiel automatique sur HTTP 403/429 (2 s à 60 s).
-Le dashboard distingue désormais le **cycle MEXC réel** de la **latence HTTP MEXC**.
+## Avant démarrage sur VPS Asie
+1. Vérifier `curl -4 -I https://api.mexc.com` et un GET `/api/v3/depth` => HTTP 200.
+2. Vérifier NTP/chrony, mais ne pas utiliser le timestamp MEXC brut comme filtre de trading.
+3. Lancer avec une DB V2.3 neuve.
+4. Contrôler `depth_ready == symbols` avant d'interpréter les résultats.
+5. Surveiller WS reconnects, queue/backlog, BBO local age p50/p95 et CPU/RAM.
 
-# MEXC ↔ Gate Arbitrage Scanner V3
-
-Scanner **lecture seule** : aucune clé API, aucun ordre.
-
-## Ce qui change par rapport à V2
-
-- Tailles : **250 / 500 / 1 000 / 2 000 USDT**
-- Univers dynamique : jusqu'à **150 paires USDT communes** à MEXC et Gate
-- Préférence aux marchés moins liquides mais encore tradables
-- Paires V2 intéressantes épinglées : ARB, FET, SEI, NEAR, XRP, OP, SUI, DOGE, AAVE, RENDER, PEPE, ADA
-- Gate BBO via WebSocket
-- MEXC BBO récupéré en **un seul appel pour toutes les paires**, cible 100 ms
-- Vérification exacte par carnet 100 niveaux uniquement lorsque le spread BBO devient intéressant
-- Les ticks positifs sont regroupés en **événements**
-- Le dashboard compte donc le **nombre d'opportunités par token**
-- Base séparée : `scanner_v3.db`
-
-## Pourquoi MEXC n'utilise pas directement son WebSocket ici ?
-
-Le flux Spot WebSocket MEXC actuel est en Protocol Buffers. Pour rendre le déploiement V3 simple et robuste sur le VPS actuel, le scanner utilise l'endpoint public `ticker/bookTicker` qui renvoie **tous les symboles en un appel**, avec une cible de 100 ms. Cela supprime le défaut V2 où ~30 requêtes séquentielles donnaient ~40 secondes entre deux mesures d'une même paire.
-
-La V3 affiche le `cycle MEXC` réel sur la page. Il faut se fier à cette valeur mesurée et non à la cible théorique de 100 ms.
-
-Une V3.1 pourra passer le côté MEXC en WebSocket Protocol Buffers 100 ms/10 ms si l'on veut encore réduire la latence.
-
-## Installation / mise à jour
-
-Dans le dépôt :
-
-```bash
-source venv/bin/activate
-pip install -r requirements.txt
-python app.py
-```
-
-Dashboard : port 8080.
-
-## Variables utiles
-
-```bash
-MAX_PAIRS=150
-MEXC_BBO_INTERVAL=0.10
-MIN_QUOTE_VOL_24H=100000
-MAX_QUOTE_VOL_24H=75000000
-PREFILTER_GROSS=0.0004
-VERIFY_COOLDOWN_MS=250
-EVENT_CLOSE_GAP_MS=1000
-```
-
-## Base SQLite
-
-### `verified_checks`
-Mesures exactes après lecture de la profondeur pour chacune des quatre tailles.
-
-### `opportunities`
-Une ligne = **une opportunité**, et non un tick.
-Champs utiles :
-- pair
-- direction
-- start_ms / end_ms
-- duration_ms
-- ticks
-- peak_net / avg_net
-- peak_profit
-- best_size
-
-### `universe_snapshots`
-Pourquoi une paire a été sélectionnée : volumes 24 h et score de volatilité/liquidité.
-
-## Important
-
-Le profit affiché est un **profit théorique après frais de trading configurés**, mais avant risque de latence/exécution, retrait, rééquilibrage, etc. Ce scanner sert à identifier les marchés à tester avant tout bot d'exécution.
+Cette version reste PAPER/RESEARCH. Elle ne contient aucune fonction d'envoi d'ordre réel.
