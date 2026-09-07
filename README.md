@@ -1,19 +1,15 @@
-# MEXC Spot 2-Leg Scanner V2.2 Depth
+# MEXC Spot 2-leg Scanner V2.2 TopBook (nuit OVH)
 
-Deux vues en parallèle :
+Version temporaire sans snapshot REST, conçue pour fonctionner malgré le blocage REST MEXC sur le VPS OVH.
 
-1. **RAW / research** — sans capital initial. Le flux marché provient du carnet local MEXC maintenu par `aggre.depth @10ms`; timestamps MEXC/VPS, âge/skew, traces T0→300 ms et matrice de latence restent enregistrés. Le PnL brut sert de référence de capacité du signal.
-2. **Paper bot 2 000 $** — 2 000 $ répartis au départ entre USDT/USDC/USD1. Capital réservé à T0, une entrée max par événement, profits/pertes réinjectés dans les balances, rebalance dynamique. L'exécution est désormais **séquentielle et multi-niveaux** : le leg 1 marche le carnet vers la moitié de la latence totale, puis le leg 2 marche le carnet à la latence totale avec exactement l'actif intermédiaire obtenu.
+- Spot 2-leg uniquement.
+- WebSocket MEXC BookTicker 10 ms.
+- **Niveau 1 du carnet uniquement** : best bid/ask + quantité disponible au meilleur prix.
+- Aucun snapshot REST et aucune profondeur multi-niveaux inventée.
+- Timestamps MEXC + réception VPS, âge BBO, skew, trajectoires jusqu'à +300 ms.
+- Recherche brute sans capital + matrice âge/latence.
+- Paper bot 2 000 USD : 666.67 par USDT/USDC/USD1, capital réservé à T0, profits/pertes composés, rebalances.
+- Paper bot séquentiel : leg 1 vers +75 ms, leg 2 vers +150 ms, chacun limité à la quantité réellement visible au **premier niveau BBO** à cet instant.
+- Si le niveau 1 du leg 2 ne peut pas absorber toute la quantité obtenue au leg 1, l'exécution est classée comme non résolue/risque ; aucune profondeur cachée n'est supposée.
 
-## Carnet local
-- WebSocket MEXC `spot@public.aggre.depth.v3.api.pb@10ms@SYMBOL`
-- snapshot REST `/api/v3/depth?limit=100`
-- suivi des versions; resynchronisation si un gap est détecté
-- BBO dérivé du carnet local, donc un seul stream/symbol
-- dashboard : nombre de carnets `depth prêts`
-
-Défauts paper : âge échange <=150 ms, skew <=50 ms, latence totale 150 ms (leg 1 ~75 ms, leg 2 ~150 ms), frais taker 0,05 %/leg, minimum 10 $.
-
-Base : `mexc_routes_v22.db` — dashboard : port 8081.
-
-Cette version reste un simulateur : elle n'envoie aucun ordre réel. Les vrais fills/ACK/API seront mesurés plus tard en shadow/live micro-capital.
+Cette version sert à collecter cette nuit. La V2.2 Depth multi-niveaux restera la cible pour le nouveau VPS où REST MEXC est accessible.
