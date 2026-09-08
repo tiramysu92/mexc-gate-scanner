@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, render_template_string
 import websocket
 
-VERSION = "2.3.2-depth-resync"
+VERSION = "2.3.3-shadow"
 HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", "8081"))
 DB_PATH = os.getenv("DB_PATH", "mexc_routes_v23.db")
@@ -50,6 +50,15 @@ SIM_DONOR_RESERVE_PCT = float(os.getenv("SIM_DONOR_RESERVE_PCT", "0.10"))
 REBALANCE_MAX_PROFIT_SHARE = float(os.getenv("REBALANCE_MAX_PROFIT_SHARE", "0.80"))
 REBALANCE_EDGE_MULT = float(os.getenv("REBALANCE_EDGE_MULT", "1.25"))
 
+# Shadow-live execution profiles: same real MEXC depth feed, no real orders.
+SHADOW_PROFILES = {
+    "FAST": (15, 30),
+    "TARGET": (25, 50),
+    "DEGRADED": (50, 100),
+}
+SHADOW_BBO_AGE_MS = int(os.getenv("SHADOW_BBO_AGE_MS", "150"))
+SHADOW_MAX_SKEW_MS = int(os.getenv("SHADOW_MAX_SKEW_MS", "50"))
+
 # Historical research data
 SNAPSHOT_INTERVAL_SEC = float(os.getenv("SNAPSHOT_INTERVAL_SEC", "2.0"))
 SNAPSHOT_TOP_N = int(os.getenv("SNAPSHOT_TOP_N", "50"))
@@ -81,6 +90,15 @@ paper_route_armed = defaultdict(lambda: True)
 paper_route_neutral_since = {}
 paper_route_last_trade = defaultdict(int)
 paper_open_exposures = {}
+
+shadow_lock = threading.RLock()
+shadow_states = {}
+shadow_reserved = defaultdict(lambda: defaultdict(float))
+shadow_open_exposures = defaultdict(dict)
+shadow_consumed_events = set()
+shadow_route_armed = defaultdict(lambda: True)
+shadow_route_neutral_since = {}
+shadow_route_last_trade = defaultdict(int)
 active_traces = {}
 trace_lock = threading.RLock()
 ws_latency_last_sample = {}
@@ -206,6 +224,32 @@ def db_writer():
       skipped_rebalance INTEGER NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS shadow_state(
+      profile TEXT NOT NULL, day TEXT NOT NULL, updated_ts_ms INTEGER NOT NULL, balances_json TEXT NOT NULL,
+      profit_bank REAL NOT NULL, trades INTEGER NOT NULL, wins INTEGER NOT NULL, losses INTEGER NOT NULL,
+      rebalances INTEGER NOT NULL, rebalance_cost REAL NOT NULL, skipped_flash INTEGER NOT NULL,
+      skipped_balance INTEGER NOT NULL, skipped_rebalance INTEGER NOT NULL,
+      PRIMARY KEY(profile,day)
+    );
+
+    CREATE TABLE IF NOT EXISTS shadow_attempts(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, profile TEXT NOT NULL, day TEXT NOT NULL, ts_ms INTEGER NOT NULL,
+      decision_id TEXT NOT NULL, route_id TEXT NOT NULL, event_start_ts_ms INTEGER NOT NULL, status TEXT NOT NULL,
+      input_usd REAL NOT NULL, leg1_input_units REAL NOT NULL, leg1_mid_units REAL NOT NULL,
+      leg2_mid_used REAL NOT NULL, leg2_output_units REAL NOT NULL, unwind_mid_used REAL NOT NULL,
+      unwind_start_units REAL NOT NULL, stranded_mid_units REAL NOT NULL, output_usd_total REAL NOT NULL, profit_usd REAL NOT NULL,
+      UNIQUE(profile,decision_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_shadow_attempt_day ON shadow_attempts(profile,day,ts_ms);
+
+    CREATE TABLE IF NOT EXISTS shadow_open_exposures(
+      profile TEXT NOT NULL, decision_id TEXT NOT NULL, day TEXT NOT NULL, route_id TEXT NOT NULL,
+      opened_ts_ms INTEGER NOT NULL, updated_ts_ms INTEGER NOT NULL, symbol TEXT NOT NULL, mid_asset TEXT NOT NULL,
+      start_asset TEXT NOT NULL, units REAL NOT NULL, recovered_start_units REAL NOT NULL DEFAULT 0,
+      input_usd REAL NOT NULL DEFAULT 0, cash_output_usd REAL NOT NULL DEFAULT 0, recovered_usd REAL NOT NULL DEFAULT 0,
+      last_mark_usd REAL NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'open', PRIMARY KEY(profile,decision_id)
+    );
+
     CREATE TABLE IF NOT EXISTS route_snapshots(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       ts_ms INTEGER NOT NULL,
@@ -304,6 +348,15 @@ def db_writer():
             elif typ == "paper_state":
                 con.execute("""INSERT OR REPLACE INTO paper_state(day,updated_ts_ms,balances_json,profit_bank,trades,rebalances,
                     rebalance_cost,skipped_flash,skipped_balance,skipped_rebalance) VALUES(?,?,?,?,?,?,?,?,?,?)""", payload)
+            elif typ == "shadow_state":
+                con.execute("""INSERT OR REPLACE INTO shadow_state(profile,day,updated_ts_ms,balances_json,profit_bank,trades,wins,losses,rebalances,rebalance_cost,skipped_flash,skipped_balance,skipped_rebalance) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", payload)
+            elif typ == "shadow_attempt":
+                con.execute("""INSERT OR IGNORE INTO shadow_attempts(profile,day,ts_ms,decision_id,route_id,event_start_ts_ms,status,input_usd,leg1_input_units,leg1_mid_units,leg2_mid_used,leg2_output_units,unwind_mid_used,unwind_start_units,stranded_mid_units,output_usd_total,profit_usd) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", payload)
+            elif typ == "shadow_open":
+                con.execute("""INSERT OR REPLACE INTO shadow_open_exposures(profile,decision_id,day,route_id,opened_ts_ms,updated_ts_ms,symbol,mid_asset,start_asset,units,recovered_start_units,input_usd,cash_output_usd,recovered_usd,last_mark_usd,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", payload)
+            elif typ == "shadow_close":
+                con.execute("UPDATE shadow_open_exposures SET updated_ts_ms=?,units=0,recovered_start_units=?,recovered_usd=?,last_mark_usd=0,status='closed' WHERE profile=? AND decision_id=?", payload[:5])
+                con.execute("UPDATE shadow_attempts SET status='forced_unwind_later',output_usd_total=?,profit_usd=? WHERE profile=? AND decision_id=?", payload[5:])
             elif typ == "snapshot_many":
                 con.executemany("INSERT INTO route_snapshots(ts_ms,route_id,route_type,net,executable_usd,max_bbo_age_ms) VALUES(?,?,?,?,?,?)", payload)
             elif typ == "stable_many":
@@ -965,9 +1018,150 @@ def open_exposure_worker():
                 persist_paper()
 
 
+# ---------- Shadow-live engine (no real orders) ----------
+def shadow_default(day):
+    each=SIM_CAPITAL/len(STABLES) if STABLES else 0.0
+    return {"day":day,"balances":{x:each for x in STABLES},"profit_bank":0.0,"trades":0,"wins":0,"losses":0,
+            "rebalances":0,"rebalance_cost":0.0,"skipped_flash":0,"skipped_balance":0,"skipped_rebalance":0}
+
+def load_shadow_state():
+    _,_,day=local_day_bounds_ms(0)
+    with shadow_lock:
+        for profile in SHADOW_PROFILES:
+            shadow_states[profile]=shadow_default(day)
+            shadow_reserved[profile].clear(); shadow_open_exposures[profile].clear()
+    try:
+        con=sqlite3.connect(DB_PATH,timeout=10)
+        for profile in SHADOW_PROFILES:
+            r=con.execute("SELECT day,balances_json,profit_bank,trades,wins,losses,rebalances,rebalance_cost,skipped_flash,skipped_balance,skipped_rebalance FROM shadow_state WHERE profile=? AND day=?",(profile,day)).fetchone()
+            if r:
+                shadow_states[profile]={"day":r[0],"balances":json.loads(r[1]),"profit_bank":float(r[2]),"trades":int(r[3]),"wins":int(r[4]),"losses":int(r[5]),"rebalances":int(r[6]),"rebalance_cost":float(r[7]),"skipped_flash":int(r[8]),"skipped_balance":int(r[9]),"skipped_rebalance":int(r[10])}
+            for x in con.execute("SELECT decision_id,day,route_id,opened_ts_ms,updated_ts_ms,symbol,mid_asset,start_asset,units,recovered_start_units,input_usd,cash_output_usd,recovered_usd,last_mark_usd,status FROM shadow_open_exposures WHERE profile=? AND day=? AND status='open' AND units>0",(profile,day)).fetchall():
+                shadow_open_exposures[profile][x[0]]={"decision_id":x[0],"day":x[1],"route_id":x[2],"opened_ts_ms":x[3],"updated_ts_ms":x[4],"symbol":x[5],"mid_asset":x[6],"start_asset":x[7],"units":float(x[8]),"recovered_start_units":float(x[9]),"input_usd":float(x[10]),"cash_output_usd":float(x[11]),"recovered_usd":float(x[12]),"last_mark_usd":float(x[13]),"status":x[14]}
+        con.close()
+    except Exception as e: logerr(f"shadow restore: {e}")
+
+def ensure_shadow_day(profile):
+    _,_,day=local_day_bounds_ms(0)
+    st=shadow_states.get(profile)
+    if not st or st.get("day")!=day:
+        shadow_states[profile]=shadow_default(day); shadow_reserved[profile].clear(); shadow_open_exposures[profile].clear(); persist_shadow(profile)
+    return shadow_states[profile]
+
+def persist_shadow(profile):
+    st=shadow_states[profile]
+    put_db(("shadow_state",(profile,st["day"],now_ms(),json.dumps(st["balances"],sort_keys=True),st["profit_bank"],st["trades"],st["wins"],st["losses"],st["rebalances"],st["rebalance_cost"],st["skipped_flash"],st["skipped_balance"],st["skipped_rebalance"])))
+
+def shadow_choose_rebalance(profile,target_asset,needed_units,event_x,books,meta):
+    st=shadow_states[profile]; target_mark=stable_mark_usdt(target_asset,books,meta)
+    if target_mark<=0 or needed_units<=0 or st["profit_bank"]<=0: return None
+    initial_each=SIM_CAPITAL/len(STABLES); candidates=[]
+    for donor,bal in st["balances"].items():
+        if donor==target_asset: continue
+        donor_mark=stable_mark_usdt(donor,books,meta); reserve_units=(initial_each*SIM_DONOR_RESERVE_PCT)/max(donor_mark,1e-12)
+        available=max(0.0,bal-shadow_reserved[profile].get(donor,0.0)-reserve_units)
+        if available<=0: continue
+        probe=stable_conversion(donor,target_asset,available,books,meta)
+        if not probe or probe["rate"]<=0: continue
+        conv=stable_conversion(donor,target_asset,min(available,needed_units/probe["rate"]),books,meta)
+        if not conv: continue
+        expected=conv["output"]*target_mark*max(event_x["net"],0.0); budget=st["profit_bank"]*REBALANCE_MAX_PROFIT_SHARE
+        if conv["cost"]>budget+1e-12: continue
+        if conv["cost"]>0 and expected<conv["cost"]*REBALANCE_EDGE_MULT: continue
+        candidates.append((expected-conv["cost"],donor,conv))
+    if not candidates: return None
+    candidates.sort(reverse=True,key=lambda x:x[0]); return candidates[0][1],candidates[0][2]
+
+def reserve_shadow_trade(profile,route,event_x,event_start_ts,decision_id,decision_ts):
+    with shadow_lock:
+        st=ensure_shadow_day(profile)
+        with state_lock: books=dict(state["bbo"]); meta=state["market_meta"]
+        s,e=route["path"][0],route["path"][-1]
+        if s not in st["balances"] or e not in st["balances"]: return None
+        sm=event_x["start_mark"]; desired=event_x["size"]/max(sm,1e-12)
+        free=max(0.0,st["balances"].get(s,0.0)-shadow_reserved[profile].get(s,0.0)); shortage=max(0.0,desired-free)
+        if shortage>0:
+            rb=shadow_choose_rebalance(profile,s,shortage,event_x,books,meta)
+            if rb:
+                donor,conv=rb; st["balances"][donor]-=conv["input"]; st["balances"][s]+=conv["output"]; st["rebalances"]+=1; st["rebalance_cost"]+=conv["cost"]; st["profit_bank"]=max(0.0,st["profit_bank"]-conv["cost"]*REBALANCE_COVER_MULT)
+                free=max(0.0,st["balances"].get(s,0.0)-shadow_reserved[profile].get(s,0.0))
+            else: st["skipped_rebalance"]+=1
+        input_units=min(free,desired); input_usd=input_units*sm
+        if input_usd<SIM_MIN_TRADE_USD: st["skipped_balance"]+=1; persist_shadow(profile); return None
+        shadow_reserved[profile][s]+=input_units; persist_shadow(profile)
+        l1,l2=SHADOW_PROFILES[profile]
+        return {"profile":profile,"decision_id":decision_id,"route":route,"event_start_ts":event_start_ts,"t0":decision_ts,"x0":dict(event_x),"start_asset":s,"end_asset":e,"reserved_units":input_units,"reserved_usd":input_usd,"leg1_due":decision_ts+l1,"leg2_due":decision_ts+l2,"stage":1}
+
+def shadow_leg1(q):
+    r=q["route"]; sym=r["symbols"][0]; frm,to=r["path"][0],r["path"][1]
+    with state_lock: meta=state["market_meta"]
+    fill=depth_walk(sym,frm,to,q["reserved_units"],meta)
+    if not fill or fill["input_used"]*q["x0"]["start_mark"]<SIM_MIN_TRADE_USD: return False
+    q["leg1"]=fill; q["stage"]=2; return True
+
+def settle_shadow_trade(q,exec_ts):
+    profile=q["profile"]
+    with shadow_lock:
+        st=ensure_shadow_day(profile); s,e=q["start_asset"],q["end_asset"]; reserved=q["reserved_units"]; r=q["route"]; mid=r["path"][1]; sym1,sym2=r["symbols"]
+        with state_lock: meta=state["market_meta"]; books=dict(state["bbo"])
+        leg1=q["leg1"]; mid_total=leg1["output"]; input_units=min(leg1["input_used"],st["balances"].get(s,0.0)); input_usd=input_units*q["x0"]["start_mark"]
+        fill2=depth_walk(sym2,mid,e,mid_total,meta); leg2_used=fill2["input_used"] if fill2 else 0.0; end_out=fill2["output"] if fill2 else 0.0
+        remaining=max(0.0,mid_total-leg2_used); unwind=depth_walk(sym1,mid,s,remaining,meta) if remaining>1e-12 else None
+        unwind_used=unwind["input_used"] if unwind else 0.0; start_back=unwind["output"] if unwind else 0.0; open_units=max(0.0,remaining-unwind_used)
+        shadow_reserved[profile][s]=max(0.0,shadow_reserved[profile].get(s,0.0)-reserved)
+        st["balances"][s]-=input_units; st["balances"][s]+=start_back; st["balances"][e]+=end_out
+        sm=stable_mark_usdt(s,books,meta); em=stable_mark_usdt(e,books,meta); cash_output=start_back*sm+end_out*em
+        mark_usd=0.0; status="completed" if remaining<=1e-12 else ("forced_unwind" if open_units<=1e-12 else "open_exposure")
+        if open_units>1e-12:
+            exp={"decision_id":q["decision_id"],"day":st["day"],"route_id":r["id"],"opened_ts_ms":exec_ts,"updated_ts_ms":exec_ts,"symbol":sym1,"mid_asset":mid,"start_asset":s,"units":open_units,"recovered_start_units":0.0,"input_usd":input_usd,"cash_output_usd":cash_output,"recovered_usd":0.0,"last_mark_usd":0.0,"status":"open"}
+            mark_usd=exposure_mark_usd(exp,books,meta); exp["last_mark_usd"]=mark_usd; shadow_open_exposures[profile][q["decision_id"]]=exp
+            put_db(("shadow_open",(profile,exp["decision_id"],exp["day"],exp["route_id"],exp["opened_ts_ms"],exp["updated_ts_ms"],exp["symbol"],exp["mid_asset"],exp["start_asset"],exp["units"],0.0,input_usd,cash_output,0.0,mark_usd,"open")))
+        economic_output=cash_output+mark_usd; profit=economic_output-input_usd; st["trades"]+=1; st["profit_bank"]+=(cash_output-input_usd)
+        if profit>0: st["wins"]+=1
+        elif profit<0: st["losses"]+=1
+        put_db(("shadow_attempt",(profile,st["day"],exec_ts,q["decision_id"],r["id"],q["event_start_ts"],status,input_usd,input_units,mid_total,leg2_used,end_out,unwind_used,start_back,open_units,economic_output,profit)))
+        persist_shadow(profile)
+
+def shadow_exposure_worker():
+    while True:
+        time.sleep(.10)
+        with shadow_lock:
+            with state_lock: meta=state["market_meta"]; books=dict(state["bbo"])
+            for profile in SHADOW_PROFILES:
+                st=ensure_shadow_day(profile)
+                for did,exp in list(shadow_open_exposures[profile].items()):
+                    units=max(0.0,float(exp.get("units",0.0)))
+                    if units<=1e-12: shadow_open_exposures[profile].pop(did,None); continue
+                    fill=depth_walk(exp["symbol"],exp["mid_asset"],exp["start_asset"],units,meta)
+                    if not fill: exp["last_mark_usd"]=exposure_mark_usd(exp,books,meta); continue
+                    used,recovered=fill["input_used"],fill["output"]
+                    if used<=0: continue
+                    exp["units"]=max(0.0,units-used); exp["recovered_start_units"]+=recovered; exp["updated_ts_ms"]=now_ms(); st["balances"][exp["start_asset"]]=st["balances"].get(exp["start_asset"],0.0)+recovered
+                    recovered_usd=recovered*stable_mark_usdt(exp["start_asset"],books,meta); exp["recovered_usd"]+=recovered_usd; st["profit_bank"]+=recovered_usd; exp["last_mark_usd"]=exposure_mark_usd(exp,books,meta) if exp["units"]>1e-12 else 0.0
+                    if exp["units"]<=1e-12:
+                        final_output=exp["cash_output_usd"]+exp["recovered_usd"]; final_profit=final_output-exp["input_usd"]
+                        put_db(("shadow_close",(exp["updated_ts_ms"],exp["recovered_start_units"],exp["recovered_usd"],profile,did,final_output,final_profit,profile,did)))
+                        shadow_open_exposures[profile].pop(did,None)
+                    else:
+                        put_db(("shadow_open",(profile,did,exp["day"],exp["route_id"],exp["opened_ts_ms"],exp["updated_ts_ms"],exp["symbol"],exp["mid_asset"],exp["start_asset"],exp["units"],exp["recovered_start_units"],exp["input_usd"],exp["cash_output_usd"],exp["recovered_usd"],exp["last_mark_usd"],"open")))
+                    persist_shadow(profile)
+
+def shadow_status():
+    out={}
+    with state_lock: books=dict(state["bbo"]); meta=state["market_meta"]
+    with shadow_lock:
+        for profile,(l1,l2) in SHADOW_PROFILES.items():
+            st=dict(ensure_shadow_day(profile)); st["balances"]=dict(st["balances"])
+            nav=sum(v*stable_mark_usdt(a,books,meta) for a,v in st["balances"].items())
+            exposures=[dict(x) for x in shadow_open_exposures[profile].values()]; exp_nav=sum(exposure_mark_usd(x,books,meta) for x in exposures); nav+=exp_nav
+            st.update({"profile":profile,"leg1_ms":l1,"leg2_ms":l2,"capital":SIM_CAPITAL,"nav":nav,"profit":nav-SIM_CAPITAL,"return_pct":(nav/SIM_CAPITAL-1)*100 if SIM_CAPITAL else 0.0,"open_exposures":len(exposures),"open_exposure_nav":exp_nav,"reserved":dict(shadow_reserved[profile])})
+            out[profile]=st
+    return out
+
 # ---------- V2.1 immediate-decision / delayed-execution research ----------
 pending_trials=[]
 pending_paper_trials=[]
+pending_shadow_trials=[]
 pending_lock=threading.RLock()
 last_decision_ms={}
 DECISION_COOLDOWN_MS=int(os.getenv("DECISION_COOLDOWN_MS","250"))
@@ -1028,9 +1222,20 @@ def schedule_decision(route,x,ts,event_start_ts):
             paper_consumed_events.add(event_key); paper_route_armed[rid]=False; paper_route_last_trade[rid]=ts; paper_route_neutral_since.pop(rid,None)
             with pending_lock: pending_paper_trials.append(q)
 
+    # Shadow-live: same event, three independent $2k portfolios and measured depth at profile latencies.
+    shadow_ok=(shadow_route_armed[rid] and ts-shadow_route_last_trade[rid]>=PAPER_HARD_COOLDOWN_MS)
+    if shadow_ok and event_key not in shadow_consumed_events and x.get("max_age",999999)<=SHADOW_BBO_AGE_MS and x.get("bbo_skew",999999)<=SHADOW_MAX_SKEW_MS:
+        qs=[]
+        for profile in SHADOW_PROFILES:
+            sq=reserve_shadow_trade(profile,route,x,event_start_ts,did,ts)
+            if sq: qs.append(sq)
+        if qs:
+            shadow_consumed_events.add(event_key); shadow_route_armed[rid]=False; shadow_route_last_trade[rid]=ts; shadow_route_neutral_since.pop(rid,None)
+            with pending_lock: pending_shadow_trials.extend(qs)
+
 def execution_trial_worker():
     while True:
-        time.sleep(.005); ts=now_ms(); due=[]; paper_due=[]
+        time.sleep(.005); ts=now_ms(); due=[]; paper_due=[]; shadow_due=[]
         with pending_lock:
             keep=[]
             for q in pending_trials:
@@ -1040,7 +1245,11 @@ def execution_trial_worker():
             for q in pending_paper_trials:
                 (paper_due if (q["leg1_due"] if q.get("stage",1)==1 else q["leg2_due"])<=ts else pkeep).append(q)
             pending_paper_trials[:] = pkeep
-        if not due and not paper_due: continue
+            skeep=[]
+            for q in pending_shadow_trials:
+                (shadow_due if (q["leg1_due"] if q.get("stage",1)==1 else q["leg2_due"])<=ts else skeep).append(q)
+            pending_shadow_trials[:] = skeep
+        if not due and not paper_due and not shadow_due: continue
         with state_lock:
             books=dict(state["bbo"]); meta=state["market_meta"]
         for q in due:
@@ -1067,6 +1276,15 @@ def execution_trial_worker():
                         paper["skipped_flash"]+=1; persist_paper()
             else:
                 settle_paper_trade(q,ts)
+        for q in shadow_due:
+            if q.get("stage",1)==1:
+                if shadow_leg1(q):
+                    with pending_lock: pending_shadow_trials.append(q)
+                else:
+                    with shadow_lock:
+                        p=q["profile"]; shadow_reserved[p][q["start_asset"]]=max(0.0,shadow_reserved[p].get(q["start_asset"],0.0)-q["reserved_units"]); shadow_states[p]["skipped_flash"]+=1; persist_shadow(p)
+            else:
+                settle_shadow_trade(q,ts)
 
 # ---------- Event aggregation ----------
 def close_event(key,ev,end_ts=None):
@@ -1077,6 +1295,7 @@ def close_event(key,ev,end_ts=None):
              ev.get("confirm_ts"),ev.get("confirm_net"),ev.get("confirm_size"),ev.get("confirm_profit"),ev.get("confirm_ticks"))
     put_db(("event",payload))
     paper_consumed_events.discard((ev["route_id"],int(ev["start_ts"])))
+    shadow_consumed_events.discard((ev["route_id"],int(ev["start_ts"])))
 
 def process_route(route,ts):
     with state_lock:
@@ -1095,6 +1314,14 @@ def process_route(route,ts):
                 paper_route_armed[key]=True; paper_route_neutral_since.pop(key,None)
         else:
             paper_route_neutral_since.pop(key,None)
+    if not shadow_route_armed[key]:
+        if x is not None and x["net"]<=PAPER_REARM_NET:
+            since=shadow_route_neutral_since.get(key)
+            if since is None: shadow_route_neutral_since[key]=ts
+            elif ts-since>=PAPER_REARM_NEUTRAL_MS:
+                shadow_route_armed[key]=True; shadow_route_neutral_since.pop(key,None)
+        else:
+            shadow_route_neutral_since.pop(key,None)
     with event_lock:
         ev=active_events.get(key)
         if x and x["net"]>=MIN_NET:
@@ -1296,17 +1523,20 @@ def api_status():
                  "research_ages":RESEARCH_BBO_AGES_MS,"research_latencies":RESEARCH_LATENCIES_MS,
                  "matrix":execution_matrix(),"raw_primary":raw_primary_status(),"rebalance_cover_mult":REBALANCE_COVER_MULT,"v22":v22_stats(),
                  "trace_window_ms":TRACE_WINDOW_MS,"decision_max_recv_age_ms":DECISION_MAX_RECV_AGE_MS,"decision_max_skew_ms":DECISION_MAX_SKEW_MS,"primary_max_skew_ms":PRIMARY_MAX_SKEW_MS,"paper_rearm_neutral_ms":PAPER_REARM_NEUTRAL_MS,"paper_hard_cooldown_ms":PAPER_HARD_COOLDOWN_MS,
-                 "recent_decisions":recent_v22_decisions()})
+                 "recent_decisions":recent_v22_decisions(),"shadows":shadow_status(),
+                 "shadow_profiles":{k:{"leg1_ms":v[0],"leg2_ms":v[1]} for k,v in SHADOW_PROFILES.items()}})
     return jsonify(base)
 
-HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MEXC 2-Leg V2.3.1 Depth Strict</title>
+HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MEXC 2-Leg V2.3.3 Shadow</title>
 <style>body{background:#090d14;color:#e8edf5;font-family:system-ui;margin:0;padding:16px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.c,.panel{background:#111827;border:1px solid #273248;border-radius:10px;padding:12px}.compare{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;margin-top:12px}.v{font-weight:800;font-size:20px}.big{font-size:28px}.muted{color:#9aa7bd;font-size:12px}.good{color:#22d38a}.bad{color:#ff6677}.panel{margin-top:12px;overflow:auto}.compare .panel{margin-top:0}table{border-collapse:collapse;width:100%;font-size:12px}th,td{padding:8px;border-bottom:1px solid #263044;text-align:right}th:first-child,td:first-child{text-align:left}.tag{display:inline-block;border:1px solid #334155;border-radius:999px;padding:3px 7px;font-size:11px;color:#bac6d8}</style></head><body>
-<h2>MEXC — Scanner Spot 2-leg V2.3.1 Depth Strict</h2><div class=cards id=cards></div>
+<h2>MEXC — Scanner Spot 2-leg V2.3.3 Shadow</h2><div class=cards id=cards></div>
 <div class=compare><div class=panel id=paper></div><div class=panel id=raw></div></div>
+<div class=panel id=shadows></div>
 <div class=panel><h3>Décisions récentes — trace 0→300 ms</h3><table><thead><tr><th>Heure</th><th>Route</th><th>Edge T0</th><th>Taille BBO</th><th>Âge échange</th><th>Skew échange</th></tr></thead><tbody id=recent></tbody></table></div>
 <div class=panel><h3>Matrice brute exécution — journée fixe</h3><div class=muted>Sans capital de base : mesure du signal et de la latence. Carnet local depth 10 ms pour le flux marché; décision immédiate à T0, gains et pertes conservés. Le PnL brut peut utiliser une taille BBO supérieure à 2 000 $.</div><table><thead><tr><th>Âge réception max</th><th>Latence</th><th>Décisions</th><th>Résolues</th><th>Gagnantes</th><th>Perdantes</th><th>PnL brut</th><th>Net exec moy.</th></tr></thead><tbody id=matrix></tbody></table></div><div class=panel id=diag></div>
 <script>async function refresh(){let d=await fetch('/api/status').then(r=>r.json()),g=d.diag,s=d.sim,r=d.raw_primary||{};document.getElementById('cards').innerHTML=`<div class=c><div class=v>${d.symbols}</div><div class=muted>marchés WS</div></div><div class=c><div class=v>${d.routes}</div><div class=muted>routes 2-leg</div></div><div class=c><div class=v>${d.ws}/${d.ws_expected}</div><div class=muted>WebSockets</div></div><div class=c><div class=v>${d.age_ms??'-'} ms</div><div class=muted>dernier BBO reçu</div></div><div class=c><div class=v>${d.depth_ready||0}/${d.symbols}</div><div class=muted>carnets depth prêts</div></div><div class=c><div class=v>${d.v22?.decisions||0}</div><div class=muted>décisions tracées</div></div><div class=c><div class=v>${d.v22?.trace_points||0}</div><div class=muted>points trajectoire</div></div><div class=c><div class=v>${d.v22?.avg_ws_transport_ms==null?'-':d.v22.avg_ws_transport_ms.toFixed(1)+' ms'}</div><div class=muted>MEXC → VPS brut (horloges non corrigées)</div></div>`;
 let bals=Object.entries(s.balances||{}).map(([k,v])=>`${k}: ${v.toFixed(2)}`).join(' · ');document.getElementById('paper').innerHTML=`<div class=tag>SIMULATION CAPITAL RÉEL</div><h3>Paper bot — capital initial ${s.capital.toFixed(0)} $</h3><div class='v big ${s.profit>=0?'good':'bad'}'>${s.profit>=0?'+':''}${s.profit.toFixed(2)} $</div><div class='v ${s.return_pct>=0?'good':'bad'}'>${s.return_pct>=0?'+':''}${s.return_pct.toFixed(3)} %</div><div class=muted>NAV actuelle : ${s.nav.toFixed(2)} $ · profits/pertes réalloués automatiquement au capital</div><div class=cards style='margin-top:12px'><div><div class=v>${s.trades}</div><div class=muted>trades exécutés</div></div><div><div class=v>${s.rebalances}</div><div class=muted>rebalances</div></div><div><div class=v>${s.open_exposures||0}</div><div class=muted>expositions ouvertes</div></div><div><div class=v>${s.rebalance_cost.toFixed(3)} $</div><div class=muted>coût rebalance</div></div><div><div class=v>${s.skipped_balance}</div><div class=muted>refus capital</div></div></div><div class=muted style='margin-top:10px'>Buckets : ${bals}<br>Règles live : âge local ≤${d.primary_age_ms} ms · skew ≤${d.primary_max_skew_ms} ms · depth multi-niveaux · leg 1 vers +${Math.floor(d.primary_latency_ms/2)} ms · leg 2 vers +${d.primary_latency_ms} ms · capital réservé à T0 · 1 entrée max par événement · reliquat conservé en exposition puis liquidé sur depth.</div>`;
+let sh=d.shadows||{},shh=`<div class=tag>SHADOW LIVE — AUCUN ORDRE RÉEL</div><h3>3 portefeuilles indépendants · 2 000 $ chacun</h3><div class=cards>`;for(let n of ['FAST','TARGET','DEGRADED']){let x=sh[n];if(!x)continue;shh+=`<div><div class=muted>${n} · ${x.leg1_ms}/${x.leg2_ms} ms</div><div class='v ${x.profit>=0?'good':'bad'}'>${x.profit>=0?'+':''}${x.profit.toFixed(2)} $</div><div class=muted>NAV ${x.nav.toFixed(2)} $ · ${x.trades} trades · ${x.wins}W/${x.losses}L · exp. ${x.open_exposures}</div></div>`}shh+=`</div><div class=muted style='margin-top:10px'>Même signal T0, mêmes carnets Depth réels, capital/réservations/fills indépendants. Seul l'envoi d'ordre MEXC est remplacé par une exécution virtuelle.</div>`;document.getElementById('shadows').innerHTML=shh;
 document.getElementById('raw').innerHTML=`<div class=tag>DONNÉES BRUTES — SANS CAPITAL</div><h3>Même filtre bot, taille BBO brute</h3><div class='v big ${(r.pnl||0)>=0?'good':'bad'}'>${(r.pnl||0)>=0?'+':''}${(r.pnl||0).toFixed(2)} $</div><div class=muted>Pas de capital initial, pas de contrainte de buckets : ce PnL sert uniquement à comparer le signal brut à ce que les 2 000 $ peuvent réellement exploiter.</div><div class=cards style='margin-top:12px'><div><div class=v>${r.executed||0}</div><div class=muted>résolues</div></div><div><div class=v>${r.wins||0}</div><div class=muted>gagnantes</div></div><div><div class=v>${r.losses||0}</div><div class=muted>perdantes</div></div><div><div class=v>${r.avg_exec_net==null?'-':(100*r.avg_exec_net).toFixed(4)+'%'}</div><div class=muted>net exec moyen</div></div></div><div class=muted style='margin-top:10px'>Même condition : âge échange ≤${d.primary_age_ms} ms · skew ≤${d.primary_max_skew_ms} ms · +${d.primary_latency_ms} ms.</div>`;
 let m=d.matrix||[],h='';for(let x of m){h+=`<tr><td>${x.age} ms</td><td>${x.lat} ms</td><td>${x.n}</td><td>${x.executed}</td><td>${x.wins||0}</td><td>${x.losses||0}</td><td class='${x.pnl>=0?'good':'bad'}'>${x.pnl.toFixed(3)} $</td><td>${x.avg_exec_net==null?'-':(100*x.avg_exec_net).toFixed(4)+'%'}</td></tr>`}document.getElementById('matrix').innerHTML=h;let rh='';for(let q of (d.recent_decisions||[])){let t=new Date(q.ts_ms);rh+=`<tr><td>${t.toLocaleTimeString()}</td><td>${q.route_id}</td><td class='good'>${(100*q.decision_net).toFixed(4)}%</td><td>${q.decision_size_usd.toFixed(2)} $</td><td>${q.exchange_age_max_ms} ms</td><td>${q.exchange_skew_ms} ms</td></tr>`}document.getElementById('recent').innerHTML=rh;document.getElementById('diag').innerHTML=`<h3>Univers</h3><div class=cards><div><div class=v>${g.all_markets}</div><div class=muted>marchés découverts</div></div><div><div class=v>${g.candidate_2leg}</div><div class=muted>2-leg candidates</div></div><div><div class=v>${g.selected_2leg}</div><div class=muted>2-leg suivies</div></div><div><div class=v>${g.candidate_3leg}</div><div class=muted>3-leg détectées mais ignorées</div></div></div>`}refresh();setInterval(refresh,3000)</script></body></html>'''
 
@@ -1319,7 +1549,7 @@ def index(): return render_template_string(HTML)
 def bootstrap():
     threading.Thread(target=db_writer,daemon=True).start()
     # Give DB schema thread a moment before state restore.
-    time.sleep(.15); load_paper_state()
+    time.sleep(.15); load_paper_state(); load_shadow_state()
     markets=discover_markets(); chosen,routes,meta,diag=select_routes_under_symbol_budget(markets)
     bysym=defaultdict(list)
     for r in routes:
@@ -1327,17 +1557,19 @@ def bootstrap():
     symbols=[m["symbol"] for m in chosen]
     with state_lock:
         state["symbols"]=symbols; state["routes"]=routes; state["routes_by_symbol"]=bysym; state["market_meta"]=meta; state["route_diag"]=diag
-    groups=[symbols[i:i+30] for i in range(0,len(symbols),30)]
+    groups=[symbols[i:i+20] for i in range(0,len(symbols),20)]
     with state_lock: state["ws_expected"]=len(groups)
     print(f"[Routes V{VERSION}] source={state['market_source']} markets={diag['all_markets']} candidates={diag['candidate_routes']} "
           f"(2L={diag['candidate_2leg']},3L={diag['candidate_3leg']}) selected_symbols={len(symbols)} selected_routes={len(routes)} "
           f"(2L={diag['selected_2leg']},3L={diag['selected_3leg']}) WS={len(groups)}")
     put_db(("meta",("version",VERSION))); put_db(("meta",("paper_rearm_neutral_ms",str(PAPER_REARM_NEUTRAL_MS)))); put_db(("meta",("paper_hard_cooldown_ms",str(PAPER_HARD_COOLDOWN_MS)))); put_db(("meta",("paper_failed_leg_policy","reverse_leg1_then_persist_open_exposure_until_liquidated"))); put_db(("meta",("ws_depth_interval","10ms"))); put_db(("meta",("depth_snapshot_levels","100"))); put_db(("meta",("trace_window_ms",str(TRACE_WINDOW_MS)))); put_db(("meta",("market_source",state["market_source"])))
     put_db(("meta",("route_diag",json.dumps(diag,sort_keys=True))))
+    put_db(("meta",("shadow_profiles",json.dumps(SHADOW_PROFILES,sort_keys=True))))
     for _ in range(6): threading.Thread(target=scan_worker,daemon=True).start()
     threading.Thread(target=event_sweeper,daemon=True).start()
     threading.Thread(target=execution_trial_worker,daemon=True).start()
     threading.Thread(target=open_exposure_worker,daemon=True).start()
+    threading.Thread(target=shadow_exposure_worker,daemon=True).start()
     threading.Thread(target=snapshot_worker,daemon=True).start()
     threading.Thread(target=stable_quote_worker,daemon=True).start()
     for i,g in enumerate(groups,1): threading.Thread(target=ws_worker,args=(g,i),daemon=True).start()
