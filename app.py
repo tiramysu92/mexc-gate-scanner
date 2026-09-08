@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, render_template_string
 import websocket
 
-VERSION = "2.3.1-depth-strict"
+VERSION = "2.3.2-depth-resync"
 HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", "8081"))
 DB_PATH = os.getenv("DB_PATH", "mexc_routes_v23.db")
@@ -86,6 +86,11 @@ trace_lock = threading.RLock()
 ws_latency_last_sample = {}
 depth_lock = threading.RLock()
 depth_buffers = defaultdict(lambda: deque(maxlen=5000))
+# V2.3.2: serialized depth resync. A symbol can be queued only once.
+depth_resync_q = queue.Queue()
+depth_resync_pending = set()
+depth_resync_lock = threading.Lock()
+depth_resync_diag = defaultdict(lambda: {"drops":0,"resync_ok":0,"resync_fail":0,"not_ready_since":None,"last_reason":"","last_resync_ms":None})
 
 
 def now_ms(): return int(time.time()*1000)
@@ -250,6 +255,12 @@ def db_writer():
     );
     CREATE INDEX IF NOT EXISTS idx_ws_lat_v22_ts ON ws_latency_v22(ts_ms);
 
+    CREATE TABLE IF NOT EXISTS depth_sync_events(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER NOT NULL, symbol TEXT NOT NULL,
+      event TEXT NOT NULL, reason TEXT, duration_ms INTEGER, attempt INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_depth_sync_symbol_ts ON depth_sync_events(symbol,ts_ms);
+
     CREATE TABLE IF NOT EXISTS execution_trials(
       id INTEGER PRIMARY KEY AUTOINCREMENT, day TEXT NOT NULL, decision_id TEXT NOT NULL, route_id TEXT NOT NULL,
       decision_ts_ms INTEGER NOT NULL, exec_ts_ms INTEGER NOT NULL, bbo_age_limit_ms INTEGER NOT NULL, latency_ms INTEGER NOT NULL,
@@ -308,6 +319,8 @@ def db_writer():
                     leg2_bid,leg2_ask,leg2_bidq,leg2_askq,leg2_send_ts_ms,leg2_recv_ts_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", payload)
             elif typ == "ws_lat_v22":
                 con.execute("INSERT INTO ws_latency_v22(ts_ms,symbol,send_ts_ms,recv_ts_ms,transport_ms) VALUES(?,?,?,?,?)", payload)
+            elif typ == "depth_sync":
+                con.execute("INSERT INTO depth_sync_events(ts_ms,symbol,event,reason,duration_ms,attempt) VALUES(?,?,?,?,?,?)", payload)
             elif typ == "trial":
                 con.execute("""INSERT INTO execution_trials(day,decision_id,route_id,decision_ts_ms,exec_ts_ms,bbo_age_limit_ms,latency_ms,
                     decision_net,decision_size_usd,decision_max_bbo_age_ms,decision_bbo_skew_ms,exec_net,exec_size_usd,exec_max_bbo_age_ms,
@@ -515,32 +528,57 @@ def _publish_depth_bbo(sym, send_ts):
         state["last_ws_ms"]=ts
     enqueue_scan(sym)
 
+def queue_depth_resync(sym, reason="gap"):
+    """Queue one serialized REST resync per symbol; never spawn resync threads from WS callbacks."""
+    ts=now_ms()
+    with depth_resync_lock:
+        d=depth_resync_diag[sym]
+        d["last_reason"]=reason
+        if d["not_ready_since"] is None:
+            d["not_ready_since"]=ts; d["drops"]+=1
+            put_db(("depth_sync",(ts,sym,"NOT_READY",reason,None,None)))
+        if sym in depth_resync_pending:
+            return False
+        depth_resync_pending.add(sym)
+        depth_resync_q.put(sym)
+    return True
+
+
 def apply_depth_update(x):
     sym=x["symbol"]
+    need_resync=False
     with depth_lock:
         ob=state["depth"].get(sym)
         if not ob or not ob.get("ready"):
-            depth_buffers[sym].append(x); return False
+            depth_buffers[sym].append(x)
+            # Startup symbols are queued by bootstrap; a dropped live symbol is already pending.
+            return False
         prev=ob.get("version")
         fv=x.get("from"); tv=x.get("to")
         if tv is not None and prev is not None and tv<=prev: return False
         if fv is not None and prev is not None and fv>prev+1:
-            ob["ready"]=False; depth_buffers[sym].append(x)
-            threading.Thread(target=init_depth_symbol,args=(sym,),daemon=True).start(); return False
-        for side in ("asks","bids"):
-            book=ob[side]
-            for price,qty in x[side]:
-                if qty<=0: book.pop(price,None)
-                else: book[price]=qty
-        if tv is not None: ob["version"]=tv
-        ob["send_ts"]=x["send"]; ob["ts"]=now_ms()
+            ob["ready"]=False; depth_buffers[sym].append(x); need_resync=True
+            state["depth_ready"]=sum(1 for z in state["depth"].values() if z.get("ready"))
+        else:
+            for side in ("asks","bids"):
+                book=ob[side]
+                for price,qty in x[side]:
+                    if qty<=0: book.pop(price,None)
+                    else: book[price]=qty
+            if tv is not None: ob["version"]=tv
+            ob["send_ts"]=x["send"]; ob["ts"]=now_ms()
+    if need_resync:
+        queue_depth_resync(sym,"version_gap")
+        return False
     _publish_depth_bbo(sym,x["send"]); return True
 
+
 def init_depth_symbol(sym):
+    """Build one coherent local book. Return True only if snapshot + buffered deltas reconcile."""
     try:
         r=requests.get(REST+"/api/v3/depth",params={"symbol":sym,"limit":100},timeout=8); r.raise_for_status(); j=r.json()
         bids={float(a):float(b) for a,b in j.get("bids",[]) if float(b)>0}; asks={float(a):float(b) for a,b in j.get("asks",[]) if float(b)>0}
-        ver=int(j.get("lastUpdateId",0)); send=now_ms()
+        ver=int(j.get("lastUpdateId",0)); send=now_ms(); ready=True
         with depth_lock:
             ob={"bids":bids,"asks":asks,"version":ver,"ready":True,"ts":send,"send_ts":send}
             state["depth"][sym]=ob
@@ -550,25 +588,61 @@ def init_depth_symbol(sym):
                 if tv is not None and tv<=ob["version"]: continue
                 fv=x.get("from")
                 if fv is not None and fv>ob["version"]+1:
-                    ob["ready"]=False; break
+                    ob["ready"]=False; ready=False
+                    # Keep the offending delta and later deltas for the next snapshot attempt.
+                    depth_buffers[sym].append(x)
+                    continue
+                if not ready:
+                    depth_buffers[sym].append(x); continue
                 for side in ("asks","bids"):
                     for price,qty in x[side]:
                         if qty<=0: ob[side].pop(price,None)
                         else: ob[side][price]=qty
                 if tv is not None: ob["version"]=tv
                 send=x["send"]
-            if ob["ready"]: state["depth_ready"]=sum(1 for z in state["depth"].values() if z.get("ready"))
-        if ob.get("ready"): _publish_depth_bbo(sym,send)
+            state["depth_ready"]=sum(1 for z in state["depth"].values() if z.get("ready"))
+        if ready:
+            _publish_depth_bbo(sym,send)
+        return ready
     except Exception as e:
-        logerr(f"depth snapshot {sym}: {e}")
+        logger(f"depth snapshot {sym}: {e}")
+        return False
+
+
+def depth_resync_worker():
+    """Single rate-limited REST worker with retry/backoff; prevents 429 resync storms."""
+    while True:
+        sym=depth_resync_q.get(); attempt=0
+        try:
+            while True:
+                attempt+=1
+                ok=init_depth_symbol(sym)
+                if ok:
+                    ts=now_ms()
+                    with depth_resync_lock:
+                        d=depth_resync_diag[sym]; since=d.get("not_ready_since")
+                        dur=max(0,ts-since) if since is not None else None
+                        d["resync_ok"]+=1; d["not_ready_since"]=None; d["last_resync_ms"]=dur
+                    put_db(("depth_sync",(ts,sym,"READY",depth_resync_diag[sym].get("last_reason",""),dur,attempt)))
+                    break
+                with depth_resync_lock: depth_resync_diag[sym]["resync_fail"]+=1
+                put_db(("depth_sync",(now_ms(),sym,"RETRY",depth_resync_diag[sym].get("last_reason",""),None,attempt)))
+                # 0.5, 1, 2, 4, 8s; capped. One worker means no REST burst.
+                time.sleep(min(8.0,0.5*(2**min(attempt-1,4))))
+            # Keep successful snapshot requests under ~4/s even during a queue backlog.
+            time.sleep(0.25)
+        finally:
+            with depth_resync_lock: depth_resync_pending.discard(sym)
+            depth_resync_q.task_done()
+
 
 def depth_bootstrap_worker(symbols):
-    # WS buffers deltas while REST snapshots are built, matching MEXC's documented local-book procedure.
+    # All initial snapshots use the same serialized/rate-limited resync path.
     for sym in symbols:
         with depth_lock:
             if sym not in state["depth"]: state["depth"][sym]={"bids":{},"asks":{},"version":None,"ready":False}
-        init_depth_symbol(sym)
-        time.sleep(.03)
+        queue_depth_resync(sym,"bootstrap")
+
 
 def depth_walk(symbol, frm, to, input_units, meta):
     m=meta.get(symbol)
@@ -1046,7 +1120,7 @@ def process_route(route,ts):
 
 def event_sweeper():
     while True:
-        time.sleep(.25); ts=now_ms()
+        time.sleep(.03); ts=now_ms()
         with event_lock:
             for key,ev in list(active_events.items()):
                 if ts-ev["last_ts"]>EVENT_CLOSE_GAP_MS:
@@ -1268,6 +1342,7 @@ def bootstrap():
     threading.Thread(target=stable_quote_worker,daemon=True).start()
     for i,g in enumerate(groups,1): threading.Thread(target=ws_worker,args=(g,i),daemon=True).start()
     time.sleep(1.0)
+    threading.Thread(target=depth_resync_worker,daemon=True).start()
     threading.Thread(target=depth_bootstrap_worker,args=(symbols,),daemon=True).start()
 
 if __name__=="__main__":
