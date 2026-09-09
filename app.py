@@ -6,10 +6,10 @@ from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, render_template_string
 import websocket
 
-VERSION = "2.3.3-shadow"
+VERSION = "2.3.4-replay-ready"
 HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", "8081"))
-DB_PATH = os.getenv("DB_PATH", "mexc_routes_v23.db")
+DB_PATH = os.getenv("DB_PATH", "mexc_routes_v234.db")
 MARKET_CACHE = os.getenv("MARKET_CACHE", "mexc_markets_cache.json")
 TZ_NAME = os.getenv("TZ_NAME", "Europe/Paris")
 TZ = ZoneInfo(TZ_NAME)
@@ -58,6 +58,24 @@ SHADOW_PROFILES = {
 }
 SHADOW_BBO_AGE_MS = int(os.getenv("SHADOW_BBO_AGE_MS", "150"))
 SHADOW_MAX_SKEW_MS = int(os.getenv("SHADOW_MAX_SKEW_MS", "50"))
+# V2.3.4 prospective policy chosen from the V2.3.3 export. Research logging remains broad
+# so future exports can replay other thresholds without hindsight.
+SHADOW_MIN_EDGE = float(os.getenv("SHADOW_MIN_EDGE_PCT", "0.35")) / 100.0
+SHADOW_TARGET_WEIGHTS = {"USDT":0.40, "USDC":0.10, "USD1":0.50}
+SHADOW_REBALANCE_CHECK_SEC = int(os.getenv("SHADOW_REBALANCE_CHECK_SEC", "1800"))
+SHADOW_REBALANCE_MAX_SEC = int(os.getenv("SHADOW_REBALANCE_MAX_SEC", "14400"))
+SHADOW_REBALANCE_EARLY_DEV = float(os.getenv("SHADOW_REBALANCE_EARLY_DEV_PCT", "15")) / 100.0
+SHADOW_REBALANCE_MIN_DEV = float(os.getenv("SHADOW_REBALANCE_MIN_DEV_PCT", "3")) / 100.0
+POST_RESYNC_GRACE_MS = int(os.getenv("POST_RESYNC_GRACE_MS", "2000"))
+ENABLE_LEGACY_PAPER = os.getenv("ENABLE_LEGACY_PAPER", "0") == "1"
+
+# Replay-grade capture. Every broad T0 decision gets multi-level books at these future offsets,
+# even if the live Shadow policy rejects it. This is what lets the next export replay balance,
+# edge, persistence and latency policies chronologically.
+DEPTH_CAPTURE_OFFSETS_MS = tuple(int(x) for x in os.getenv(
+    "DEPTH_CAPTURE_OFFSETS_MS", "0,10,15,20,25,30,40,50,60,75,100,125,150,200,250,300").split(","))
+DEPTH_CAPTURE_LEVELS = int(os.getenv("DEPTH_CAPTURE_LEVELS", "25"))
+STABLE_DEPTH_INTERVAL_SEC = float(os.getenv("STABLE_DEPTH_INTERVAL_SEC", "10"))
 
 # Historical research data
 SNAPSHOT_INTERVAL_SEC = float(os.getenv("SNAPSHOT_INTERVAL_SEC", "2.0"))
@@ -102,13 +120,16 @@ shadow_route_last_trade = defaultdict(int)
 active_traces = {}
 trace_lock = threading.RLock()
 ws_latency_last_sample = {}
+pending_depth_captures = []
+shadow_last_rebalance_ms = {}
+shadow_last_rebalance_check_ms = {}
 depth_lock = threading.RLock()
 depth_buffers = defaultdict(lambda: deque(maxlen=5000))
 # V2.3.2: serialized depth resync. A symbol can be queued only once.
 depth_resync_q = queue.Queue()
 depth_resync_pending = set()
 depth_resync_lock = threading.Lock()
-depth_resync_diag = defaultdict(lambda: {"drops":0,"resync_ok":0,"resync_fail":0,"not_ready_since":None,"last_reason":"","last_resync_ms":None})
+depth_resync_diag = defaultdict(lambda: {"drops":0,"resync_ok":0,"resync_fail":0,"not_ready_since":None,"last_reason":"","last_resync_ms":None,"last_ready_ts_ms":None})
 
 
 def now_ms(): return int(time.time()*1000)
@@ -250,6 +271,46 @@ def db_writer():
       last_mark_usd REAL NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'open', PRIMARY KEY(profile,decision_id)
     );
 
+    CREATE TABLE IF NOT EXISTS shadow_rebalances_v234(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, profile TEXT NOT NULL, day TEXT NOT NULL, ts_ms INTEGER NOT NULL,
+      reason TEXT NOT NULL, from_asset TEXT NOT NULL, to_asset TEXT NOT NULL, input_units REAL NOT NULL,
+      output_units REAL NOT NULL, input_usd REAL NOT NULL, output_usd REAL NOT NULL, cost_usd REAL NOT NULL,
+      balances_before_json TEXT NOT NULL, balances_after_json TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_shadow_reb_v234 ON shadow_rebalances_v234(profile,day,ts_ms);
+
+    CREATE TABLE IF NOT EXISTS decision_context_v234(
+      decision_id TEXT PRIMARY KEY, day TEXT NOT NULL, route_id TEXT NOT NULL, event_start_ts_ms INTEGER NOT NULL,
+      ts_ms INTEGER NOT NULL, path TEXT NOT NULL, start_asset TEXT NOT NULL, end_asset TEXT NOT NULL,
+      decision_net REAL NOT NULL, decision_size_usd REAL NOT NULL, start_mark REAL, end_mark REAL,
+      leg1_last_ready_age_ms INTEGER, leg2_last_ready_age_ms INTEGER, shadow_policy_eligible INTEGER NOT NULL, policy_reason TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_dec_ctx_v234_ts ON decision_context_v234(ts_ms,route_id);
+
+    CREATE TABLE IF NOT EXISTS decision_depth_samples_v234(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, decision_id TEXT NOT NULL, route_id TEXT NOT NULL, decision_ts_ms INTEGER NOT NULL,
+      sample_ts_ms INTEGER NOT NULL, elapsed_ms INTEGER NOT NULL, leg INTEGER NOT NULL, symbol TEXT NOT NULL,
+      path_from TEXT NOT NULL, path_to TEXT NOT NULL, ready INTEGER NOT NULL, version INTEGER, book_ts_ms INTEGER,
+      send_ts_ms INTEGER, recv_age_ms INTEGER, last_ready_ts_ms INTEGER, bids_json TEXT, asks_json TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_depth_sample_v234_dec ON decision_depth_samples_v234(decision_id,elapsed_ms,leg);
+    CREATE INDEX IF NOT EXISTS idx_depth_sample_v234_ts ON decision_depth_samples_v234(sample_ts_ms);
+
+    CREATE TABLE IF NOT EXISTS shadow_execution_details_v234(
+      profile TEXT NOT NULL, decision_id TEXT NOT NULL, route_id TEXT NOT NULL, decision_ts_ms INTEGER NOT NULL,
+      leg1_ts_ms INTEGER, leg2_ts_ms INTEGER, decision_edge REAL NOT NULL,
+      leg1_levels INTEGER, leg1_vwap REAL, leg1_fill_ratio REAL, leg1_book_ts_ms INTEGER,
+      leg2_levels INTEGER, leg2_vwap REAL, leg2_fill_ratio REAL, leg2_book_ts_ms INTEGER,
+      unwind_levels INTEGER, unwind_vwap REAL, unwind_fill_ratio REAL, unwind_book_ts_ms INTEGER,
+      PRIMARY KEY(profile,decision_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS stable_depth_snapshots_v234(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER NOT NULL, symbol TEXT NOT NULL, base_asset TEXT NOT NULL, quote_asset TEXT NOT NULL,
+      ready INTEGER NOT NULL, version INTEGER, book_ts_ms INTEGER, bids_json TEXT, asks_json TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_stable_depth_v234_ts ON stable_depth_snapshots_v234(ts_ms,symbol);
+
     CREATE TABLE IF NOT EXISTS route_snapshots(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       ts_ms INTEGER NOT NULL,
@@ -357,6 +418,16 @@ def db_writer():
             elif typ == "shadow_close":
                 con.execute("UPDATE shadow_open_exposures SET updated_ts_ms=?,units=0,recovered_start_units=?,recovered_usd=?,last_mark_usd=0,status='closed' WHERE profile=? AND decision_id=?", payload[:5])
                 con.execute("UPDATE shadow_attempts SET status='forced_unwind_later',output_usd_total=?,profit_usd=? WHERE profile=? AND decision_id=?", payload[5:])
+            elif typ == "shadow_rebalance_v234":
+                con.execute("""INSERT INTO shadow_rebalances_v234(profile,day,ts_ms,reason,from_asset,to_asset,input_units,output_units,input_usd,output_usd,cost_usd,balances_before_json,balances_after_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", payload)
+            elif typ == "decision_context_v234":
+                con.execute("""INSERT OR REPLACE INTO decision_context_v234(decision_id,day,route_id,event_start_ts_ms,ts_ms,path,start_asset,end_asset,decision_net,decision_size_usd,start_mark,end_mark,leg1_last_ready_age_ms,leg2_last_ready_age_ms,shadow_policy_eligible,policy_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", payload)
+            elif typ == "depth_sample_v234":
+                con.execute("""INSERT INTO decision_depth_samples_v234(decision_id,route_id,decision_ts_ms,sample_ts_ms,elapsed_ms,leg,symbol,path_from,path_to,ready,version,book_ts_ms,send_ts_ms,recv_age_ms,last_ready_ts_ms,bids_json,asks_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", payload)
+            elif typ == "shadow_exec_detail_v234":
+                con.execute("""INSERT OR REPLACE INTO shadow_execution_details_v234(profile,decision_id,route_id,decision_ts_ms,leg1_ts_ms,leg2_ts_ms,decision_edge,leg1_levels,leg1_vwap,leg1_fill_ratio,leg1_book_ts_ms,leg2_levels,leg2_vwap,leg2_fill_ratio,leg2_book_ts_ms,unwind_levels,unwind_vwap,unwind_fill_ratio,unwind_book_ts_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", payload)
+            elif typ == "stable_depth_many_v234":
+                con.executemany("""INSERT INTO stable_depth_snapshots_v234(ts_ms,symbol,base_asset,quote_asset,ready,version,book_ts_ms,bids_json,asks_json) VALUES(?,?,?,?,?,?,?,?,?)""", payload)
             elif typ == "snapshot_many":
                 con.executemany("INSERT INTO route_snapshots(ts_ms,route_id,route_type,net,executable_usd,max_bbo_age_ms) VALUES(?,?,?,?,?,?)", payload)
             elif typ == "stable_many":
@@ -658,7 +729,7 @@ def init_depth_symbol(sym):
             _publish_depth_bbo(sym,send)
         return ready
     except Exception as e:
-        logger(f"depth snapshot {sym}: {e}")
+        logerr(f"depth snapshot {sym}: {e}")
         return False
 
 
@@ -675,7 +746,7 @@ def depth_resync_worker():
                     with depth_resync_lock:
                         d=depth_resync_diag[sym]; since=d.get("not_ready_since")
                         dur=max(0,ts-since) if since is not None else None
-                        d["resync_ok"]+=1; d["not_ready_since"]=None; d["last_resync_ms"]=dur
+                        d["resync_ok"]+=1; d["not_ready_since"]=None; d["last_resync_ms"]=dur; d["last_ready_ts_ms"]=ts
                     put_db(("depth_sync",(ts,sym,"READY",depth_resync_diag[sym].get("last_reason",""),dur,attempt)))
                     break
                 with depth_resync_lock: depth_resync_diag[sym]["resync_fail"]+=1
@@ -707,24 +778,65 @@ def depth_walk(symbol, frm, to, input_units, meta):
         asks=sorted(ob["asks"].items())
         book_ts=ob.get("ts",0); send_ts=ob.get("send_ts",book_ts)
     if now_ms()-book_ts > PRIMARY_BBO_AGE_MS: return None
-    remain=float(input_units); out=0.0; used=0.0; notional=0.0
+    remain=float(input_units); out=0.0; used=0.0; notional=0.0; levels_used=0; gross_out=0.0; side=None
     if frm==m["base"] and to==m["quote"]:
+        side="sell_base"
         for price,qty in bids:
-            take=min(remain,qty);
+            take=min(remain,qty)
             if take<=0: continue
-            used+=take; out+=take*price; notional+=take*price; remain-=take
+            levels_used+=1; used+=take; gross_out+=take*price; notional+=take*price; remain-=take
             if remain<=1e-12: break
-        out*=1.0-FEE
+        out=gross_out*(1.0-FEE)
+        vwap=(notional/used) if used>0 else None
     elif frm==m["quote"] and to==m["base"]:
+        side="buy_base"; base_gross=0.0
         for price,qty in asks:
             max_quote=price*qty; takeq=min(remain,max_quote)
             if takeq<=0: continue
-            base=takeq/price; used+=takeq; out+=base; notional+=takeq; remain-=takeq
+            levels_used+=1; base=takeq/price; used+=takeq; base_gross+=base; notional+=takeq; remain-=takeq
             if remain<=1e-12: break
-        out*=1.0-FEE
+        gross_out=base_gross; out=base_gross*(1.0-FEE)
+        vwap=(notional/base_gross) if base_gross>0 else None
     else: return None
     if used<=0: return None
-    return {"input_used":used,"output":out,"fill_ratio":used/input_units,"book_ts":book_ts,"send_ts":send_ts}
+    return {"input_requested":input_units,"input_used":used,"output":out,"gross_output":gross_out,"fill_ratio":used/input_units,
+            "book_ts":book_ts,"send_ts":send_ts,"levels_used":levels_used,"vwap":vwap,"side":side}
+
+def _depth_book_payload(symbol):
+    """Small replay snapshot of the local multi-level book. Kept only around decisions/stable rebalance pairs."""
+    ts=now_ms()
+    with depth_lock:
+        ob=state["depth"].get(symbol)
+        if not ob:
+            return {"ready":0,"version":None,"book_ts":None,"send_ts":None,"recv_age":None,"bids":[],"asks":[]}
+        ready=1 if ob.get("ready") else 0
+        bids=sorted(ob.get("bids",{}).items(), reverse=True)[:DEPTH_CAPTURE_LEVELS]
+        asks=sorted(ob.get("asks",{}).items())[:DEPTH_CAPTURE_LEVELS]
+        book_ts=ob.get("ts"); send_ts=ob.get("send_ts"); version=ob.get("version")
+    return {"ready":ready,"version":version,"book_ts":book_ts,"send_ts":send_ts,
+            "recv_age":(ts-book_ts if book_ts else None),"bids":bids,"asks":asks}
+
+
+def capture_decision_depth(q, sample_ts):
+    route=q["route"]; did=q["did"]; t0=q["t0"]
+    for leg,sym in enumerate(route["symbols"],1):
+        b=_depth_book_payload(sym)
+        with depth_resync_lock:
+            ready_ts=depth_resync_diag[sym].get("last_ready_ts_ms")
+        frm,to=route["path"][leg-1],route["path"][leg]
+        put_db(("depth_sample_v234",(did,route["id"],t0,sample_ts,max(0,sample_ts-t0),leg,sym,frm,to,
+            b["ready"],b["version"],b["book_ts"],b["send_ts"],b["recv_age"],ready_ts,
+            json.dumps(b["bids"],separators=(",",":")),json.dumps(b["asks"],separators=(",",":")))))
+
+
+def symbols_post_resync_safe(route, ts):
+    """Never admit a Shadow trade immediately after one of its own books has been rebuilt."""
+    with depth_resync_lock:
+        for sym in route["symbols"]:
+            rt=depth_resync_diag[sym].get("last_ready_ts_ms")
+            if rt is not None and ts-rt < POST_RESYNC_GRACE_MS:
+                return False
+    return True
 
 def exposure_mark_usd(exp, books, meta):
     """Mark an open intermediate exposure without ever forcing it to zero."""
@@ -1020,8 +1132,10 @@ def open_exposure_worker():
 
 # ---------- Shadow-live engine (no real orders) ----------
 def shadow_default(day):
-    each=SIM_CAPITAL/len(STABLES) if STABLES else 0.0
-    return {"day":day,"balances":{x:each for x in STABLES},"profit_bank":0.0,"trades":0,"wins":0,"losses":0,
+    weights={a:SHADOW_TARGET_WEIGHTS.get(a,0.0) for a in STABLES}; sw=sum(weights.values())
+    if sw<=0: weights={a:1.0/max(1,len(STABLES)) for a in STABLES}
+    else: weights={a:w/sw for a,w in weights.items()}
+    return {"day":day,"balances":{a:SIM_CAPITAL*weights[a] for a in STABLES},"profit_bank":0.0,"trades":0,"wins":0,"losses":0,
             "rebalances":0,"rebalance_cost":0.0,"skipped_flash":0,"skipped_balance":0,"skipped_rebalance":0}
 
 def load_shadow_state():
@@ -1097,7 +1211,7 @@ def shadow_leg1(q):
     with state_lock: meta=state["market_meta"]
     fill=depth_walk(sym,frm,to,q["reserved_units"],meta)
     if not fill or fill["input_used"]*q["x0"]["start_mark"]<SIM_MIN_TRADE_USD: return False
-    q["leg1"]=fill; q["stage"]=2; return True
+    q["leg1"]=fill; q["leg1_ts_ms"]=now_ms(); q["stage"]=2; return True
 
 def settle_shadow_trade(q,exec_ts):
     profile=q["profile"]
@@ -1120,6 +1234,10 @@ def settle_shadow_trade(q,exec_ts):
         if profit>0: st["wins"]+=1
         elif profit<0: st["losses"]+=1
         put_db(("shadow_attempt",(profile,st["day"],exec_ts,q["decision_id"],r["id"],q["event_start_ts"],status,input_usd,input_units,mid_total,leg2_used,end_out,unwind_used,start_back,open_units,economic_output,profit)))
+        put_db(("shadow_exec_detail_v234",(profile,q["decision_id"],r["id"],q["t0"],q.get("leg1_ts_ms"),exec_ts,q["x0"].get("net",0.0),
+            leg1.get("levels_used"),leg1.get("vwap"),leg1.get("fill_ratio"),leg1.get("book_ts"),
+            fill2.get("levels_used") if fill2 else None,fill2.get("vwap") if fill2 else None,fill2.get("fill_ratio") if fill2 else None,fill2.get("book_ts") if fill2 else None,
+            unwind.get("levels_used") if unwind else None,unwind.get("vwap") if unwind else None,unwind.get("fill_ratio") if unwind else None,unwind.get("book_ts") if unwind else None)))
         persist_shadow(profile)
 
 def shadow_exposure_worker():
@@ -1146,6 +1264,88 @@ def shadow_exposure_worker():
                         put_db(("shadow_open",(profile,did,exp["day"],exp["route_id"],exp["opened_ts_ms"],exp["updated_ts_ms"],exp["symbol"],exp["mid_asset"],exp["start_asset"],exp["units"],exp["recovered_start_units"],exp["input_usd"],exp["cash_output_usd"],exp["recovered_usd"],exp["last_mark_usd"],"open")))
                     persist_shadow(profile)
 
+def _shadow_weight_snapshot(profile, books, meta):
+    st=ensure_shadow_day(profile)
+    vals={a:max(0.0,st["balances"].get(a,0.0)-shadow_reserved[profile].get(a,0.0))*stable_mark_usdt(a,books,meta) for a in STABLES}
+    total=sum(vals.values())
+    weights={a:(vals[a]/total if total>0 else 0.0) for a in STABLES}
+    targets={a:SHADOW_TARGET_WEIGHTS.get(a,0.0) for a in STABLES}; sw=sum(targets.values()) or 1.0
+    targets={a:v/sw for a,v in targets.items()}
+    return vals,total,weights,targets
+
+
+def shadow_target_rebalance(profile, reason):
+    """Virtual periodic rebalance through real local stablecoin Depth. Never touches reserved funds or open exposures."""
+    with shadow_lock:
+        st=ensure_shadow_day(profile)
+        if any(v>1e-9 for v in shadow_reserved[profile].values()) or shadow_open_exposures[profile]:
+            return False
+        with state_lock: books=dict(state["bbo"]); meta=state["market_meta"]
+        vals,total,weights,targets=_shadow_weight_snapshot(profile,books,meta)
+        if total<=0: return False
+        before=json.dumps(st["balances"],sort_keys=True)
+        changed=False
+        # At most a few direct stable conversions are required for three buckets.
+        for _ in range(6):
+            vals,total,weights,targets=_shadow_weight_snapshot(profile,books,meta)
+            deficits=sorted([(targets[a]*total-vals[a],a) for a in STABLES if targets[a]*total-vals[a]>0.50],reverse=True)
+            excess=sorted([(vals[a]-targets[a]*total,a) for a in STABLES if vals[a]-targets[a]*total>0.50],reverse=True)
+            if not deficits or not excess: break
+            need_usd,to_asset=deficits[0]; give_usd,from_asset=excess[0]
+            sym,m=direct_pair(from_asset,to_asset,meta)
+            if not sym: break
+            from_mark=stable_mark_usdt(from_asset,books,meta); to_mark=stable_mark_usdt(to_asset,books,meta)
+            if from_mark<=0 or to_mark<=0: break
+            free_units=max(0.0,st["balances"].get(from_asset,0.0)-shadow_reserved[profile].get(from_asset,0.0))
+            input_units=min(free_units,min(give_usd,need_usd)/from_mark)
+            if input_units<=1e-9: break
+            fill=depth_walk(sym,from_asset,to_asset,input_units,meta)
+            if not fill or fill.get("input_used",0)<=0: break
+            used=fill["input_used"]; out=fill["output"]
+            in_usd=used*from_mark; out_usd=out*to_mark; cost=max(0.0,in_usd-out_usd)
+            bbefore=json.dumps(st["balances"],sort_keys=True)
+            st["balances"][from_asset]=max(0.0,st["balances"].get(from_asset,0.0)-used)
+            st["balances"][to_asset]=st["balances"].get(to_asset,0.0)+out
+            st["rebalances"]+=1; st["rebalance_cost"]+=cost; st["profit_bank"]=max(0.0,st["profit_bank"]-cost)
+            bafter=json.dumps(st["balances"],sort_keys=True)
+            put_db(("shadow_rebalance_v234",(profile,st["day"],now_ms(),reason,from_asset,to_asset,used,out,in_usd,out_usd,cost,bbefore,bafter)))
+            changed=True
+        if changed: persist_shadow(profile)
+        return changed
+
+
+def shadow_periodic_rebalance_worker():
+    while True:
+        time.sleep(5.0); ts=now_ms()
+        for profile in SHADOW_PROFILES:
+            last_check=shadow_last_rebalance_check_ms.get(profile,0)
+            if ts-last_check < SHADOW_REBALANCE_CHECK_SEC*1000: continue
+            shadow_last_rebalance_check_ms[profile]=ts
+            with shadow_lock:
+                with state_lock: books=dict(state["bbo"]); meta=state["market_meta"]
+                vals,total,weights,targets=_shadow_weight_snapshot(profile,books,meta)
+                max_dev=max((abs(weights.get(a,0)-targets.get(a,0)) for a in STABLES),default=0.0)
+            last=shadow_last_rebalance_ms.get(profile,ts)
+            reason=None
+            if max_dev>=SHADOW_REBALANCE_EARLY_DEV: reason="early_imbalance"
+            elif ts-last>=SHADOW_REBALANCE_MAX_SEC*1000 and max_dev>=SHADOW_REBALANCE_MIN_DEV: reason="periodic_4h"
+            if reason and shadow_target_rebalance(profile,reason): shadow_last_rebalance_ms[profile]=ts
+
+
+def stable_depth_capture_worker():
+    while True:
+        time.sleep(STABLE_DEPTH_INTERVAL_SEC); ts=now_ms(); rows=[]
+        with state_lock: meta=dict(state["market_meta"])
+        seen=set()
+        for a in STABLES:
+            for b in STABLES:
+                if a>=b: continue
+                sym,m=direct_pair(a,b,meta)
+                if not sym or sym in seen: continue
+                seen.add(sym); z=_depth_book_payload(sym)
+                rows.append((ts,sym,m["base"],m["quote"],z["ready"],z["version"],z["book_ts"],json.dumps(z["bids"],separators=(",",":")),json.dumps(z["asks"],separators=(",",":"))))
+        if rows: put_db(("stable_depth_many_v234",rows))
+
 def shadow_status():
     out={}
     with state_lock: books=dict(state["bbo"]); meta=state["market_meta"]
@@ -1156,6 +1356,15 @@ def shadow_status():
             exposures=[dict(x) for x in shadow_open_exposures[profile].values()]; exp_nav=sum(exposure_mark_usd(x,books,meta) for x in exposures); nav+=exp_nav
             st.update({"profile":profile,"leg1_ms":l1,"leg2_ms":l2,"capital":SIM_CAPITAL,"nav":nav,"profit":nav-SIM_CAPITAL,"return_pct":(nav/SIM_CAPITAL-1)*100 if SIM_CAPITAL else 0.0,"open_exposures":len(exposures),"open_exposure_nav":exp_nav,"reserved":dict(shadow_reserved[profile])})
             out[profile]=st
+    # Recompute W/L and average admitted edge from immutable attempts so delayed unwind updates are reflected.
+    start,end,_=local_day_bounds_ms(0)
+    try:
+        con=db_connect()
+        for profile in out:
+            r=con.execute("""SELECT COUNT(*),SUM(CASE WHEN a.profit_usd>0 THEN 1 ELSE 0 END),SUM(CASE WHEN a.profit_usd<0 THEN 1 ELSE 0 END),AVG(d.decision_net),COALESCE(SUM(a.profit_usd),0) FROM shadow_attempts a LEFT JOIN decisions_v22 d ON d.decision_id=a.decision_id WHERE a.profile=? AND a.ts_ms>=? AND a.ts_ms<?""",(profile,start,end)).fetchone()
+            out[profile]["trades"]=r[0] or 0; out[profile]["wins"]=r[1] or 0; out[profile]["losses"]=r[2] or 0; out[profile]["avg_edge"]=r[3]; out[profile]["attempt_pnl"]=r[4] or 0.0
+        con.close()
+    except Exception as e: logerr(f"shadow status stats: {e}")
     return out
 
 # ---------- V2.1 immediate-decision / delayed-execution research ----------
@@ -1211,11 +1420,26 @@ def schedule_decision(route,x,ts,event_start_ts):
             for lat in RESEARCH_LATENCIES_MS:
                 pending_trials.append({"due":ts+lat,"day":day,"did":did,"route":route,"t0":ts,
                     "age_lim":age_lim,"lat":lat,"x0":dict(x)})
+        for off in DEPTH_CAPTURE_OFFSETS_MS:
+            if off>0: pending_depth_captures.append({"due":ts+off,"did":did,"route":route,"t0":ts})
+    if 0 in DEPTH_CAPTURE_OFFSETS_MS:
+        capture_decision_depth({"did":did,"route":route,"t0":ts},ts)
 
     # Separate $2k portfolio simulation: one executable entry per arbitrage event, real capital reserved at T0.
     event_key=(route["id"],int(event_start_ts))
     rid=route["id"]
-    paper_ok = (paper_route_armed[rid] and ts-paper_route_last_trade[rid]>=PAPER_HARD_COOLDOWN_MS)
+    with depth_resync_lock:
+        ready_ages=[]
+        for _sym in route["symbols"]:
+            _rt=depth_resync_diag[_sym].get("last_ready_ts_ms")
+            ready_ages.append((ts-_rt) if _rt is not None else None)
+    _policy_reason="eligible"
+    if x.get("net",-1.0)<SHADOW_MIN_EDGE: _policy_reason="edge_below_min"
+    elif x.get("max_age",999999)>SHADOW_BBO_AGE_MS: _policy_reason="book_age"
+    elif x.get("bbo_skew",999999)>SHADOW_MAX_SKEW_MS: _policy_reason="book_skew"
+    elif not symbols_post_resync_safe(route,ts): _policy_reason="post_resync_grace"
+    put_db(("decision_context_v234",(did,day,route["id"],int(event_start_ts),ts,">".join(route["path"]),route["path"][0],route["path"][-1],x["net"],x["size"],x.get("start_mark"),x.get("end_mark"),ready_ages[0] if len(ready_ages)>0 else None,ready_ages[1] if len(ready_ages)>1 else None,1 if _policy_reason=="eligible" else 0,_policy_reason)))
+    paper_ok = ENABLE_LEGACY_PAPER and (paper_route_armed[rid] and ts-paper_route_last_trade[rid]>=PAPER_HARD_COOLDOWN_MS)
     if paper_ok and event_key not in paper_consumed_events and x.get("max_age",999999)<=PRIMARY_BBO_AGE_MS and x.get("bbo_skew",999999)<=PRIMARY_MAX_SKEW_MS:
         q=reserve_paper_trade(route,x,event_start_ts,did,ts)
         if q:
@@ -1224,7 +1448,9 @@ def schedule_decision(route,x,ts,event_start_ts):
 
     # Shadow-live: same event, three independent $2k portfolios and measured depth at profile latencies.
     shadow_ok=(shadow_route_armed[rid] and ts-shadow_route_last_trade[rid]>=PAPER_HARD_COOLDOWN_MS)
-    if shadow_ok and event_key not in shadow_consumed_events and x.get("max_age",999999)<=SHADOW_BBO_AGE_MS and x.get("bbo_skew",999999)<=SHADOW_MAX_SKEW_MS:
+    if (shadow_ok and event_key not in shadow_consumed_events and x.get("net",-1.0)>=SHADOW_MIN_EDGE
+        and x.get("max_age",999999)<=SHADOW_BBO_AGE_MS and x.get("bbo_skew",999999)<=SHADOW_MAX_SKEW_MS
+        and symbols_post_resync_safe(route,ts)):
         qs=[]
         for profile in SHADOW_PROFILES:
             sq=reserve_shadow_trade(profile,route,x,event_start_ts,did,ts)
@@ -1235,7 +1461,7 @@ def schedule_decision(route,x,ts,event_start_ts):
 
 def execution_trial_worker():
     while True:
-        time.sleep(.005); ts=now_ms(); due=[]; paper_due=[]; shadow_due=[]
+        time.sleep(.005); ts=now_ms(); due=[]; paper_due=[]; shadow_due=[]; depth_due=[]
         with pending_lock:
             keep=[]
             for q in pending_trials:
@@ -1249,9 +1475,15 @@ def execution_trial_worker():
             for q in pending_shadow_trials:
                 (shadow_due if (q["leg1_due"] if q.get("stage",1)==1 else q["leg2_due"])<=ts else skeep).append(q)
             pending_shadow_trials[:] = skeep
-        if not due and not paper_due and not shadow_due: continue
+            dkeep=[]
+            for q in pending_depth_captures:
+                (depth_due if q["due"]<=ts else dkeep).append(q)
+            pending_depth_captures[:] = dkeep
+        if not due and not paper_due and not shadow_due and not depth_due: continue
         with state_lock:
             books=dict(state["bbo"]); meta=state["market_meta"]
+        for q in depth_due:
+            capture_decision_depth(q,ts)
         for q in due:
             # IMPORTANT: once T0 fired, the result is recorded even when negative.
             # We observe the current BBO after the requested latency; no positivity filter here.
@@ -1510,6 +1742,15 @@ def v22_stats():
     tr=con.execute("SELECT COUNT(*) n FROM decision_trace_v22 WHERE ts_ms>=? AND ts_ms<?",(start,end)).fetchone()
     con.close(); return {"decisions":d[0] or 0,"routes":d[1] or 0,"avg_exchange_age_ms":d[2],"avg_exchange_skew_ms":d[3],"avg_ws_transport_ms":w[0],"max_ws_transport_ms":w[1],"trace_points":tr[0] or 0}
 
+def v234_capture_stats():
+    start,end,_=local_day_bounds_ms(0); con=db_connect()
+    try:
+        a=con.execute("SELECT COUNT(*),COUNT(DISTINCT decision_id) FROM decision_depth_samples_v234 WHERE sample_ts_ms>=? AND sample_ts_ms<?",(start,end)).fetchone()
+        b=con.execute("SELECT COUNT(*) FROM stable_depth_snapshots_v234 WHERE ts_ms>=? AND ts_ms<?",(start,end)).fetchone()
+        c=con.execute("SELECT COUNT(*) FROM shadow_execution_details_v234 WHERE decision_ts_ms>=? AND decision_ts_ms<?",(start,end)).fetchone()
+        return {"depth_samples":a[0] or 0,"depth_decisions":a[1] or 0,"stable_depth_samples":b[0] or 0,"exec_details":c[0] or 0}
+    finally: con.close()
+
 @app.get("/api/status")
 def api_status():
     rows,label=daily_rows(); sim=paper_status(); now=now_ms()
@@ -1524,23 +1765,33 @@ def api_status():
                  "matrix":execution_matrix(),"raw_primary":raw_primary_status(),"rebalance_cover_mult":REBALANCE_COVER_MULT,"v22":v22_stats(),
                  "trace_window_ms":TRACE_WINDOW_MS,"decision_max_recv_age_ms":DECISION_MAX_RECV_AGE_MS,"decision_max_skew_ms":DECISION_MAX_SKEW_MS,"primary_max_skew_ms":PRIMARY_MAX_SKEW_MS,"paper_rearm_neutral_ms":PAPER_REARM_NEUTRAL_MS,"paper_hard_cooldown_ms":PAPER_HARD_COOLDOWN_MS,
                  "recent_decisions":recent_v22_decisions(),"shadows":shadow_status(),
-                 "shadow_profiles":{k:{"leg1_ms":v[0],"leg2_ms":v[1]} for k,v in SHADOW_PROFILES.items()}})
+                 "shadow_profiles":{k:{"leg1_ms":v[0],"leg2_ms":v[1]} for k,v in SHADOW_PROFILES.items()},
+                 "v234_policy":{"edge_min_pct":SHADOW_MIN_EDGE*100,"target_weights":SHADOW_TARGET_WEIGHTS,
+                    "rebalance_check_min":SHADOW_REBALANCE_CHECK_SEC/60,"rebalance_max_h":SHADOW_REBALANCE_MAX_SEC/3600,
+                    "early_dev_pct":SHADOW_REBALANCE_EARLY_DEV*100,"post_resync_grace_ms":POST_RESYNC_GRACE_MS,
+                    "depth_capture_offsets_ms":DEPTH_CAPTURE_OFFSETS_MS,"depth_capture_levels":DEPTH_CAPTURE_LEVELS},
+                 "v234_capture":v234_capture_stats()})
     return jsonify(base)
 
-HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MEXC 2-Leg V2.3.3 Shadow</title>
-<style>body{background:#090d14;color:#e8edf5;font-family:system-ui;margin:0;padding:16px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.c,.panel{background:#111827;border:1px solid #273248;border-radius:10px;padding:12px}.compare{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;margin-top:12px}.v{font-weight:800;font-size:20px}.big{font-size:28px}.muted{color:#9aa7bd;font-size:12px}.good{color:#22d38a}.bad{color:#ff6677}.panel{margin-top:12px;overflow:auto}.compare .panel{margin-top:0}table{border-collapse:collapse;width:100%;font-size:12px}th,td{padding:8px;border-bottom:1px solid #263044;text-align:right}th:first-child,td:first-child{text-align:left}.tag{display:inline-block;border:1px solid #334155;border-radius:999px;padding:3px 7px;font-size:11px;color:#bac6d8}</style></head><body>
-<h2>MEXC — Scanner Spot 2-leg V2.3.3 Shadow</h2><div class=cards id=cards></div>
-<div class=compare><div class=panel id=paper></div><div class=panel id=raw></div></div>
-<div class=panel id=shadows></div>
-<div class=panel><h3>Décisions récentes — trace 0→300 ms</h3><table><thead><tr><th>Heure</th><th>Route</th><th>Edge T0</th><th>Taille BBO</th><th>Âge échange</th><th>Skew échange</th></tr></thead><tbody id=recent></tbody></table></div>
-<div class=panel><h3>Matrice brute exécution — journée fixe</h3><div class=muted>Sans capital de base : mesure du signal et de la latence. Carnet local depth 10 ms pour le flux marché; décision immédiate à T0, gains et pertes conservés. Le PnL brut peut utiliser une taille BBO supérieure à 2 000 $.</div><table><thead><tr><th>Âge réception max</th><th>Latence</th><th>Décisions</th><th>Résolues</th><th>Gagnantes</th><th>Perdantes</th><th>PnL brut</th><th>Net exec moy.</th></tr></thead><tbody id=matrix></tbody></table></div><div class=panel id=diag></div>
-<script>async function refresh(){let d=await fetch('/api/status').then(r=>r.json()),g=d.diag,s=d.sim,r=d.raw_primary||{};document.getElementById('cards').innerHTML=`<div class=c><div class=v>${d.symbols}</div><div class=muted>marchés WS</div></div><div class=c><div class=v>${d.routes}</div><div class=muted>routes 2-leg</div></div><div class=c><div class=v>${d.ws}/${d.ws_expected}</div><div class=muted>WebSockets</div></div><div class=c><div class=v>${d.age_ms??'-'} ms</div><div class=muted>dernier BBO reçu</div></div><div class=c><div class=v>${d.depth_ready||0}/${d.symbols}</div><div class=muted>carnets depth prêts</div></div><div class=c><div class=v>${d.v22?.decisions||0}</div><div class=muted>décisions tracées</div></div><div class=c><div class=v>${d.v22?.trace_points||0}</div><div class=muted>points trajectoire</div></div><div class=c><div class=v>${d.v22?.avg_ws_transport_ms==null?'-':d.v22.avg_ws_transport_ms.toFixed(1)+' ms'}</div><div class=muted>MEXC → VPS brut (horloges non corrigées)</div></div>`;
-let bals=Object.entries(s.balances||{}).map(([k,v])=>`${k}: ${v.toFixed(2)}`).join(' · ');document.getElementById('paper').innerHTML=`<div class=tag>SIMULATION CAPITAL RÉEL</div><h3>Paper bot — capital initial ${s.capital.toFixed(0)} $</h3><div class='v big ${s.profit>=0?'good':'bad'}'>${s.profit>=0?'+':''}${s.profit.toFixed(2)} $</div><div class='v ${s.return_pct>=0?'good':'bad'}'>${s.return_pct>=0?'+':''}${s.return_pct.toFixed(3)} %</div><div class=muted>NAV actuelle : ${s.nav.toFixed(2)} $ · profits/pertes réalloués automatiquement au capital</div><div class=cards style='margin-top:12px'><div><div class=v>${s.trades}</div><div class=muted>trades exécutés</div></div><div><div class=v>${s.rebalances}</div><div class=muted>rebalances</div></div><div><div class=v>${s.open_exposures||0}</div><div class=muted>expositions ouvertes</div></div><div><div class=v>${s.rebalance_cost.toFixed(3)} $</div><div class=muted>coût rebalance</div></div><div><div class=v>${s.skipped_balance}</div><div class=muted>refus capital</div></div></div><div class=muted style='margin-top:10px'>Buckets : ${bals}<br>Règles live : âge local ≤${d.primary_age_ms} ms · skew ≤${d.primary_max_skew_ms} ms · depth multi-niveaux · leg 1 vers +${Math.floor(d.primary_latency_ms/2)} ms · leg 2 vers +${d.primary_latency_ms} ms · capital réservé à T0 · 1 entrée max par événement · reliquat conservé en exposition puis liquidé sur depth.</div>`;
-let sh=d.shadows||{},shh=`<div class=tag>SHADOW LIVE — AUCUN ORDRE RÉEL</div><h3>3 portefeuilles indépendants · 2 000 $ chacun</h3><div class=cards>`;for(let n of ['FAST','TARGET','DEGRADED']){let x=sh[n];if(!x)continue;shh+=`<div><div class=muted>${n} · ${x.leg1_ms}/${x.leg2_ms} ms</div><div class='v ${x.profit>=0?'good':'bad'}'>${x.profit>=0?'+':''}${x.profit.toFixed(2)} $</div><div class=muted>NAV ${x.nav.toFixed(2)} $ · ${x.trades} trades · ${x.wins}W/${x.losses}L · exp. ${x.open_exposures}</div></div>`}shh+=`</div><div class=muted style='margin-top:10px'>Même signal T0, mêmes carnets Depth réels, capital/réservations/fills indépendants. Seul l'envoi d'ordre MEXC est remplacé par une exécution virtuelle.</div>`;document.getElementById('shadows').innerHTML=shh;
-document.getElementById('raw').innerHTML=`<div class=tag>DONNÉES BRUTES — SANS CAPITAL</div><h3>Même filtre bot, taille BBO brute</h3><div class='v big ${(r.pnl||0)>=0?'good':'bad'}'>${(r.pnl||0)>=0?'+':''}${(r.pnl||0).toFixed(2)} $</div><div class=muted>Pas de capital initial, pas de contrainte de buckets : ce PnL sert uniquement à comparer le signal brut à ce que les 2 000 $ peuvent réellement exploiter.</div><div class=cards style='margin-top:12px'><div><div class=v>${r.executed||0}</div><div class=muted>résolues</div></div><div><div class=v>${r.wins||0}</div><div class=muted>gagnantes</div></div><div><div class=v>${r.losses||0}</div><div class=muted>perdantes</div></div><div><div class=v>${r.avg_exec_net==null?'-':(100*r.avg_exec_net).toFixed(4)+'%'}</div><div class=muted>net exec moyen</div></div></div><div class=muted style='margin-top:10px'>Même condition : âge échange ≤${d.primary_age_ms} ms · skew ≤${d.primary_max_skew_ms} ms · +${d.primary_latency_ms} ms.</div>`;
-let m=d.matrix||[],h='';for(let x of m){h+=`<tr><td>${x.age} ms</td><td>${x.lat} ms</td><td>${x.n}</td><td>${x.executed}</td><td>${x.wins||0}</td><td>${x.losses||0}</td><td class='${x.pnl>=0?'good':'bad'}'>${x.pnl.toFixed(3)} $</td><td>${x.avg_exec_net==null?'-':(100*x.avg_exec_net).toFixed(4)+'%'}</td></tr>`}document.getElementById('matrix').innerHTML=h;let rh='';for(let q of (d.recent_decisions||[])){let t=new Date(q.ts_ms);rh+=`<tr><td>${t.toLocaleTimeString()}</td><td>${q.route_id}</td><td class='good'>${(100*q.decision_net).toFixed(4)}%</td><td>${q.decision_size_usd.toFixed(2)} $</td><td>${q.exchange_age_max_ms} ms</td><td>${q.exchange_skew_ms} ms</td></tr>`}document.getElementById('recent').innerHTML=rh;document.getElementById('diag').innerHTML=`<h3>Univers</h3><div class=cards><div><div class=v>${g.all_markets}</div><div class=muted>marchés découverts</div></div><div><div class=v>${g.candidate_2leg}</div><div class=muted>2-leg candidates</div></div><div><div class=v>${g.selected_2leg}</div><div class=muted>2-leg suivies</div></div><div><div class=v>${g.candidate_3leg}</div><div class=muted>3-leg détectées mais ignorées</div></div></div>`}refresh();setInterval(refresh,3000)</script></body></html>'''
-
-
+HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MEXC 2-Leg V2.3.4</title>
+<style>body{background:#090d14;color:#e8edf5;font-family:system-ui;margin:0;padding:16px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.c,.panel{background:#111827;border:1px solid #273248;border-radius:10px;padding:12px}.v{font-weight:800;font-size:20px}.big{font-size:28px}.muted{color:#9aa7bd;font-size:12px}.good{color:#22d38a}.bad{color:#ff6677}.panel{margin-top:12px;overflow:auto}.latency{display:grid;grid-template-columns:repeat(3,minmax(250px,1fr));gap:10px}.latbox{background:#0c1421;border:1px solid #2a3850;border-radius:10px;padding:12px}.balance{margin-top:8px;line-height:1.7}.metricgrid{display:grid;grid-template-columns:repeat(2,minmax(95px,1fr));gap:7px;margin-top:10px}.metric{background:#111b2b;border-radius:8px;padding:8px}.tag{display:inline-block;border:1px solid #334155;border-radius:999px;padding:3px 7px;font-size:11px;color:#bac6d8}table{border-collapse:collapse;width:100%;font-size:12px}th,td{padding:8px;border-bottom:1px solid #263044;text-align:right}th:first-child,td:first-child{text-align:left}@media(max-width:900px){.latency{grid-template-columns:1fr}}</style></head><body>
+<h2>MEXC — Scanner Spot 2-leg V2.3.4</h2><div class=cards id=cards></div>
+<div class=panel id=latencies></div>
+<div class=panel id=policy></div>
+<div class=panel><h3>Décisions récentes — données conservées pour replay</h3><table><thead><tr><th>Heure</th><th>Route</th><th>Edge T0</th><th>Taille BBO</th><th>Âge local</th><th>Skew local</th></tr></thead><tbody id=recent></tbody></table></div>
+<div class=panel id=capture></div><div class=panel id=diag></div>
+<script>
+async function refresh(){let d=await fetch('/api/status').then(r=>r.json()),g=d.diag,p=d.v234_policy||{},cap=d.v234_capture||{};
+document.getElementById('cards').innerHTML=`<div class=c><div class=v>${d.symbols}</div><div class=muted>marchés WS</div></div><div class=c><div class=v>${d.routes}</div><div class=muted>routes 2-leg</div></div><div class=c><div class=v>${d.ws}/${d.ws_expected}</div><div class=muted>WebSockets</div></div><div class=c><div class=v>${d.age_ms??'-'} ms</div><div class=muted>dernier BBO reçu</div></div><div class=c><div class=v>${d.depth_ready||0}/${d.symbols}</div><div class=muted>carnets Depth prêts</div></div><div class=c><div class=v>${d.v22?.decisions||0}</div><div class=muted>décisions brutes tracées</div></div><div class=c><div class=v>${d.v22?.trace_points||0}</div><div class=muted>points trajectoire</div></div>`;
+let sh=d.shadows||{},h=`<div class=tag>LATENCE D'EXÉCUTION</div><h3>FAST / TARGET / DEGRADED — 2 000 $ indépendants chacun</h3><div class=latency>`;
+for(let n of ['FAST','TARGET','DEGRADED']){let x=sh[n];if(!x)continue;let bal=Object.entries(x.balances||{}).map(([a,v])=>`${a} <b>${v.toFixed(2)}</b>`).join(' · ');h+=`<div class=latbox><div class=muted>${n} · Leg1 +${x.leg1_ms} ms · Leg2 +${x.leg2_ms} ms</div><div class='v big ${x.profit>=0?'good':'bad'}'>${x.profit>=0?'+':''}${x.profit.toFixed(2)} $</div><div class=muted>NAV ${x.nav.toFixed(2)} $</div><div class=metricgrid><div class=metric><div class=v>${x.trades}</div><div class=muted>trades</div></div><div class=metric><div class=v>${x.wins} / ${x.losses}</div><div class=muted>gagnés / perdus</div></div><div class=metric><div class=v>${x.avg_edge==null?'-':(100*x.avg_edge).toFixed(3)+'%'}</div><div class=muted>edge T0 moyen</div></div><div class=metric><div class=v>${x.rebalances}</div><div class=muted>rebalances</div></div></div><div class='balance muted'>Balance : ${bal}<br>Coût rebalance ${x.rebalance_cost.toFixed(3)} $ · refus balance ${x.skipped_balance} · expositions ${x.open_exposures}</div></div>`}h+=`</div><div class=muted style='margin-top:10px'>Même signal et mêmes carnets MEXC réels. Seuls les délais virtuels diffèrent. Aucun ordre réel n'est envoyé.</div>`;document.getElementById('latencies').innerHTML=h;
+let tw=Object.entries(p.target_weights||{}).map(([a,v])=>`${a} ${(100*v).toFixed(0)}%`).join(' · ');document.getElementById('policy').innerHTML=`<div class=tag>POLITIQUE PROSPECTIVE V2.3.4</div><h3>Admission + capital + sécurité</h3><div class=cards><div><div class=v>${(p.edge_min_pct??0).toFixed(2)}%</div><div class=muted>edge minimum Shadow</div></div><div><div class=v>${tw}</div><div class=muted>allocation cible</div></div><div><div class=v>${p.rebalance_check_min??'-'} min</div><div class=muted>contrôle balance</div></div><div><div class=v>${p.rebalance_max_h??'-'} h</div><div class=muted>rebalance périodique max</div></div><div><div class=v>${p.early_dev_pct??'-'} pts</div><div class=muted>déclenchement anticipé</div></div><div><div class=v>${p.post_resync_grace_ms??'-'} ms</div><div class=muted>grâce après resync</div></div></div><div class=muted style='margin-top:10px'>Les décisions sous 0,35% restent enregistrées pour les prochains backtests : on pourra rejouer 0,30 / 0,35 / 0,40 / 0,50 sans perdre les données.</div>`;
+let rh='';for(let q of (d.recent_decisions||[])){let t=new Date(q.ts_ms);rh+=`<tr><td>${t.toLocaleTimeString()}</td><td>${q.route_id}</td><td class='good'>${(100*q.decision_net).toFixed(4)}%</td><td>${q.decision_size_usd.toFixed(2)} $</td><td>${q.recv_age_max_ms} ms</td><td>${q.recv_skew_ms} ms</td></tr>`}document.getElementById('recent').innerHTML=rh;
+document.getElementById('capture').innerHTML=`<div class=tag>DATASET REPLAY V2.3.4</div><h3>Collecte pour le prochain export</h3><div class=cards><div><div class=v>${cap.depth_decisions||0}</div><div class=muted>décisions avec Depth</div></div><div><div class=v>${cap.depth_samples||0}</div><div class=muted>snapshots multi-level</div></div><div><div class=v>${cap.exec_details||0}</div><div class=muted>exécutions VWAP détaillées</div></div><div><div class=v>${cap.stable_depth_samples||0}</div><div class=muted>snapshots Depth stablecoins</div></div></div><div class=muted style='margin-top:10px'>Offsets Depth : ${(p.depth_capture_offsets_ms||[]).join(', ')} ms · top ${(p.depth_capture_levels||'-')} niveaux par côté. Cela permettra de rejouer chronologiquement ratios de balance, rebalances, seuils d'edge, latences, persistance, VWAP, partial fills et règles post-resync.</div>`;
+document.getElementById('diag').innerHTML=`<h3>Univers</h3><div class=cards><div><div class=v>${g.all_markets}</div><div class=muted>marchés découverts</div></div><div><div class=v>${g.candidate_2leg}</div><div class=muted>2-leg candidates</div></div><div><div class=v>${g.selected_2leg}</div><div class=muted>2-leg suivies</div></div><div><div class=v>${g.candidate_3leg}</div><div class=muted>3-leg détectées mais ignorées</div></div></div>`}
+refresh();setInterval(refresh,3000)
+</script></body></html>
+'''
 
 @app.get("/")
 def index(): return render_template_string(HTML)
@@ -1550,6 +1801,9 @@ def bootstrap():
     threading.Thread(target=db_writer,daemon=True).start()
     # Give DB schema thread a moment before state restore.
     time.sleep(.15); load_paper_state(); load_shadow_state()
+    boot_ts=now_ms()
+    for _p in SHADOW_PROFILES:
+        shadow_last_rebalance_ms[_p]=boot_ts; shadow_last_rebalance_check_ms[_p]=boot_ts
     markets=discover_markets(); chosen,routes,meta,diag=select_routes_under_symbol_budget(markets)
     bysym=defaultdict(list)
     for r in routes:
@@ -1565,6 +1819,7 @@ def bootstrap():
     put_db(("meta",("version",VERSION))); put_db(("meta",("paper_rearm_neutral_ms",str(PAPER_REARM_NEUTRAL_MS)))); put_db(("meta",("paper_hard_cooldown_ms",str(PAPER_HARD_COOLDOWN_MS)))); put_db(("meta",("paper_failed_leg_policy","reverse_leg1_then_persist_open_exposure_until_liquidated"))); put_db(("meta",("ws_depth_interval","10ms"))); put_db(("meta",("depth_snapshot_levels","100"))); put_db(("meta",("trace_window_ms",str(TRACE_WINDOW_MS)))); put_db(("meta",("market_source",state["market_source"])))
     put_db(("meta",("route_diag",json.dumps(diag,sort_keys=True))))
     put_db(("meta",("shadow_profiles",json.dumps(SHADOW_PROFILES,sort_keys=True))))
+    put_db(("meta",("v234_policy",json.dumps({"edge_min":SHADOW_MIN_EDGE,"target_weights":SHADOW_TARGET_WEIGHTS,"rebalance_check_sec":SHADOW_REBALANCE_CHECK_SEC,"rebalance_max_sec":SHADOW_REBALANCE_MAX_SEC,"early_dev":SHADOW_REBALANCE_EARLY_DEV,"post_resync_grace_ms":POST_RESYNC_GRACE_MS,"depth_capture_offsets_ms":DEPTH_CAPTURE_OFFSETS_MS,"depth_capture_levels":DEPTH_CAPTURE_LEVELS},sort_keys=True))))
     for _ in range(6): threading.Thread(target=scan_worker,daemon=True).start()
     threading.Thread(target=event_sweeper,daemon=True).start()
     threading.Thread(target=execution_trial_worker,daemon=True).start()
@@ -1572,6 +1827,8 @@ def bootstrap():
     threading.Thread(target=shadow_exposure_worker,daemon=True).start()
     threading.Thread(target=snapshot_worker,daemon=True).start()
     threading.Thread(target=stable_quote_worker,daemon=True).start()
+    threading.Thread(target=stable_depth_capture_worker,daemon=True).start()
+    threading.Thread(target=shadow_periodic_rebalance_worker,daemon=True).start()
     for i,g in enumerate(groups,1): threading.Thread(target=ws_worker,args=(g,i),daemon=True).start()
     time.sleep(1.0)
     threading.Thread(target=depth_resync_worker,daemon=True).start()
