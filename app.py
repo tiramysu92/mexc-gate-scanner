@@ -6,10 +6,10 @@ from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, render_template_string
 import websocket
 
-VERSION = "2.3.6-all-2leg"
+VERSION = "2.3.7-mexc-ping-balanced-ws"
 HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", "8081"))
-DB_PATH = os.getenv("DB_PATH", "mexc_routes_v236.db")
+DB_PATH = os.getenv("DB_PATH", "mexc_routes_v237.db")
 MARKET_CACHE = os.getenv("MARKET_CACHE", "mexc_markets_cache.json")
 TZ_NAME = os.getenv("TZ_NAME", "Europe/Paris")
 TZ = ZoneInfo(TZ_NAME)
@@ -25,6 +25,8 @@ EVENT_CLOSE_GAP_MS = int(os.getenv("EVENT_CLOSE_GAP_MS", "750"))
 FOLLOW_ALL_2LEG = os.getenv("FOLLOW_ALL_2LEG", "1") == "1"
 MAX_WS_SYMBOLS = int(os.getenv("MAX_WS_SYMBOLS", "600"))
 WS_GROUP_SIZE = max(1, min(30, int(os.getenv("WS_GROUP_SIZE", "20"))))
+MEXC_APP_PING_SEC = max(5.0, float(os.getenv("MEXC_APP_PING_SEC", "15")))
+MEXC_APP_PONG_TIMEOUT_SEC = max(MEXC_APP_PING_SEC+5.0, float(os.getenv("MEXC_APP_PONG_TIMEOUT_SEC", "45")))
 MAX_ROUTES_PER_SYMBOL_SCAN = int(os.getenv("MAX_ROUTES_PER_SYMBOL_SCAN", "10000"))
 
 # Realistic paper-execution model
@@ -103,7 +105,8 @@ state = {
     "symbols": [], "routes": [], "routes_by_symbol": defaultdict(list), "market_meta": {},
     "errors": deque(maxlen=30), "started_ms": int(time.time()*1000), "market_source": "",
     "scan_updates": 0, "scan_coalesced": 0, "scan_queue_drops": 0, "db_queue_drops": 0,
-    "ws_disconnects": 0, "ws_reconnects": 0, "ws_workers": {},
+    "ws_disconnects": 0, "ws_reconnects": 0, "ws_app_pings": 0, "ws_app_pongs": 0,
+    "ws_ping_errors": 0, "ws_workers": {},
     "depth_gap_events": 0, "depth_resync_failures": 0, "depth_resync_recoveries": 0,
     "latest_routes": {}, "route_diag": {},
     "depth": {}, "depth_ready": 0,
@@ -618,6 +621,40 @@ def select_routes_under_symbol_budget(markets):
           "dropped_routes":len(candidates)-len(selected),"direct_stable_symbols":len(direct_stable),
           "follow_all_2leg":FOLLOW_ALL_2LEG,"ws_group_size":WS_GROUP_SIZE,"mode":"2-leg only"}
     return chosen,selected,bysym,diag
+
+def fetch_ws_activity_weights(symbols):
+    """Approximate per-symbol stream load from MEXC rolling 24h quote volume."""
+    try:
+        headers={"User-Agent":"Mozilla/5.0 mexc-routes-scanner/2.3.7", "Accept":"application/json"}
+        r=requests.get(REST+"/api/v3/ticker/24hr",headers=headers,timeout=25); r.raise_for_status()
+        rows=r.json()
+        if not isinstance(rows,list): return {},"ticker_unavailable"
+        wanted=set(symbols); weights={}
+        for x in rows:
+            sym=str(x.get("symbol","")).upper()
+            if sym not in wanted: continue
+            try: weights[sym]=max(0.0,float(x.get("quoteVolume") or 0.0))
+            except (TypeError,ValueError): weights[sym]=0.0
+        return weights,"mexc_quote_volume_24h"
+    except Exception as e:
+        logerr(f"24h WS load weights: {e}")
+        return {},"round_robin_fallback"
+
+def build_balanced_ws_groups(symbols):
+    """Keep <= WS_GROUP_SIZE symbols/socket while spreading the busiest feeds."""
+    symbols=sorted(set(symbols))
+    if not symbols: return [],[],"empty"
+    count=max(1,math.ceil(len(symbols)/WS_GROUP_SIZE))
+    weights,mode=fetch_ws_activity_weights(symbols)
+    groups=[[] for _ in range(count)]; loads=[0.0 for _ in range(count)]
+    # With no ticker data, the same greedy loop becomes a deterministic round-robin.
+    ordered=sorted(symbols,key=lambda s:(-weights.get(s,0.0),s)) if weights else symbols
+    for sym in ordered:
+        available=[i for i,g in enumerate(groups) if len(g)<WS_GROUP_SIZE]
+        i=min(available,key=lambda j:(loads[j],len(groups[j]),j)) if weights else min(available,key=lambda j:(len(groups[j]),j))
+        groups[i].append(sym); loads[i]+=weights.get(sym,0.0)
+    for g in groups: g.sort()
+    return groups,loads,mode
 
 # ---------- protobuf BBO ----------
 def _pb_varint(data,pos):
@@ -1846,10 +1883,39 @@ def scan_worker():
             scanq.task_done()
 
 # ---------- WS ----------
-def ws_worker(symbols,worker_id):
+def ws_worker(symbols,worker_id,group_volume_24h=0.0):
     while True:
-        opened=False; health_last_publish=0
+        opened=False; health_last_publish=0; connection_stop=threading.Event()
         try:
+            def application_ping_loop(ws):
+                while not connection_stop.wait(MEXC_APP_PING_SEC):
+                    ts=now_ms()
+                    with state_lock:
+                        h=state["ws_workers"].get(worker_id)
+                        if not h or not h.get("connected"): return
+                        last_pong=h.get("last_pong_ms") or h.get("opened_ms") or ts
+                        sent=int(h.get("pings",0))
+                    if sent and ts-last_pong > MEXC_APP_PONG_TIMEOUT_SEC*1000:
+                        with state_lock:
+                            h=state["ws_workers"].get(worker_id)
+                            if h is not None: h["last_error"]="MEXC application PONG timeout"
+                        try: ws.close()
+                        except Exception: pass
+                        return
+                    try:
+                        ws.send(json.dumps({"method":"PING"}))
+                        with state_lock:
+                            state["ws_app_pings"]+=1
+                            h=state["ws_workers"].get(worker_id)
+                            if h is not None:
+                                h["last_ping_ms"]=ts; h["pings"]=int(h.get("pings",0))+1
+                    except Exception as e:
+                        with state_lock:
+                            state["ws_ping_errors"]+=1
+                            h=state["ws_workers"].get(worker_id)
+                            if h is not None:
+                                h["ping_errors"]=int(h.get("ping_errors",0))+1; h["last_error"]=str(e)[:300]
+                        return
             def on_open(ws):
                 nonlocal opened; opened=True
                 ts=now_ms()
@@ -1860,14 +1926,29 @@ def ws_worker(symbols,worker_id):
                     if opens>1: state["ws_reconnects"]+=1
                     state["ws_workers"][worker_id]={"worker_id":worker_id,"symbols":len(symbols),"connected":True,
                         "opens":opens,"disconnects":int(prev.get("disconnects",0)),"opened_ms":ts,
+                        "symbol_names":list(symbols),"volume_24h":group_volume_24h,
                         "last_message_ms":None,"last_close_code":prev.get("last_close_code"),
-                        "last_error":prev.get("last_error")}
+                        "last_error":None,"last_ping_ms":None,"last_pong_ms":None,
+                        "pings":int(prev.get("pings",0)),"pongs":int(prev.get("pongs",0)),
+                        "ping_errors":int(prev.get("ping_errors",0))}
                 params=[f"spot@public.aggre.depth.v3.api.pb@10ms@{s}" for s in symbols]
                 ws.send(json.dumps({"method":"SUBSCRIPTION","params":params}))
-                print(f"[Routes V{VERSION}] WS {worker_id}: {len(symbols)} symbols")
+                threading.Thread(target=application_ping_loop,args=(ws,),daemon=True).start()
+                print(f"[Routes V{VERSION}] WS {worker_id}: {len(symbols)} symbols load24h={group_volume_24h:,.0f}")
             def on_message(ws,msg):
                 nonlocal health_last_publish
-                if isinstance(msg,str): return
+                if isinstance(msg,str):
+                    try:
+                        j=json.loads(msg)
+                        if str(j.get("msg","")).upper()=="PONG":
+                            ts=now_ms()
+                            with state_lock:
+                                state["ws_app_pongs"]+=1
+                                h=state["ws_workers"].get(worker_id)
+                                if h is not None:
+                                    h["last_pong_ms"]=ts; h["pongs"]=int(h.get("pongs",0))+1
+                    except Exception: pass
+                    return
                 try:
                     x=decode_depth(msg)
                     if not x: return
@@ -1890,6 +1971,7 @@ def ws_worker(symbols,worker_id):
                 logerr(f"WS {worker_id}: {e}")
             def on_close(ws,code,msg):
                 nonlocal opened
+                connection_stop.set()
                 if opened:
                     with state_lock:
                         state["ws_connected"]=max(0,state["ws_connected"]-1); state["ws_disconnects"]+=1
@@ -1899,9 +1981,12 @@ def ws_worker(symbols,worker_id):
                             h["closed_ms"]=now_ms(); h["last_close_code"]=code
                     opened=False
             w=websocket.WebSocketApp(WS,on_open=on_open,on_message=on_message,on_error=on_error,on_close=on_close)
-            w.run_forever(ping_interval=20,ping_timeout=10)
+            # MEXC specifies JSON {"method":"PING"}; RFC control-frame ping timeouts
+            # caused healthy but busy feeds to reconnect and invalidate their books.
+            w.run_forever(ping_interval=0)
         except Exception as e: logerr(f"WS loop {worker_id}: {e}")
         finally:
+            connection_stop.set()
             # websocket-client normally invokes on_close. Keep the counters exact
             # even if run_forever exits through an exception before that callback.
             if opened:
@@ -2040,15 +2125,21 @@ def runtime_health(now):
         workers=[dict(v) for _,v in sorted(state["ws_workers"].items())]
         connected=state["ws_connected"]; expected=state["ws_expected"]
         out={"ws_connected":connected,"ws_expected":expected,"ws_disconnects":state["ws_disconnects"],
-             "ws_reconnects":state["ws_reconnects"],"scan_coalesced":state["scan_coalesced"],
+             "ws_reconnects":state["ws_reconnects"],"ws_app_pings":state["ws_app_pings"],
+             "ws_app_pongs":state["ws_app_pongs"],"ws_ping_errors":state["ws_ping_errors"],
+             "scan_coalesced":state["scan_coalesced"],
              "scan_queue_drops":state["scan_queue_drops"],"db_queue_drops":state["db_queue_drops"],
              "depth_gap_events":state["depth_gap_events"],"depth_resync_failures":state["depth_resync_failures"],
              "depth_resync_recoveries":state["depth_resync_recoveries"]}
     ages=[max(0,now-(w.get("last_message_ms") or w.get("opened_ms") or now)) for w in workers if w.get("connected")]
+    pong_ages=[max(0,now-(w.get("last_pong_ms") or w.get("opened_ms") or now)) for w in workers if w.get("connected")]
     with depth_resync_lock:
         resync_queue=depth_resync_q.qsize(); resync_pending=len(depth_resync_pending)
     out.update({"workers":workers,"stale_workers":sum(a>30000 for a in ages),
                 "max_worker_message_age_ms":max(ages) if ages else None,
+                "max_pong_age_ms":max(pong_ages) if pong_ages else None,
+                "workers_without_pong":sum(1 for w in workers if w.get("connected") and w.get("pings",0)>0 and not w.get("last_pong_ms")),
+                "app_ping_interval_sec":MEXC_APP_PING_SEC,"app_pong_timeout_sec":MEXC_APP_PONG_TIMEOUT_SEC,
                 "scan_queue":scanq.qsize(),"scan_queue_capacity":scanq.maxsize,
                 "db_queue":dbq.qsize(),"db_queue_capacity":dbq.maxsize,
                 "resync_queue":resync_queue,"resync_pending":resync_pending})
@@ -2080,9 +2171,9 @@ def api_status():
                  "v235_capture":v234_capture_stats()})
     return jsonify(base)
 
-HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MEXC 2-Leg V2.3.6</title>
+HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MEXC 2-Leg V2.3.7</title>
 <style>body{background:#090d14;color:#e8edf5;font-family:system-ui;margin:0;padding:16px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.c,.panel{background:#111827;border:1px solid #273248;border-radius:10px;padding:12px}.v{font-weight:800;font-size:20px}.big{font-size:28px}.muted{color:#9aa7bd;font-size:12px}.good{color:#22d38a}.bad{color:#ff6677}.panel{margin-top:12px;overflow:auto}.latency{display:grid;grid-template-columns:repeat(3,minmax(250px,1fr));gap:10px}.latbox{background:#0c1421;border:1px solid #2a3850;border-radius:10px;padding:12px}.balance{margin-top:8px;line-height:1.7}.metricgrid{display:grid;grid-template-columns:repeat(2,minmax(95px,1fr));gap:7px;margin-top:10px}.metric{background:#111b2b;border-radius:8px;padding:8px}.tag{display:inline-block;border:1px solid #334155;border-radius:999px;padding:3px 7px;font-size:11px;color:#bac6d8}table{border-collapse:collapse;width:100%;font-size:12px}th,td{padding:8px;border-bottom:1px solid #263044;text-align:right}th:first-child,td:first-child{text-align:left}@media(max-width:900px){.latency{grid-template-columns:1fr}}</style></head><body>
-<h2>MEXC — Scanner Spot 2-leg V2.3.6 · univers complet</h2><div class=cards id=cards></div>
+<h2>MEXC — Scanner Spot 2-leg V2.3.7 · univers complet</h2><div class=cards id=cards></div>
 <div class=panel id=health></div>
 <div class=panel id=latencies></div>
 <div class=panel id=policy></div>
@@ -2092,14 +2183,14 @@ HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" 
 <script>
 async function refresh(){let d=await fetch('/api/status').then(r=>r.json()),g=d.diag,p=d.v235_policy||{},cap=d.v235_capture||{},ql=d.quality||{},ad=d.admissions||{},he=d.health||{};
 document.getElementById('cards').innerHTML=`<div class=c><div class=v>${d.symbols}</div><div class=muted>marchés WS</div></div><div class=c><div class=v>${d.routes}</div><div class=muted>routes 2-leg</div></div><div class=c><div class=v>${d.ws}/${d.ws_expected}</div><div class=muted>WebSockets</div></div><div class=c><div class=v>${d.age_ms??'-'} ms</div><div class=muted>dernier BBO reçu</div></div><div class=c><div class=v>${d.depth_ready||0}/${d.symbols}</div><div class=muted>carnets Depth prêts</div></div><div class=c><div class=v>${d.v22?.decisions||0}</div><div class=muted>décisions brutes tracées</div></div><div class=c><div class=v>${d.v22?.trace_points||0}</div><div class=muted>points trajectoire</div></div>`;
-let wsok=(he.ws_connected===he.ws_expected)&&(he.stale_workers||0)===0;document.getElementById('health').innerHTML=`<div class=tag>SANTÉ TEMPS RÉEL</div><h3 class='${wsok?'good':'bad'}'>WebSockets ${he.ws_connected||0}/${he.ws_expected||0} · ${he.stale_workers||0} silencieux &gt;30 s</h3><div class=cards><div><div class=v>${he.ws_disconnects||0}</div><div class=muted>chutes WS</div></div><div><div class=v>${he.ws_reconnects||0}</div><div class=muted>reconnexions WS</div></div><div><div class=v>${he.max_worker_message_age_ms==null?'-':he.max_worker_message_age_ms+' ms'}</div><div class=muted>âge max dernier message/socket</div></div><div><div class=v>${he.depth_gap_events||0}</div><div class=muted>gaps Depth hors bootstrap</div></div><div><div class=v>${he.depth_resync_failures||0}</div><div class=muted>échecs resync</div></div><div><div class=v>${he.resync_queue||0}/${he.resync_pending||0}</div><div class=muted>file/pending resync</div></div><div><div class=v>${he.scan_queue||0}/${he.scan_queue_capacity||0}</div><div class=muted>file scan</div></div><div><div class=v>${he.scan_queue_drops||0}</div><div class=muted>abandons file scan</div></div><div><div class=v>${he.scan_coalesced||0}</div><div class=muted>updates fusionnées</div></div><div><div class=v>${he.db_queue||0}/${he.db_queue_capacity||0}</div><div class=muted>file DB</div></div><div><div class=v>${he.db_queue_drops||0}</div><div class=muted>abandons DB</div></div></div>`;
+let wsok=(he.ws_connected===he.ws_expected)&&(he.stale_workers||0)===0&&(he.workers_without_pong||0)===0;document.getElementById('health').innerHTML=`<div class=tag>SANTÉ TEMPS RÉEL</div><h3 class='${wsok?'good':'bad'}'>WebSockets ${he.ws_connected||0}/${he.ws_expected||0} · ${he.stale_workers||0} silencieux &gt;30 s</h3><div class=cards><div><div class=v>${he.ws_disconnects||0}</div><div class=muted>chutes WS</div></div><div><div class=v>${he.ws_reconnects||0}</div><div class=muted>reconnexions WS</div></div><div><div class=v>${he.ws_app_pings||0} / ${he.ws_app_pongs||0}</div><div class=muted>PING / PONG MEXC</div></div><div><div class=v>${he.max_pong_age_ms==null?'-':he.max_pong_age_ms+' ms'}</div><div class=muted>âge maximal PONG</div></div><div><div class=v>${he.workers_without_pong||0} / ${he.ws_ping_errors||0}</div><div class=muted>sockets sans PONG / erreurs ping</div></div><div><div class=v>${he.max_worker_message_age_ms==null?'-':he.max_worker_message_age_ms+' ms'}</div><div class=muted>âge max dernier Depth/socket</div></div><div><div class=v>${he.depth_gap_events||0}</div><div class=muted>gaps Depth hors bootstrap</div></div><div><div class=v>${he.depth_resync_failures||0}</div><div class=muted>échecs resync</div></div><div><div class=v>${he.resync_queue||0}/${he.resync_pending||0}</div><div class=muted>file/pending resync</div></div><div><div class=v>${he.scan_queue||0}/${he.scan_queue_capacity||0}</div><div class=muted>file scan</div></div><div><div class=v>${he.scan_queue_drops||0}</div><div class=muted>abandons file scan</div></div><div><div class=v>${he.scan_coalesced||0}</div><div class=muted>updates fusionnées</div></div><div><div class=v>${he.db_queue||0}/${he.db_queue_capacity||0}</div><div class=muted>file DB</div></div><div><div class=v>${he.db_queue_drops||0}</div><div class=muted>abandons DB</div></div></div>`;
 let sh=d.shadows||{},first=sh.FAST||{},h=`<div class=tag>LATENCE D'EXÉCUTION</div><h3>FAST / TARGET / DEGRADED — ${(first.capital||0).toFixed(0)} $ indépendants chacun</h3><div class=latency>`;
 for(let n of ['FAST','TARGET','DEGRADED']){let x=sh[n];if(!x)continue;let bal=Object.entries(x.balances||{}).map(([a,v])=>`${a} <b>${v.toFixed(2)}</b>`).join(' · ');h+=`<div class=latbox><div class=muted>${n} · Leg1 +${x.leg1_ms} ms · Leg2 +${x.leg2_ms} ms</div><div class='v big ${x.profit>=0?'good':'bad'}'>${x.profit>=0?'+':''}${x.profit.toFixed(2)} $</div><div class=muted>NAV ${x.nav.toFixed(2)} $</div><div class=metricgrid><div class=metric><div class=v>${x.trades}</div><div class=muted>trades</div></div><div class=metric><div class=v>${x.wins} / ${x.losses}</div><div class=muted>gagnés / perdus</div></div><div class=metric><div class=v>${x.avg_edge==null?'-':(100*x.avg_edge).toFixed(3)+'%'}</div><div class=muted>edge T0 moyen</div></div><div class=metric><div class=v>${x.rebalances}</div><div class=muted>rebalances</div></div></div><div class='balance muted'>Balance : ${bal}<br>Coût rebalance ${x.rebalance_cost.toFixed(3)} $ · refus balance ${x.skipped_balance} · expositions ${x.open_exposures}</div></div>`}h+=`</div><div class=muted style='margin-top:10px'>Même signal et mêmes carnets MEXC réels. Seuls les délais virtuels diffèrent. Aucun ordre réel n'est envoyé.</div>`;document.getElementById('latencies').innerHTML=h;
-let tw=Object.entries(p.target_weights||{}).map(([a,v])=>`${a} ${(100*v).toFixed(0)}%`).join(' · ');document.getElementById('policy').innerHTML=`<div class=tag>POLITIQUE V2.3.6</div><h3>Depth Quality adaptatif — aucun cap absolu</h3><div class=cards><div><div class=v>${(p.edge_min_pct??0).toFixed(2)}%</div><div class=muted>edge initial minimum</div></div><div><div class=v>A · ${(p.a_fraction_pct??0).toFixed(0)}%</div><div class=muted>capacité si suppression L1 ≥ edge min</div></div><div><div class=v>B+ · ${(p.b_fraction_pct??0).toFixed(0)}%</div><div class=muted>capacité si −50% BBO ≥ ${(p.bplus_half_edge_pct??0).toFixed(2)}%</div></div><div><div class=v>×${(p.coverage3_min??0).toFixed(0)}</div><div class=muted>réserve minimum niveaux 1–3</div></div><div><div class=v>${tw}</div><div class=muted>allocation cible</div></div><div><div class=v>${p.rebalance_check_min??'-'} min / ${p.rebalance_max_h??'-'} h</div><div class=muted>contrôle / rebalance maximum</div></div></div><div class=muted style='margin-top:10px'>A : 50% de la capacité robuste. B+ : 33%, edge après −50% BBO ≥0,75%, edge sans niveau 1 ≥−2%, réserve L1–L3 ≥×3. B−, C et D sont enregistrés mais refusés. Taille finale limitée uniquement par le solde disponible.</div>`;
+let tw=Object.entries(p.target_weights||{}).map(([a,v])=>`${a} ${(100*v).toFixed(0)}%`).join(' · ');document.getElementById('policy').innerHTML=`<div class=tag>POLITIQUE V2.3.7</div><h3>Depth Quality adaptatif — aucun cap absolu</h3><div class=cards><div><div class=v>${(p.edge_min_pct??0).toFixed(2)}%</div><div class=muted>edge initial minimum</div></div><div><div class=v>A · ${(p.a_fraction_pct??0).toFixed(0)}%</div><div class=muted>capacité si suppression L1 ≥ edge min</div></div><div><div class=v>B+ · ${(p.b_fraction_pct??0).toFixed(0)}%</div><div class=muted>capacité si −50% BBO ≥ ${(p.bplus_half_edge_pct??0).toFixed(2)}%</div></div><div><div class=v>×${(p.coverage3_min??0).toFixed(0)}</div><div class=muted>réserve minimum niveaux 1–3</div></div><div><div class=v>${tw}</div><div class=muted>allocation cible</div></div><div><div class=v>${p.rebalance_check_min??'-'} min / ${p.rebalance_max_h??'-'} h</div><div class=muted>contrôle / rebalance maximum</div></div></div><div class=muted style='margin-top:10px'>A : 50% de la capacité robuste. B+ : 33%, edge après −50% BBO ≥0,75%, edge sans niveau 1 ≥−2%, réserve L1–L3 ≥×3. B−, C et D sont enregistrés mais refusés. Taille finale limitée uniquement par le solde disponible.</div>`;
 let qa=0,qb=0,qsmall=0,qbm=0,qcd=0;for(let r of (ql.rows||[])){if(r.grade==='A'&&r.eligible===1)qa+=r.n;if(r.grade==='B+'&&r.eligible===1)qb+=r.n;if((r.grade==='A'||r.grade==='B+')&&r.reason==='below_min_trade')qsmall+=r.n;if(r.grade==='B-')qbm+=r.n;if(r.grade==='C'||r.grade==='D')qcd+=r.n}let ac={};for(let r of (ad.rows||[]))ac[r.disposition]=(ac[r.disposition]||0)+r.n;let aexec=(ac.executed_all_profiles||0)+(ac.executed_partial_profiles||0),ablock=(ac.blocked_same_event||0)+(ac.blocked_not_rearmed||0)+(ac.blocked_cooldown||0),perf=ql.compute||{},cf=ql.coverage_counterfactual||{};document.getElementById('quality').innerHTML=`<div class=tag>QUALITÉ DEPTH AUJOURD'HUI</div><h3>A / B+ admis — entonnoir d'exécution explicite</h3><div class=cards><div><div class=v good>${qa}</div><div class=muted>A admissibles</div></div><div><div class=v good>${qb}</div><div class=muted>B+ admissibles</div></div><div><div class=v>${qsmall}</div><div class=muted>A/B+ sous 10 $</div></div><div><div class=v good>${aexec}</div><div class=muted>signaux exécutés</div></div><div><div class=v>${ablock}</div><div class=muted>bloqués event/réarmement/cooldown</div></div><div><div class=v>${ac.blocked_no_profile_balance||0}</div><div class=muted>bloqués balance</div></div><div><div class=v>${qbm}</div><div class=muted>B− refusés</div></div><div><div class=v>${qcd}</div><div class=muted>C / D refusés</div></div><div><div class=v>${cf.x1??0} / ${cf.x3??0}</div><div class=muted>B+ potentiels si couverture ×1 / ×3</div></div><div><div class=v>${ql.max_selected_usd==null?'-':ql.max_selected_usd.toFixed(2)+' $'}</div><div class=muted>taille Depth max admise</div></div><div><div class=v>${perf.p95_us==null?'-':perf.p95_us.toFixed(1)+' µs'}</div><div class=muted>temps calcul p95</div></div></div>`;
 let fp=v=>v==null?'-':(100*v).toFixed(3)+'%',fn=v=>v==null?'-':Number(v).toFixed(2);let rh='';for(let q of (d.recent_decisions||[])){let t=new Date(q.ts_ms),ok=q.eligible===1;rh+=`<tr><td>${t.toLocaleTimeString()}</td><td>${q.route_id}</td><td>${fp(q.decision_net)}</td><td class='${ok?'good':'muted'}'>${q.grade||q.reason||'-'}</td><td>${q.selected_usd==null?'-':q.selected_usd.toFixed(2)+' $'}</td><td>${fp(q.half_bbo_edge)}</td><td>${fp(q.drop_l1_edge)}</td><td>${q.coverage3==null?'-':'×'+fn(q.coverage3)}</td><td>${q.compute_us==null?'-':fn(q.compute_us)+' µs'}</td></tr>`}document.getElementById('recent').innerHTML=rh;
-document.getElementById('capture').innerHTML=`<div class=tag>DATASET REPLAY V2.3.6</div><h3>Collecte jusqu'à T0 + 5 secondes</h3><div class=cards><div><div class=v>${cap.depth_decisions||0}</div><div class=muted>décisions avec Depth</div></div><div><div class=v>${cap.depth_samples||0}</div><div class=muted>snapshots multi-level</div></div><div><div class=v>${cap.exec_details||0}</div><div class=muted>exécutions VWAP détaillées</div></div><div><div class=v>${cap.stable_depth_samples||0}</div><div class=muted>snapshots Depth stablecoins</div></div></div><div class=muted style='margin-top:10px'>Offsets Depth : ${(p.depth_capture_offsets_ms||[]).join(', ')} ms · top ${(p.depth_capture_levels||'-')} niveaux par côté. Les trois latences, tailles, stress BBO, rebalances, partial fills et expositions restent rejouables.</div>`;
-document.getElementById('diag').innerHTML=`<h3>Univers</h3><div class=cards><div><div class=v>${g.all_markets}</div><div class=muted>marchés découverts</div></div><div><div class=v>${g.candidate_2leg}</div><div class=muted>2-leg candidates</div></div><div><div class='v ${g.selected_2leg===g.candidate_2leg?'good':'bad'}'>${g.selected_2leg}</div><div class=muted>2-leg suivies</div></div><div><div class=v>${g.dropped_2leg||0}</div><div class=muted>2-leg exclues</div></div><div><div class=v>${g.candidate_3leg}</div><div class=muted>3-leg détectées mais ignorées</div></div><div><div class=v>${g.ws_group_size||'-'}</div><div class=muted>symboles par WebSocket</div></div></div>`}
+document.getElementById('capture').innerHTML=`<div class=tag>DATASET REPLAY V2.3.7</div><h3>Collecte jusqu'à T0 + 5 secondes</h3><div class=cards><div><div class=v>${cap.depth_decisions||0}</div><div class=muted>décisions avec Depth</div></div><div><div class=v>${cap.depth_samples||0}</div><div class=muted>snapshots multi-level</div></div><div><div class=v>${cap.exec_details||0}</div><div class=muted>exécutions VWAP détaillées</div></div><div><div class=v>${cap.stable_depth_samples||0}</div><div class=muted>snapshots Depth stablecoins</div></div></div><div class=muted style='margin-top:10px'>Offsets Depth : ${(p.depth_capture_offsets_ms||[]).join(', ')} ms · top ${(p.depth_capture_levels||'-')} niveaux par côté. Les trois latences, tailles, stress BBO, rebalances, partial fills et expositions restent rejouables.</div>`;
+document.getElementById('diag').innerHTML=`<h3>Univers</h3><div class=cards><div><div class=v>${g.all_markets}</div><div class=muted>marchés découverts</div></div><div><div class=v>${g.candidate_2leg}</div><div class=muted>2-leg candidates</div></div><div><div class='v ${g.selected_2leg===g.candidate_2leg?'good':'bad'}'>${g.selected_2leg}</div><div class=muted>2-leg suivies</div></div><div><div class=v>${g.dropped_2leg||0}</div><div class=muted>2-leg exclues</div></div><div><div class=v>${g.candidate_3leg}</div><div class=muted>3-leg détectées mais ignorées</div></div><div><div class=v>${g.ws_group_size||'-'}</div><div class=muted>symboles maximum par WebSocket</div></div><div><div class=v>${g.ws_grouping_mode||'-'}</div><div class=muted>répartition des flux</div></div><div><div class=v>${g.mexc_app_ping_sec||'-'} s</div><div class=muted>PING applicatif MEXC</div></div></div>`}
 refresh();setInterval(refresh,3000)
 </script></body></html>
 '''
@@ -2120,15 +2211,22 @@ def bootstrap():
     for r in routes:
         for s in r["symbols"]: bysym[s].append(r)
     symbols=[m["symbol"] for m in chosen]
+    groups,group_loads,grouping_mode=build_balanced_ws_groups(symbols)
+    diag["ws_grouping_mode"]=grouping_mode
+    diag["ws_groups"]=len(groups)
+    diag["mexc_app_ping_sec"]=MEXC_APP_PING_SEC
+    diag["mexc_app_pong_timeout_sec"]=MEXC_APP_PONG_TIMEOUT_SEC
     with state_lock:
         state["symbols"]=symbols; state["routes"]=routes; state["routes_by_symbol"]=bysym; state["market_meta"]=meta; state["route_diag"]=diag
-    groups=[symbols[i:i+WS_GROUP_SIZE] for i in range(0,len(symbols),WS_GROUP_SIZE)]
     with state_lock: state["ws_expected"]=len(groups)
     print(f"[Routes V{VERSION}] source={state['market_source']} markets={diag['all_markets']} candidates={diag['candidate_routes']} "
           f"(2L={diag['candidate_2leg']},3L={diag['candidate_3leg']}) selected_symbols={len(symbols)} selected_routes={len(routes)} "
-          f"(2L={diag['selected_2leg']},3L={diag['selected_3leg']}) WS={len(groups)} group={WS_GROUP_SIZE}")
+          f"(2L={diag['selected_2leg']},3L={diag['selected_3leg']}) WS={len(groups)} group<={WS_GROUP_SIZE} "
+          f"grouping={grouping_mode} app_ping={MEXC_APP_PING_SEC:g}s")
     put_db(("meta",("version",VERSION))); put_db(("meta",("paper_rearm_neutral_ms",str(PAPER_REARM_NEUTRAL_MS)))); put_db(("meta",("paper_hard_cooldown_ms",str(PAPER_HARD_COOLDOWN_MS)))); put_db(("meta",("paper_failed_leg_policy","reverse_leg1_then_persist_open_exposure_until_liquidated"))); put_db(("meta",("ws_depth_interval","10ms"))); put_db(("meta",("depth_snapshot_levels","100"))); put_db(("meta",("trace_window_ms",str(TRACE_WINDOW_MS)))); put_db(("meta",("market_source",state["market_source"])))
     put_db(("meta",("route_diag",json.dumps(diag,sort_keys=True))))
+    put_db(("meta",("ws_grouping",grouping_mode)))
+    put_db(("meta",("ws_keepalive",json.dumps({"method":"MEXC_JSON_PING","interval_sec":MEXC_APP_PING_SEC,"pong_timeout_sec":MEXC_APP_PONG_TIMEOUT_SEC},sort_keys=True))))
     put_db(("meta",("shadow_profiles",json.dumps(SHADOW_PROFILES,sort_keys=True))))
     put_db(("meta",("v235_policy",json.dumps({"edge_min":SHADOW_MIN_EDGE,"target_weights":SHADOW_TARGET_WEIGHTS,
         "a_fraction":DEPTH_QUALITY_A_FRACTION,"b_fraction":DEPTH_QUALITY_B_FRACTION,"c_fraction":DEPTH_QUALITY_C_FRACTION,
@@ -2146,7 +2244,7 @@ def bootstrap():
     threading.Thread(target=stable_quote_worker,daemon=True).start()
     threading.Thread(target=stable_depth_capture_worker,daemon=True).start()
     threading.Thread(target=shadow_periodic_rebalance_worker,daemon=True).start()
-    for i,g in enumerate(groups,1): threading.Thread(target=ws_worker,args=(g,i),daemon=True).start()
+    for i,g in enumerate(groups,1): threading.Thread(target=ws_worker,args=(g,i,group_loads[i-1]),daemon=True).start()
     time.sleep(1.0)
     threading.Thread(target=depth_resync_worker,daemon=True).start()
     threading.Thread(target=depth_bootstrap_worker,args=(symbols,),daemon=True).start()
