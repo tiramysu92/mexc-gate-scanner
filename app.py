@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-import os, json, time, math, queue, sqlite3, threading, requests
+import os, json, time, math, queue, sqlite3, threading, random, requests
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, render_template_string
 import websocket
 
-VERSION = "2.3.8-priority-shadow"
+VERSION = "2.3.9-load-shed"
 HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", "8081"))
-DB_PATH = os.getenv("DB_PATH", "mexc_routes_v238.db")
+DB_PATH = os.getenv("DB_PATH", "mexc_routes_v239.db")
 MARKET_CACHE = os.getenv("MARKET_CACHE", "mexc_markets_cache.json")
 TZ_NAME = os.getenv("TZ_NAME", "Europe/Paris")
 TZ = ZoneInfo(TZ_NAME)
@@ -21,7 +21,9 @@ MIN_EXEC_USD = float(os.getenv("MIN_EXEC_USD", "10"))
 MAX_EXEC_USD = 0.0                                        # V2.3.6: no artificial trade cap
 MIN_NET = float(os.getenv("MIN_NET_PCT", "0.01")) / 100.0
 MAX_BBO_AGE_MS = int(os.getenv("MAX_BBO_AGE_MS", "750"))
-EVENT_CLOSE_GAP_MS = int(os.getenv("EVENT_CLOSE_GAP_MS", "750"))
+EVENT_CLOSE_GAP_MS = int(os.getenv("EVENT_CLOSE_GAP_MS", "2000"))
+EVENT_NEUTRAL_CLOSE_MS = int(os.getenv("EVENT_NEUTRAL_CLOSE_MS", "1000"))
+EVENT_CLOSE_NET = float(os.getenv("EVENT_CLOSE_NET_PCT", "0.0")) / 100.0
 FOLLOW_ALL_2LEG = os.getenv("FOLLOW_ALL_2LEG", "1") == "1"
 MAX_WS_SYMBOLS = int(os.getenv("MAX_WS_SYMBOLS", "600"))
 WS_GROUP_SIZE = max(1, min(30, int(os.getenv("WS_GROUP_SIZE", "20"))))
@@ -39,6 +41,8 @@ PRIMARY_EXEC_LATENCY_MS = int(os.getenv("PRIMARY_EXEC_LATENCY_MS", "150"))
 PRIMARY_MAX_SKEW_MS = int(os.getenv("PRIMARY_MAX_SKEW_MS", "50"))
 RESEARCH_BBO_AGES_MS = tuple(int(x) for x in os.getenv("RESEARCH_BBO_AGES_MS", "50,100,150,200,250,300").split(","))
 RESEARCH_LATENCIES_MS = tuple(int(x) for x in os.getenv("RESEARCH_LATENCIES_MS", "10,25,50,75,100,125,150,175,200,250,300").split(","))
+ENABLE_ONLINE_RESEARCH_TRIALS = os.getenv("ENABLE_ONLINE_RESEARCH_TRIALS", "0") == "1"
+REPLAY_MIN_EDGE = float(os.getenv("REPLAY_MIN_EDGE_PCT", "0.10")) / 100.0
 EXEC_OBSERVE_MAX_AGE_MS = int(os.getenv("EXEC_OBSERVE_MAX_AGE_MS", "1000"))
 TRACE_WINDOW_MS = int(os.getenv("TRACE_WINDOW_MS", "300"))
 TRACE_MIN_STEP_MS = int(os.getenv("TRACE_MIN_STEP_MS", "2"))
@@ -87,6 +91,9 @@ DEPTH_CAPTURE_OFFSETS_MS = tuple(int(x) for x in os.getenv(
     "DEPTH_CAPTURE_OFFSETS_MS", "0,10,15,20,25,30,40,50,60,75,100,125,150,200,250,300,500,750,1000,1500,2000,3000,5000").split(","))
 DEPTH_CAPTURE_LEVELS = int(os.getenv("DEPTH_CAPTURE_LEVELS", "25"))
 STABLE_DEPTH_INTERVAL_SEC = float(os.getenv("STABLE_DEPTH_INTERVAL_SEC", "10"))
+DB_COMMIT_BATCH = max(1, int(os.getenv("DB_COMMIT_BATCH", "250")))
+DB_COMMIT_MAX_MS = max(5, int(os.getenv("DB_COMMIT_MAX_MS", "50")))
+DASHBOARD_CACHE_SEC = max(5.0, float(os.getenv("DASHBOARD_CACHE_SEC", "15")))
 
 # Historical research data
 SNAPSHOT_INTERVAL_SEC = float(os.getenv("SNAPSHOT_INTERVAL_SEC", "2.0"))
@@ -110,6 +117,7 @@ state = {
     "depth_gap_events": 0, "depth_resync_failures": 0, "depth_resync_recoveries": 0,
     "latest_routes": {}, "route_diag": {},
     "depth": {}, "depth_ready": 0,
+    "replay_decisions": 0, "quality_decisions": 0,
 }
 active_events = {}
 dbq = queue.Queue(maxsize=50000)
@@ -146,6 +154,9 @@ depth_resync_pending = set()
 depth_resync_lock = threading.Lock()
 depth_resync_diag = defaultdict(lambda: {"drops":0,"resync_ok":0,"resync_fail":0,"not_ready_since":None,"last_reason":"","last_resync_ms":None,"last_ready_ts_ms":None})
 depth_quality_compute_us = deque(maxlen=10000)
+db_ready = threading.Event()
+dashboard_cache_lock = threading.RLock()
+dashboard_cache = {"updated_ms":0,"data":None,"last_error":None}
 
 
 def now_ms(): return int(time.time()*1000)
@@ -166,6 +177,8 @@ def db_writer():
     con = sqlite3.connect(DB_PATH, timeout=30)
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA synchronous=NORMAL")
+    con.execute("PRAGMA wal_autocheckpoint=2000")
+    con.execute("PRAGMA journal_size_limit=67108864")
     con.executescript("""
     CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
     CREATE TABLE IF NOT EXISTS opportunities(
@@ -278,6 +291,15 @@ def db_writer():
       UNIQUE(profile,decision_id)
     );
     CREATE INDEX IF NOT EXISTS idx_shadow_attempt_day ON shadow_attempts(profile,day,ts_ms);
+
+    CREATE TABLE IF NOT EXISTS shadow_skips_v239(
+      profile TEXT NOT NULL, day TEXT NOT NULL, ts_ms INTEGER NOT NULL,
+      decision_id TEXT NOT NULL, route_id TEXT NOT NULL, stage TEXT NOT NULL,
+      reason TEXT NOT NULL, scheduled_ts_ms INTEGER NOT NULL, book_age_ms INTEGER,
+      requested_usd REAL NOT NULL, executable_usd REAL,
+      PRIMARY KEY(profile,decision_id,stage)
+    );
+    CREATE INDEX IF NOT EXISTS idx_shadow_skip_v239_day ON shadow_skips_v239(profile,day,ts_ms,reason);
 
     CREATE TABLE IF NOT EXISTS shadow_open_exposures(
       profile TEXT NOT NULL, decision_id TEXT NOT NULL, day TEXT NOT NULL, route_id TEXT NOT NULL,
@@ -409,9 +431,18 @@ def db_writer():
     CREATE INDEX IF NOT EXISTS idx_trials_matrix ON execution_trials(day,bbo_age_limit_ms,latency_ms);
     """)
     con.commit()
+    db_ready.set()
+    pending_commit=0; last_commit=time.monotonic()
     while True:
-        item = dbq.get()
-        if item is None: break
+        try:
+            item = dbq.get(timeout=DB_COMMIT_MAX_MS/1000.0)
+        except queue.Empty:
+            if pending_commit:
+                con.commit(); pending_commit=0; last_commit=time.monotonic()
+            continue
+        if item is None:
+            if pending_commit: con.commit()
+            dbq.task_done(); break
         try:
             typ, payload = item
             if typ == "event":
@@ -445,6 +476,8 @@ def db_writer():
                 con.execute("""INSERT OR REPLACE INTO shadow_state(profile,day,updated_ts_ms,balances_json,profit_bank,trades,wins,losses,rebalances,rebalance_cost,skipped_flash,skipped_balance,skipped_rebalance) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", payload)
             elif typ == "shadow_attempt":
                 con.execute("""INSERT OR IGNORE INTO shadow_attempts(profile,day,ts_ms,decision_id,route_id,event_start_ts_ms,status,input_usd,leg1_input_units,leg1_mid_units,leg2_mid_used,leg2_output_units,unwind_mid_used,unwind_start_units,stranded_mid_units,output_usd_total,profit_usd) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", payload)
+            elif typ == "shadow_skip_v239":
+                con.execute("""INSERT OR REPLACE INTO shadow_skips_v239(profile,day,ts_ms,decision_id,route_id,stage,reason,scheduled_ts_ms,book_age_ms,requested_usd,executable_usd) VALUES(?,?,?,?,?,?,?,?,?,?,?)""", payload)
             elif typ == "shadow_open":
                 con.execute("""INSERT OR REPLACE INTO shadow_open_exposures(profile,decision_id,day,route_id,opened_ts_ms,updated_ts_ms,symbol,mid_asset,start_asset,units,recovered_start_units,input_usd,cash_output_usd,recovered_usd,last_mark_usd,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", payload)
             elif typ == "shadow_close":
@@ -485,12 +518,14 @@ def db_writer():
                 con.execute("""INSERT INTO execution_trials(day,decision_id,route_id,decision_ts_ms,exec_ts_ms,bbo_age_limit_ms,latency_ms,
                     decision_net,decision_size_usd,decision_max_bbo_age_ms,decision_bbo_skew_ms,exec_net,exec_size_usd,exec_max_bbo_age_ms,
                     exec_bbo_skew_ms,pnl_usd,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", payload)
-            con.commit()
+            pending_commit+=1
+            if pending_commit>=DB_COMMIT_BATCH or (time.monotonic()-last_commit)*1000>=DB_COMMIT_MAX_MS:
+                con.commit(); pending_commit=0; last_commit=time.monotonic()
         except Exception as e:
             logerr(f"DB: {e}")
         finally:
             dbq.task_done()
-    con.close()
+    con.commit(); con.close()
 
 
 def put_db(item):
@@ -625,7 +660,7 @@ def select_routes_under_symbol_budget(markets):
 def fetch_ws_activity_weights(symbols):
     """Approximate per-symbol stream load from MEXC rolling 24h quote volume."""
     try:
-        headers={"User-Agent":"Mozilla/5.0 mexc-routes-scanner/2.3.8", "Accept":"application/json"}
+        headers={"User-Agent":"Mozilla/5.0 mexc-routes-scanner/2.3.9", "Accept":"application/json"}
         r=requests.get(REST+"/api/v3/ticker/24hr",headers=headers,timeout=25); r.raise_for_status()
         rows=r.json()
         if not isinstance(rows,list): return {},"ticker_unavailable"
@@ -1427,8 +1462,22 @@ def reserve_shadow_trade(profile,route,event_x,event_start_ts,decision_id,decisi
 def shadow_leg1(q):
     r=q["route"]; sym=r["symbols"][0]; frm,to=r["path"][0],r["path"][1]
     with state_lock: meta=state["market_meta"]
+    market=meta.get(sym)
+    if not market:
+        q["skip_detail"]={"reason":"market_missing","book_age_ms":None,"executable_usd":None}; return False
+    with depth_lock:
+        ob=state["depth"].get(sym)
+        if not ob or not ob.get("ready"):
+            q["skip_detail"]={"reason":"depth_not_ready","book_age_ms":None,"executable_usd":None}; return False
+        book_age=max(0,now_ms()-int(ob.get("ts",0)))
+    if book_age>PRIMARY_BBO_AGE_MS:
+        q["skip_detail"]={"reason":"depth_stale","book_age_ms":book_age,"executable_usd":None}; return False
     fill=depth_walk(sym,frm,to,q["reserved_units"],meta)
-    if not fill or fill["input_used"]*q["x0"]["start_mark"]<SIM_MIN_TRADE_USD: return False
+    if not fill:
+        q["skip_detail"]={"reason":"no_liquidity","book_age_ms":book_age,"executable_usd":0.0}; return False
+    fill_usd=fill["input_used"]*q["x0"]["start_mark"]
+    if fill_usd<SIM_MIN_TRADE_USD:
+        q["skip_detail"]={"reason":"below_min_fill","book_age_ms":book_age,"executable_usd":fill_usd}; return False
     q["leg1"]=fill; q["leg1_ts_ms"]=now_ms(); q["stage"]=2; return True
 
 def settle_shadow_trade(q,exec_ts):
@@ -1593,10 +1642,10 @@ pending_trials=[]
 pending_paper_trials=[]
 pending_shadow_trials=[]
 pending_lock=threading.RLock()
-# One broad research snapshot is kept at the birth of an arbitrage event. If that
-# event starts below the live threshold, exactly one additional snapshot is kept
-# at its first >=0.35% crossing. Repeated BBO updates no longer create a decision
-# every 250 ms for the same persistent opportunity.
+# One replay snapshot is kept at the first >=0.10% crossing of an event. If the
+# same event later reaches the live threshold, one additional >=0.35% snapshot
+# is kept. Sub-0.10% events remain summarized in opportunities without spawning
+# multi-level captures or latency matrices.
 decision_event_flags={}
 # The live-like Shadow clock is intentionally isolated from all replay/capture work.
 # These samples measure scheduler delay in addition to the configured market delay.
@@ -1629,16 +1678,19 @@ def record_active_trace(route,ts,x):
 def schedule_decision(route,x,ts,event_start_ts):
     rid=route["id"]
     event_key=(rid,int(event_start_ts))
-    flags=decision_event_flags.setdefault(event_key,{"broad":False,"quality":False})
-    # First broad T0 snapshot, plus at most the first crossing of the live-policy
-    # threshold. A high-edge event at birth satisfies both with one decision.
-    broad_due=not flags["broad"]
+    flags=decision_event_flags.setdefault(event_key,{"replay":False,"quality":False})
+    # First replay-grade crossing, plus at most the first live-policy crossing.
+    # An event born above 0.35% satisfies both with one decision.
+    broad_due=x.get("net",-1.0)>=REPLAY_MIN_EDGE and not flags["replay"]
     quality_due=x.get("net",-1.0)>=SHADOW_MIN_EDGE and not flags["quality"]
     if not broad_due and not quality_due: return
     if x.get("max_age",999999)>DECISION_MAX_RECV_AGE_MS: return
     if x.get("bbo_skew",999999)>DECISION_MAX_SKEW_MS: return
-    if broad_due: flags["broad"]=True
+    if broad_due: flags["replay"]=True
     if quality_due: flags["quality"]=True
+    with state_lock:
+        if broad_due: state["replay_decisions"]+=1
+        if quality_due: state["quality_decisions"]+=1
     _,_,day=local_day_bounds_ms(0); did=f"{route['id']}@{ts}"; lbs=x.get("leg_books") or []
     if len(lbs)>=2:
         put_db(("decision_v22",(did,day,route["id"],">".join(route["path"]),ts,x["net"],x["size"],x["max_age"],
@@ -1649,11 +1701,12 @@ def schedule_decision(route,x,ts,event_start_ts):
     with trace_lock:
         active_traces.setdefault(route["id"],[]).append({"did":did,"t0":ts,"last_sample":ts})
     with pending_lock:
-        for age_lim in RESEARCH_BBO_AGES_MS:
-            if x["max_age"]>age_lim: continue
-            for lat in RESEARCH_LATENCIES_MS:
-                pending_trials.append({"due":ts+lat,"day":day,"did":did,"route":route,"t0":ts,
-                    "age_lim":age_lim,"lat":lat,"x0":dict(x)})
+        if ENABLE_ONLINE_RESEARCH_TRIALS:
+            for age_lim in RESEARCH_BBO_AGES_MS:
+                if x["max_age"]>age_lim: continue
+                for lat in RESEARCH_LATENCIES_MS:
+                    pending_trials.append({"due":ts+lat,"day":day,"did":did,"route":route,"t0":ts,
+                        "age_lim":age_lim,"lat":lat,"x0":dict(x)})
         for off in DEPTH_CAPTURE_OFFSETS_MS:
             if off>0: pending_depth_captures.append({"due":ts+off,"did":did,"route":route,"t0":ts})
     if 0 in DEPTH_CAPTURE_OFFSETS_MS:
@@ -1777,9 +1830,12 @@ def shadow_execution_worker():
                     with pending_lock: pending_shadow_trials.append(q)
                 else:
                     with shadow_lock:
-                        p=q["profile"]
+                        p=q["profile"]; detail=q.get("skip_detail") or {}
                         shadow_reserved[p][q["start_asset"]]=max(0.0,shadow_reserved[p].get(q["start_asset"],0.0)-q["reserved_units"])
-                        shadow_states[p]["skipped_flash"]+=1; persist_shadow(p)
+                        shadow_states[p]["skipped_flash"]+=1
+                        put_db(("shadow_skip_v239",(p,shadow_states[p]["day"],now_ms(),q["decision_id"],q["route"]["id"],"leg1",
+                            detail.get("reason","unknown"),q["leg1_due"],detail.get("book_age_ms"),q["reserved_usd"],detail.get("executable_usd"))))
+                        persist_shadow(p)
             else:
                 settle_shadow_trade(q,now_ms())
 
@@ -1825,12 +1881,13 @@ def process_route(route,ts):
         if x and x["net"]>=MIN_NET:
             if ev is None:
                 ev={"route_id":route["id"],"type":route["type"],"path":">".join(route["path"]),"start_asset":route["path"][0],
-                    "end_asset":route["path"][-1],"start_ts":ts,"last_ts":ts,"ticks":1,"entry_net":x["net"],"peak_net":x["net"],
+                    "end_asset":route["path"][-1],"start_ts":ts,"last_ts":ts,"last_observed_ts":ts,"ticks":1,"entry_net":x["net"],"peak_net":x["net"],
                     "sum_net":x["net"],"entry_size":x["size"],"max_size":x["size"],"entry_profit":x["profit"],"peak_profit":x["profit"],
                     "max_bbo_age":x["max_age"],"confirmed":False}
                 active_events[key]=ev
             else:
-                ev["last_ts"]=ts; ev["ticks"]+=1; ev["sum_net"]+=x["net"]; ev["max_bbo_age"]=max(ev["max_bbo_age"],x["max_age"])
+                ev["last_ts"]=ts; ev["last_observed_ts"]=ts; ev.pop("neutral_since",None)
+                ev["ticks"]+=1; ev["sum_net"]+=x["net"]; ev["max_bbo_age"]=max(ev["max_bbo_age"],x["max_age"])
                 ev["peak_net"]=max(ev["peak_net"],x["net"]); ev["max_size"]=max(ev["max_size"],x["size"]); ev["peak_profit"]=max(ev["peak_profit"],x["profit"])
 
             # Decision is immediate at T0. The simulation can enter once per event when its stricter BBO/skew rules are met.
@@ -1840,15 +1897,24 @@ def process_route(route,ts):
             if not ev["confirmed"]:
                 ev["confirmed"]=True; ev["confirm_ts"]=ev["start_ts"]; ev["confirm_net"]=ev["entry_net"]; ev["confirm_size"]=ev["entry_size"]
                 ev["confirm_profit"]=ev["entry_profit"]; ev["confirm_ticks"]=1
-        elif ev is not None:
-            close_event(key,ev,ev["last_ts"]); active_events.pop(key,None)
+        elif ev is not None and x is not None:
+            # Do not turn threshold chatter around +0.01% into thousands of new
+            # events. Close only after a truly neutral edge has persisted.
+            ev["last_observed_ts"]=ts
+            if x["net"]<=EVENT_CLOSE_NET:
+                since=ev.get("neutral_since")
+                if since is None: ev["neutral_since"]=ts
+                elif ts-since>=EVENT_NEUTRAL_CLOSE_MS:
+                    close_event(key,ev,ev["last_ts"]); active_events.pop(key,None)
+            else:
+                ev.pop("neutral_since",None)
 
 def event_sweeper():
     while True:
         time.sleep(.03); ts=now_ms()
         with event_lock:
             for key,ev in list(active_events.items()):
-                if ts-ev["last_ts"]>EVENT_CLOSE_GAP_MS:
+                if ts-ev.get("last_observed_ts",ev["last_ts"])>EVENT_CLOSE_GAP_MS:
                     close_event(key,ev,ev["last_ts"]); active_events.pop(key,None)
 
 # ---------- Historical snapshots ----------
@@ -1903,10 +1969,15 @@ def scan_worker():
 
 # ---------- WS ----------
 def ws_worker(symbols,worker_id,group_volume_24h=0.0):
+    retry_delay=2.0
     while True:
-        opened=False; health_last_publish=0; connection_stop=threading.Event()
+        opened=False; health_last_publish=0; connection_stop=threading.Event(); connection_started=time.monotonic()
         try:
             def application_ping_loop(ws):
+                with state_lock: expected=max(1,state.get("ws_expected",1))
+                # Spread 36 application PINGs over one interval instead of
+                # creating a synchronized burst on every socket.
+                if connection_stop.wait(MEXC_APP_PING_SEC*((worker_id-1)%expected)/expected): return
                 while not connection_stop.wait(MEXC_APP_PING_SEC):
                     ts=now_ms()
                     with state_lock:
@@ -2016,7 +2087,9 @@ def ws_worker(symbols,worker_id,group_volume_24h=0.0):
                         h["connected"]=False; h["disconnects"]=int(h.get("disconnects",0))+1
                         h["closed_ms"]=now_ms(); h["last_close_code"]="run_forever_exit"
                 opened=False
-        time.sleep(2)
+        lived=time.monotonic()-connection_started
+        retry_delay=2.0 if lived>=120 else min(30.0,max(2.0,retry_delay*1.5))
+        time.sleep(retry_delay+random.uniform(0.0,1.5))
 
 # ---------- Dashboard ----------
 def db_connect():
@@ -2139,10 +2212,51 @@ def v236_admission_stats():
         return {"rows":[dict(r) for r in rows]}
     finally: con.close()
 
+def v239_skip_stats():
+    start,end,_=local_day_bounds_ms(0); con=db_connect()
+    try:
+        rows=con.execute("""SELECT profile,reason,COUNT(*) n,AVG(book_age_ms) avg_book_age_ms,
+            AVG(executable_usd) avg_executable_usd FROM shadow_skips_v239
+            WHERE ts_ms>=? AND ts_ms<? GROUP BY profile,reason ORDER BY n DESC""",(start,end)).fetchall()
+        return {"rows":[dict(r) for r in rows]}
+    finally: con.close()
+
+def refresh_dashboard_cache():
+    """Run SQLite aggregations off the Flask request path."""
+    started=now_ms()
+    try:
+        rows,label=daily_rows()
+        data={"day":label,"rows":rows[:100],"sim":paper_status(),
+              "matrix":execution_matrix() if ENABLE_ONLINE_RESEARCH_TRIALS else [],
+              "raw_primary":raw_primary_status() if ENABLE_ONLINE_RESEARCH_TRIALS else
+                  {"n":0,"executed":0,"wins":0,"losses":0,"pnl":0.0,"avg_exec_net":None},
+              "v22":v22_stats(),"recent_decisions":recent_v22_decisions(),
+              "shadows":shadow_status(),"quality":v235_quality_stats(),
+              "admissions":v236_admission_stats(),"shadow_skips":v239_skip_stats(),"v235_capture":v234_capture_stats()}
+        with dashboard_cache_lock:
+            dashboard_cache.update({"updated_ms":now_ms(),"data":data,"last_error":None,
+                                    "refresh_ms":now_ms()-started})
+        return True
+    except Exception as e:
+        with dashboard_cache_lock:
+            dashboard_cache["last_error"]=str(e)[:300]
+        logerr(f"dashboard cache: {e}")
+        return False
+
+def dashboard_cache_worker():
+    while True:
+        time.sleep(DASHBOARD_CACHE_SEC)
+        refresh_dashboard_cache()
+
 def runtime_health(now):
+    try:
+        db_bytes=os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
+        wal_path=DB_PATH+"-wal"; wal_bytes=os.path.getsize(wal_path) if os.path.exists(wal_path) else 0
+    except OSError:
+        db_bytes=0; wal_bytes=0
     with state_lock:
         workers=[dict(v) for _,v in sorted(state["ws_workers"].items())]
-        connected=state["ws_connected"]; expected=state["ws_expected"]
+        connected=state["ws_connected"]; expected=state["ws_expected"]; symbols=list(state["symbols"])
         out={"ws_connected":connected,"ws_expected":expected,"ws_disconnects":state["ws_disconnects"],
              "ws_reconnects":state["ws_reconnects"],"ws_app_pings":state["ws_app_pings"],
              "ws_app_pongs":state["ws_app_pongs"],"ws_ping_errors":state["ws_ping_errors"],
@@ -2152,6 +2266,13 @@ def runtime_health(now):
              "depth_resync_recoveries":state["depth_resync_recoveries"]}
     ages=[max(0,now-(w.get("last_message_ms") or w.get("opened_ms") or now)) for w in workers if w.get("connected")]
     pong_ages=[max(0,now-(w.get("last_pong_ms") or w.get("opened_ms") or now)) for w in workers if w.get("connected")]
+    pong_overdue=sum(1 for w in workers if w.get("connected") and w.get("last_ping_ms") and
+                     w.get("last_ping_ms",0)>(w.get("last_pong_ms") or w.get("opened_ms") or 0) and
+                     now-w.get("last_ping_ms",now)>MEXC_APP_PING_SEC*1000)
+    with depth_lock:
+        depth_ages=sorted(max(0,now-int(state["depth"].get(sym,{}).get("ts",0))) for sym in symbols
+                          if state["depth"].get(sym,{}).get("ready") and state["depth"].get(sym,{}).get("ts"))
+    depth_p95=depth_ages[min(len(depth_ages)-1,int((len(depth_ages)-1)*.95))] if depth_ages else None
     with depth_resync_lock:
         resync_queue=depth_resync_q.qsize(); resync_pending=len(depth_resync_pending)
     with pending_lock:
@@ -2165,28 +2286,39 @@ def runtime_health(now):
             shadow_pending_by_stage["leg1" if stage==1 else "leg2"]+=1
         lag=sorted(shadow_execution_lag_ms)
         research_pending=len(pending_trials); paper_pending=len(pending_paper_trials); depth_capture_pending=len(pending_depth_captures)
+    with dashboard_cache_lock:
+        cache_updated=dashboard_cache.get("updated_ms",0); cache_refresh_ms=dashboard_cache.get("refresh_ms")
+        cache_error=dashboard_cache.get("last_error")
     def lag_pct(frac):
         if not lag: return None
         return lag[min(len(lag)-1,int((len(lag)-1)*frac))]
     out.update({"workers":workers,"stale_workers":sum(a>30000 for a in ages),
                 "max_worker_message_age_ms":max(ages) if ages else None,
                 "max_pong_age_ms":max(pong_ages) if pong_ages else None,
-                "workers_without_pong":sum(1 for w in workers if w.get("connected") and w.get("pings",0)>0 and not w.get("last_pong_ms")),
+                "workers_without_pong":pong_overdue,
                 "app_ping_interval_sec":MEXC_APP_PING_SEC,"app_pong_timeout_sec":MEXC_APP_PONG_TIMEOUT_SEC,
+                "depth_book_age_p95_ms":depth_p95,"depth_book_age_max_ms":max(depth_ages) if depth_ages else None,
                 "scan_queue":scanq.qsize(),"scan_queue_capacity":scanq.maxsize,
                 "db_queue":dbq.qsize(),"db_queue_capacity":dbq.maxsize,
+                "db_size_bytes":db_bytes,"db_wal_size_bytes":wal_bytes,
                 "resync_queue":resync_queue,"resync_pending":resync_pending,
                 "research_pending":research_pending,"paper_pending":paper_pending,
                 "depth_capture_pending":depth_capture_pending,"shadow_pending":shadow_pending,
                 "shadow_overdue":shadow_overdue,"shadow_pending_by_profile":shadow_pending_by_profile,
                 "shadow_pending_by_stage":shadow_pending_by_stage,
+                "dashboard_cache_age_ms":max(0,now-cache_updated) if cache_updated else None,
+                "dashboard_refresh_ms":cache_refresh_ms,"dashboard_cache_error":cache_error,
                 "shadow_execution_lag":{"samples":len(lag),"p50_ms":lag_pct(.50),"p95_ms":lag_pct(.95),
                     "p99_ms":lag_pct(.99),"max_ms":max(lag) if lag else None}})
     return out
 
 @app.get("/api/status")
 def api_status():
-    rows,label=daily_rows(); sim=paper_status(); now=now_ms()
+    now=now_ms()
+    with dashboard_cache_lock:
+        cached=dict(dashboard_cache.get("data") or {})
+    _,_,fallback_day=local_day_bounds_ms(0)
+    rows=cached.get("rows",[]); label=cached.get("day",fallback_day); sim=cached.get("sim",{})
     with state_lock:
         age=now-state["last_ws_ms"] if state["last_ws_ms"] else None
         base={"version":VERSION,"symbols":len(state["symbols"]),"routes":len(state["routes"]),"ws":state["ws_connected"],
@@ -2195,10 +2327,10 @@ def api_status():
     base.update({"day":label,"rows":rows[:100],"sim":sim,"fee_pct":FEE*100,"stables":STABLES,"min_exec_usd":MIN_EXEC_USD,
                  "max_exec_usd":MAX_EXEC_USD,"min_net_pct":MIN_NET*100,"primary_age_ms":PRIMARY_BBO_AGE_MS,"primary_latency_ms":PRIMARY_EXEC_LATENCY_MS,
                  "research_ages":RESEARCH_BBO_AGES_MS,"research_latencies":RESEARCH_LATENCIES_MS,
-                 "matrix":execution_matrix(),"raw_primary":raw_primary_status(),"rebalance_cover_mult":REBALANCE_COVER_MULT,"v22":v22_stats(),
+                 "matrix":cached.get("matrix",[]),"raw_primary":cached.get("raw_primary",{}),"rebalance_cover_mult":REBALANCE_COVER_MULT,"v22":cached.get("v22",{}),
                  "trace_window_ms":TRACE_WINDOW_MS,"decision_max_recv_age_ms":DECISION_MAX_RECV_AGE_MS,"decision_max_skew_ms":DECISION_MAX_SKEW_MS,"primary_max_skew_ms":PRIMARY_MAX_SKEW_MS,"paper_rearm_neutral_ms":PAPER_REARM_NEUTRAL_MS,"paper_hard_cooldown_ms":PAPER_HARD_COOLDOWN_MS,
-                 "recent_decisions":recent_v22_decisions(),"shadows":shadow_status(),"quality":v235_quality_stats(),
-                 "admissions":v236_admission_stats(),"health":runtime_health(now),
+                 "recent_decisions":cached.get("recent_decisions",[]),"shadows":cached.get("shadows",{}),"quality":cached.get("quality",{}),
+                 "admissions":cached.get("admissions",{}),"shadow_skips":cached.get("shadow_skips",{}),"health":runtime_health(now),
                  "shadow_profiles":{k:{"leg1_ms":v[0],"leg2_ms":v[1]} for k,v in SHADOW_PROFILES.items()},
                  "v235_policy":{"edge_min_pct":SHADOW_MIN_EDGE*100,"target_weights":SHADOW_TARGET_WEIGHTS,
                     "rebalance_check_min":SHADOW_REBALANCE_CHECK_SEC/60,"rebalance_max_h":SHADOW_REBALANCE_MAX_SEC/3600,
@@ -2206,13 +2338,15 @@ def api_status():
                     "depth_capture_offsets_ms":DEPTH_CAPTURE_OFFSETS_MS,"depth_capture_levels":DEPTH_CAPTURE_LEVELS,
                     "a_fraction_pct":DEPTH_QUALITY_A_FRACTION*100,"b_fraction_pct":DEPTH_QUALITY_B_FRACTION*100,
                     "bplus_half_edge_pct":DEPTH_QUALITY_BPLUS_HALF_EDGE*100,"bplus_drop_floor_pct":DEPTH_QUALITY_BPLUS_DROP_FLOOR*100,
-                    "coverage3_min":DEPTH_QUALITY_COVERAGE3_MIN,"absolute_cap_usd":0},
-                 "v235_capture":v234_capture_stats()})
+                    "coverage3_min":DEPTH_QUALITY_COVERAGE3_MIN,"absolute_cap_usd":0,
+                    "replay_min_edge_pct":REPLAY_MIN_EDGE*100,"online_research_trials":ENABLE_ONLINE_RESEARCH_TRIALS,
+                    "event_neutral_close_ms":EVENT_NEUTRAL_CLOSE_MS},
+                 "v235_capture":cached.get("v235_capture",{})})
     return jsonify(base)
 
-HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MEXC 2-Leg V2.3.8</title>
+HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MEXC 2-Leg V2.3.9</title>
 <style>body{background:#090d14;color:#e8edf5;font-family:system-ui;margin:0;padding:16px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.c,.panel{background:#111827;border:1px solid #273248;border-radius:10px;padding:12px}.v{font-weight:800;font-size:20px}.big{font-size:28px}.muted{color:#9aa7bd;font-size:12px}.good{color:#22d38a}.bad{color:#ff6677}.panel{margin-top:12px;overflow:auto}.latency{display:grid;grid-template-columns:repeat(3,minmax(250px,1fr));gap:10px}.latbox{background:#0c1421;border:1px solid #2a3850;border-radius:10px;padding:12px}.balance{margin-top:8px;line-height:1.7}.metricgrid{display:grid;grid-template-columns:repeat(2,minmax(95px,1fr));gap:7px;margin-top:10px}.metric{background:#111b2b;border-radius:8px;padding:8px}.tag{display:inline-block;border:1px solid #334155;border-radius:999px;padding:3px 7px;font-size:11px;color:#bac6d8}table{border-collapse:collapse;width:100%;font-size:12px}th,td{padding:8px;border-bottom:1px solid #263044;text-align:right}th:first-child,td:first-child{text-align:left}@media(max-width:900px){.latency{grid-template-columns:1fr}}</style></head><body>
-<h2>MEXC — Scanner Spot 2-leg V2.3.8 · univers complet</h2><div class=cards id=cards></div>
+<h2>MEXC — Scanner Spot 2-leg V2.3.9 · univers complet</h2><div class=cards id=cards></div>
 <div class=panel id=health></div>
 <div class=panel id=latencies></div>
 <div class=panel id=policy></div>
@@ -2220,15 +2354,15 @@ HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" 
 <div class=panel><h3>Décisions récentes — Depth Quality à T0</h3><table><thead><tr><th>Heure</th><th>Route</th><th>Edge T0</th><th>Classe</th><th>Taille retenue</th><th>Edge −50% BBO</th><th>Edge sans L1</th><th>Réserve L1–L3</th><th>Calcul</th></tr></thead><tbody id=recent></tbody></table></div>
 <div class=panel id=capture></div><div class=panel id=diag></div>
 <script>
-async function refresh(){let d=await fetch('/api/status').then(r=>r.json()),g=d.diag,p=d.v235_policy||{},cap=d.v235_capture||{},ql=d.quality||{},ad=d.admissions||{},he=d.health||{};
-document.getElementById('cards').innerHTML=`<div class=c><div class=v>${d.symbols}</div><div class=muted>marchés WS</div></div><div class=c><div class=v>${d.routes}</div><div class=muted>routes 2-leg</div></div><div class=c><div class=v>${d.ws}/${d.ws_expected}</div><div class=muted>WebSockets</div></div><div class=c><div class=v>${d.age_ms??'-'} ms</div><div class=muted>dernier BBO reçu</div></div><div class=c><div class=v>${d.depth_ready||0}/${d.symbols}</div><div class=muted>carnets Depth prêts</div></div><div class=c><div class=v>${d.v22?.decisions||0}</div><div class=muted>décisions brutes tracées</div></div><div class=c><div class=v>${d.v22?.trace_points||0}</div><div class=muted>points trajectoire</div></div>`;
-let wsok=(he.ws_connected===he.ws_expected)&&(he.stale_workers||0)===0&&(he.workers_without_pong||0)===0;document.getElementById('health').innerHTML=`<div class=tag>SANTÉ TEMPS RÉEL</div><h3 class='${wsok?'good':'bad'}'>WebSockets ${he.ws_connected||0}/${he.ws_expected||0} · ${he.stale_workers||0} silencieux &gt;30 s</h3><div class=cards><div><div class=v>${he.ws_disconnects||0}</div><div class=muted>chutes WS</div></div><div><div class=v>${he.ws_reconnects||0}</div><div class=muted>reconnexions WS</div></div><div><div class=v>${he.ws_app_pings||0} / ${he.ws_app_pongs||0}</div><div class=muted>PING / PONG MEXC</div></div><div><div class=v>${he.max_pong_age_ms==null?'-':he.max_pong_age_ms+' ms'}</div><div class=muted>âge maximal PONG</div></div><div><div class=v>${he.workers_without_pong||0} / ${he.ws_ping_errors||0}</div><div class=muted>sockets sans PONG / erreurs ping</div></div><div><div class=v>${he.max_worker_message_age_ms==null?'-':he.max_worker_message_age_ms+' ms'}</div><div class=muted>âge max dernier Depth/socket</div></div><div><div class=v>${he.depth_gap_events||0}</div><div class=muted>gaps Depth hors bootstrap</div></div><div><div class=v>${he.depth_resync_failures||0}</div><div class=muted>échecs resync</div></div><div><div class=v>${he.resync_queue||0}/${he.resync_pending||0}</div><div class=muted>file/pending resync</div></div><div><div class=v>${he.scan_queue||0}/${he.scan_queue_capacity||0}</div><div class=muted>file scan</div></div><div><div class=v>${he.scan_queue_drops||0}</div><div class=muted>abandons file scan</div></div><div><div class=v>${he.scan_coalesced||0}</div><div class=muted>updates fusionnées</div></div><div><div class=v>${he.db_queue||0}/${he.db_queue_capacity||0}</div><div class=muted>file DB</div></div><div><div class=v>${he.db_queue_drops||0}</div><div class=muted>abandons DB</div></div><div><div class=v>${he.research_pending||0} / ${he.depth_capture_pending||0}</div><div class=muted>pending replay / captures</div></div><div><div class='v ${(he.shadow_overdue||0)===0?'good':'bad'}'>${he.shadow_pending||0} / ${he.shadow_overdue||0}</div><div class=muted>pending Shadow / en retard</div></div><div><div class=v>${he.shadow_execution_lag?.p95_ms==null?'-':he.shadow_execution_lag.p95_ms+' ms'}</div><div class=muted>retard worker Shadow p95</div></div></div>`;
+async function refresh(){let d=await fetch('/api/status').then(r=>r.json()),g=d.diag,p=d.v235_policy||{},cap=d.v235_capture||{},ql=d.quality||{},ad=d.admissions||{},sk=d.shadow_skips||{},he=d.health||{};
+document.getElementById('cards').innerHTML=`<div class=c><div class=v>${d.symbols}</div><div class=muted>marchés WS</div></div><div class=c><div class=v>${d.routes}</div><div class=muted>routes 2-leg</div></div><div class=c><div class=v>${d.ws}/${d.ws_expected}</div><div class=muted>WebSockets</div></div><div class=c><div class=v>${d.age_ms??'-'} ms</div><div class=muted>dernier BBO reçu</div></div><div class=c><div class=v>${d.depth_ready||0}/${d.symbols}</div><div class=muted>carnets Depth prêts</div></div><div class=c><div class=v>${d.v22?.decisions||0}</div><div class=muted>décisions replay ≥0,10%</div></div><div class=c><div class=v>${d.v22?.trace_points||0}</div><div class=muted>points trajectoire</div></div>`;
+let wsok=(he.ws_connected===he.ws_expected)&&(he.stale_workers||0)===0&&(he.workers_without_pong||0)===0&&(d.depth_ready===d.symbols)&&(he.resync_pending||0)===0;document.getElementById('health').innerHTML=`<div class=tag>SANTÉ TEMPS RÉEL</div><h3 class='${wsok?'good':'bad'}'>WebSockets ${he.ws_connected||0}/${he.ws_expected||0} · ${he.stale_workers||0} silencieux &gt;30 s</h3><div class=cards><div><div class=v>${he.ws_disconnects||0}</div><div class=muted>chutes WS</div></div><div><div class=v>${he.ws_reconnects||0}</div><div class=muted>reconnexions WS</div></div><div><div class=v>${he.ws_app_pings||0} / ${he.ws_app_pongs||0}</div><div class=muted>PING / PONG MEXC</div></div><div><div class=v>${he.max_pong_age_ms==null?'-':he.max_pong_age_ms+' ms'}</div><div class=muted>âge maximal PONG</div></div><div><div class=v>${he.workers_without_pong||0} / ${he.ws_ping_errors||0}</div><div class=muted>PONG en retard / erreurs ping</div></div><div><div class=v>${he.max_worker_message_age_ms==null?'-':he.max_worker_message_age_ms+' ms'}</div><div class=muted>silence maximal worker WS</div></div><div><div class=v>${he.depth_book_age_p95_ms==null?'-':he.depth_book_age_p95_ms+' ms'}</div><div class=muted>âge Depth p95</div></div><div><div class=v>${he.depth_book_age_max_ms==null?'-':he.depth_book_age_max_ms+' ms'}</div><div class=muted>âge Depth maximum prêt</div></div><div><div class=v>${he.depth_gap_events||0}</div><div class=muted>gaps Depth hors bootstrap</div></div><div><div class=v>${he.depth_resync_failures||0}</div><div class=muted>échecs resync</div></div><div><div class=v>${he.resync_queue||0}/${he.resync_pending||0}</div><div class=muted>file/pending resync</div></div><div><div class=v>${he.scan_queue||0}/${he.scan_queue_capacity||0}</div><div class=muted>file scan</div></div><div><div class=v>${he.scan_queue_drops||0}</div><div class=muted>abandons file scan</div></div><div><div class=v>${he.scan_coalesced||0}</div><div class=muted>updates fusionnées</div></div><div><div class=v>${he.db_queue||0}/${he.db_queue_capacity||0}</div><div class=muted>file DB</div></div><div><div class=v>${he.db_queue_drops||0}</div><div class=muted>abandons DB</div></div><div><div class=v>${((he.db_size_bytes||0)/1048576).toFixed(0)} / ${((he.db_wal_size_bytes||0)/1048576).toFixed(0)} MB</div><div class=muted>base / WAL</div></div><div><div class=v>${he.research_pending||0} / ${he.depth_capture_pending||0}</div><div class=muted>matrice live / captures pending</div></div><div><div class='v ${(he.shadow_overdue||0)===0?'good':'bad'}'>${he.shadow_pending||0} / ${he.shadow_overdue||0}</div><div class=muted>pending Shadow / en retard</div></div><div><div class=v>${he.shadow_execution_lag?.p95_ms==null?'-':he.shadow_execution_lag.p95_ms+' ms'}</div><div class=muted>retard worker Shadow p95</div></div><div><div class=v>${he.dashboard_cache_age_ms==null?'-':Math.round(he.dashboard_cache_age_ms/1000)+' s'}</div><div class=muted>âge statistiques page</div></div><div><div class=v>${he.dashboard_refresh_ms==null?'-':he.dashboard_refresh_ms+' ms'}</div><div class=muted>durée calcul statistiques</div></div></div>`;
 let sh=d.shadows||{},first=sh.FAST||{},h=`<div class=tag>LATENCE D'EXÉCUTION</div><h3>FAST / TARGET / DEGRADED — ${(first.capital||0).toFixed(0)} $ indépendants chacun</h3><div class=latency>`;
-for(let n of ['FAST','TARGET','DEGRADED']){let x=sh[n];if(!x)continue;let bal=Object.entries(x.balances||{}).map(([a,v])=>`${a} <b>${v.toFixed(2)}</b>`).join(' · ');h+=`<div class=latbox><div class=muted>${n} · Leg1 +${x.leg1_ms} ms · Leg2 +${x.leg2_ms} ms</div><div class='v big ${x.profit>=0?'good':'bad'}'>${x.profit>=0?'+':''}${x.profit.toFixed(2)} $</div><div class=muted>NAV ${x.nav.toFixed(2)} $</div><div class=metricgrid><div class=metric><div class=v>${x.trades}</div><div class=muted>trades</div></div><div class=metric><div class=v>${x.wins} / ${x.losses}</div><div class=muted>gagnés / perdus</div></div><div class=metric><div class=v>${x.avg_edge==null?'-':(100*x.avg_edge).toFixed(3)+'%'}</div><div class=muted>edge T0 moyen</div></div><div class=metric><div class=v>${x.rebalances}</div><div class=muted>rebalances</div></div></div><div class='balance muted'>Balance : ${bal}<br>Coût rebalance ${x.rebalance_cost.toFixed(3)} $ · refus balance ${x.skipped_balance} · expositions ${x.open_exposures}</div></div>`}h+=`</div><div class=muted style='margin-top:10px'>Même signal et mêmes carnets MEXC réels. Seuls les délais virtuels diffèrent. Aucun ordre réel n'est envoyé.</div>`;document.getElementById('latencies').innerHTML=h;
-let tw=Object.entries(p.target_weights||{}).map(([a,v])=>`${a} ${(100*v).toFixed(0)}%`).join(' · ');document.getElementById('policy').innerHTML=`<div class=tag>POLITIQUE V2.3.8</div><h3>Depth Quality adaptatif — aucun cap absolu</h3><div class=cards><div><div class=v>${(p.edge_min_pct??0).toFixed(2)}%</div><div class=muted>edge initial minimum</div></div><div><div class=v>A · ${(p.a_fraction_pct??0).toFixed(0)}%</div><div class=muted>capacité si suppression L1 ≥ edge min</div></div><div><div class=v>B+ · ${(p.b_fraction_pct??0).toFixed(0)}%</div><div class=muted>capacité si −50% BBO ≥ ${(p.bplus_half_edge_pct??0).toFixed(2)}%</div></div><div><div class=v>×${(p.coverage3_min??0).toFixed(0)}</div><div class=muted>réserve minimum niveaux 1–3</div></div><div><div class=v>${tw}</div><div class=muted>allocation cible</div></div><div><div class=v>${p.rebalance_check_min??'-'} min / ${p.rebalance_max_h??'-'} h</div><div class=muted>contrôle / rebalance maximum</div></div></div><div class=muted style='margin-top:10px'>A : 50% de la capacité robuste. B+ : 33%, edge après −50% BBO ≥0,75%, edge sans niveau 1 ≥−2%, réserve L1–L3 ≥×3. B−, C et D sont enregistrés mais refusés. Taille finale limitée uniquement par le solde disponible.</div>`;
-let qa=0,qb=0,qsmall=0,qbm=0,qcd=0;for(let r of (ql.rows||[])){if(r.grade==='A'&&r.eligible===1)qa+=r.n;if(r.grade==='B+'&&r.eligible===1)qb+=r.n;if((r.grade==='A'||r.grade==='B+')&&r.reason==='below_min_trade')qsmall+=r.n;if(r.grade==='B-')qbm+=r.n;if(r.grade==='C'||r.grade==='D')qcd+=r.n}let ac={},aprofiles=0;for(let r of (ad.rows||[])){ac[r.disposition]=(ac[r.disposition]||0)+r.n;aprofiles+=r.profiles_reserved||0}let aexec=(ac.executed_all_profiles||0)+(ac.executed_partial_profiles||0),finished=['FAST','TARGET','DEGRADED'].reduce((n,k)=>n+((sh[k]||{}).trades||0),0),ablock=(ac.blocked_same_event||0)+(ac.blocked_not_rearmed||0)+(ac.blocked_cooldown||0),perf=ql.compute||{},cf=ql.coverage_counterfactual||{};document.getElementById('quality').innerHTML=`<div class=tag>QUALITÉ DEPTH AUJOURD'HUI</div><h3>A / B+ admis — entonnoir d'exécution explicite</h3><div class=cards><div><div class=v good>${qa}</div><div class=muted>A admissibles</div></div><div><div class=v good>${qb}</div><div class=muted>B+ admissibles</div></div><div><div class=v>${qsmall}</div><div class=muted>A/B+ sous 10 $</div></div><div><div class=v good>${aexec}</div><div class=muted>signaux réservés</div></div><div><div class=v>${aprofiles}</div><div class=muted>exécutions profil réservées</div></div><div><div class=v>${finished}</div><div class=muted>exécutions profil terminées</div></div><div><div class='v ${(he.shadow_overdue||0)===0?'good':'bad'}'>${he.shadow_pending||0} / ${he.shadow_overdue||0}</div><div class=muted>Shadow pending / en retard</div></div><div><div class=v>${ablock}</div><div class=muted>bloqués event/réarmement/cooldown</div></div><div><div class=v>${ac.blocked_no_profile_balance||0}</div><div class=muted>bloqués balance</div></div><div><div class=v>${qbm}</div><div class=muted>B− refusés</div></div><div><div class=v>${qcd}</div><div class=muted>C / D refusés</div></div><div><div class=v>${cf.x1??0} / ${cf.x3??0}</div><div class=muted>B+ potentiels si couverture ×1 / ×3</div></div><div><div class=v>${ql.max_selected_usd==null?'-':ql.max_selected_usd.toFixed(2)+' $'}</div><div class=muted>taille Depth max admise</div></div><div><div class=v>${perf.p95_us==null?'-':perf.p95_us.toFixed(1)+' µs'}</div><div class=muted>temps calcul qualité p95</div></div></div>`;
+for(let n of ['FAST','TARGET','DEGRADED']){let x=sh[n];if(!x)continue;let bal=Object.entries(x.balances||{}).map(([a,v])=>`${a} <b>${v.toFixed(2)}</b>`).join(' · ');h+=`<div class=latbox><div class=muted>${n} · Leg1 +${x.leg1_ms} ms · Leg2 +${x.leg2_ms} ms</div><div class='v big ${x.profit>=0?'good':'bad'}'>${x.profit>=0?'+':''}${x.profit.toFixed(2)} $</div><div class=muted>NAV ${x.nav.toFixed(2)} $</div><div class=metricgrid><div class=metric><div class=v>${x.trades}</div><div class=muted>trades</div></div><div class=metric><div class=v>${x.wins} / ${x.losses}</div><div class=muted>gagnés / perdus</div></div><div class=metric><div class=v>${x.avg_edge==null?'-':(100*x.avg_edge).toFixed(3)+'%'}</div><div class=muted>edge T0 moyen</div></div><div class=metric><div class=v>${x.rebalances}</div><div class=muted>rebalances</div></div></div><div class='balance muted'>Balance : ${bal}<br>Coût rebalance ${x.rebalance_cost.toFixed(3)} $ · refus balance ${x.skipped_balance} · jambe 1 annulée ${x.skipped_flash} · expositions ${x.open_exposures}</div></div>`}h+=`</div><div class=muted style='margin-top:10px'>Même signal et mêmes carnets MEXC réels. Seuls les délais virtuels diffèrent. Aucun ordre réel n'est envoyé.</div>`;document.getElementById('latencies').innerHTML=h;
+let tw=Object.entries(p.target_weights||{}).map(([a,v])=>`${a} ${(100*v).toFixed(0)}%`).join(' · ');document.getElementById('policy').innerHTML=`<div class=tag>POLITIQUE V2.3.9</div><h3>Depth Quality adaptatif — aucun cap absolu</h3><div class=cards><div><div class=v>${(p.edge_min_pct??0).toFixed(2)}%</div><div class=muted>edge initial minimum</div></div><div><div class=v>A · ${(p.a_fraction_pct??0).toFixed(0)}%</div><div class=muted>capacité si suppression L1 ≥ edge min</div></div><div><div class=v>B+ · ${(p.b_fraction_pct??0).toFixed(0)}%</div><div class=muted>capacité si −50% BBO ≥ ${(p.bplus_half_edge_pct??0).toFixed(2)}%</div></div><div><div class=v>×${(p.coverage3_min??0).toFixed(0)}</div><div class=muted>réserve minimum niveaux 1–3</div></div><div><div class=v>${tw}</div><div class=muted>allocation cible</div></div><div><div class=v>${p.rebalance_check_min??'-'} min / ${p.rebalance_max_h??'-'} h</div><div class=muted>contrôle / rebalance maximum</div></div><div><div class=v>${(p.replay_min_edge_pct??0).toFixed(2)}%</div><div class=muted>plancher dataset replay</div></div><div><div class=v>${p.online_research_trials?'ON':'OFF'}</div><div class=muted>matrice 66 essais en ligne</div></div></div><div class=muted style='margin-top:10px'>A : 50% de la capacité robuste. B+ : 33%, edge après −50% BBO ≥0,75%, edge sans niveau 1 ≥−2%, réserve L1–L3 ≥×3. B−, C et D sont enregistrés mais refusés. Taille finale limitée uniquement par le solde disponible.</div>`;
+let qa=0,qb=0,qsmall=0,qbm=0,qcd=0;for(let r of (ql.rows||[])){if(r.grade==='A'&&r.eligible===1)qa+=r.n;if(r.grade==='B+'&&r.eligible===1)qb+=r.n;if((r.grade==='A'||r.grade==='B+')&&r.reason==='below_min_trade')qsmall+=r.n;if(r.grade==='B-')qbm+=r.n;if(r.grade==='C'||r.grade==='D')qcd+=r.n}let ac={},aprofiles=0;for(let r of (ad.rows||[])){ac[r.disposition]=(ac[r.disposition]||0)+r.n;aprofiles+=r.profiles_reserved||0}let sr={};for(let r of (sk.rows||[]))sr[r.reason]=(sr[r.reason]||0)+r.n;let aexec=(ac.executed_all_profiles||0)+(ac.executed_partial_profiles||0),finished=['FAST','TARGET','DEGRADED'].reduce((n,k)=>n+((sh[k]||{}).trades||0),0),ablock=(ac.blocked_same_event||0)+(ac.blocked_not_rearmed||0)+(ac.blocked_cooldown||0),perf=ql.compute||{},cf=ql.coverage_counterfactual||{};document.getElementById('quality').innerHTML=`<div class=tag>QUALITÉ DEPTH AUJOURD'HUI</div><h3>A / B+ admis — entonnoir d'exécution explicite</h3><div class=cards><div><div class=v good>${qa}</div><div class=muted>A admissibles</div></div><div><div class=v good>${qb}</div><div class=muted>B+ admissibles</div></div><div><div class=v>${qsmall}</div><div class=muted>A/B+ sous 10 $</div></div><div><div class=v good>${aexec}</div><div class=muted>signaux réservés</div></div><div><div class=v>${aprofiles}</div><div class=muted>exécutions profil réservées</div></div><div><div class=v>${finished}</div><div class=muted>exécutions profil terminées</div></div><div><div class='v ${(he.shadow_overdue||0)===0?'good':'bad'}'>${he.shadow_pending||0} / ${he.shadow_overdue||0}</div><div class=muted>Shadow pending / en retard</div></div><div><div class=v>${sr.depth_stale||0} / ${sr.depth_not_ready||0}</div><div class=muted>annulées Depth ancien / absent</div></div><div><div class=v>${sr.no_liquidity||0} / ${sr.below_min_fill||0}</div><div class=muted>annulées sans liquidité / sous 10 $</div></div><div><div class=v>${ablock}</div><div class=muted>bloqués event/réarmement/cooldown</div></div><div><div class=v>${ac.blocked_no_profile_balance||0}</div><div class=muted>bloqués balance</div></div><div><div class=v>${qbm}</div><div class=muted>B− refusés</div></div><div><div class=v>${qcd}</div><div class=muted>C / D refusés</div></div><div><div class=v>${cf.x1??0} / ${cf.x3??0}</div><div class=muted>B+ potentiels si couverture ×1 / ×3</div></div><div><div class=v>${ql.max_selected_usd==null?'-':ql.max_selected_usd.toFixed(2)+' $'}</div><div class=muted>taille Depth max admise</div></div><div><div class=v>${perf.p95_us==null?'-':perf.p95_us.toFixed(1)+' µs'}</div><div class=muted>temps calcul qualité p95</div></div></div>`;
 let fp=v=>v==null?'-':(100*v).toFixed(3)+'%',fn=v=>v==null?'-':Number(v).toFixed(2);let rh='';for(let q of (d.recent_decisions||[])){let t=new Date(q.ts_ms),ok=q.eligible===1;rh+=`<tr><td>${t.toLocaleTimeString()}</td><td>${q.route_id}</td><td>${fp(q.decision_net)}</td><td class='${ok?'good':'muted'}'>${q.grade||q.reason||'-'}</td><td>${q.selected_usd==null?'-':q.selected_usd.toFixed(2)+' $'}</td><td>${fp(q.half_bbo_edge)}</td><td>${fp(q.drop_l1_edge)}</td><td>${q.coverage3==null?'-':'×'+fn(q.coverage3)}</td><td>${q.compute_us==null?'-':fn(q.compute_us)+' µs'}</td></tr>`}document.getElementById('recent').innerHTML=rh;
-document.getElementById('capture').innerHTML=`<div class=tag>DATASET REPLAY V2.3.8</div><h3>Collecte jusqu'à T0 + 5 secondes</h3><div class=cards><div><div class=v>${cap.depth_decisions||0}</div><div class=muted>décisions avec Depth</div></div><div><div class=v>${cap.depth_samples||0}</div><div class=muted>snapshots multi-level</div></div><div><div class=v>${cap.exec_details||0}</div><div class=muted>exécutions VWAP détaillées</div></div><div><div class=v>${cap.stable_depth_samples||0}</div><div class=muted>snapshots Depth stablecoins</div></div></div><div class=muted style='margin-top:10px'>Une capture au début de l'événement, puis une seconde uniquement au premier franchissement de 0,35%. Offsets Depth : ${(p.depth_capture_offsets_ms||[]).join(', ')} ms · top ${(p.depth_capture_levels||'-')} niveaux par côté. Les trois latences, tailles, stress BBO, rebalances, partial fills et expositions restent rejouables.</div>`;
+document.getElementById('capture').innerHTML=`<div class=tag>DATASET REPLAY V2.3.9</div><h3>Collecte jusqu'à T0 + 5 secondes</h3><div class=cards><div><div class=v>${cap.depth_decisions||0}</div><div class=muted>décisions avec Depth</div></div><div><div class=v>${cap.depth_samples||0}</div><div class=muted>snapshots multi-level</div></div><div><div class=v>${cap.exec_details||0}</div><div class=muted>exécutions VWAP détaillées</div></div><div><div class=v>${cap.stable_depth_samples||0}</div><div class=muted>snapshots Depth stablecoins</div></div></div><div class=muted style='margin-top:10px'>Une capture au premier franchissement de 0,10%, puis une seconde uniquement si le même événement franchit 0,35%. Les 66 variantes ne sont plus écrites en direct : elles seront recalculées hors ligne depuis ces carnets. Offsets Depth : ${(p.depth_capture_offsets_ms||[]).join(', ')} ms · top ${(p.depth_capture_levels||'-')} niveaux par côté.</div>`;
 document.getElementById('diag').innerHTML=`<h3>Univers</h3><div class=cards><div><div class=v>${g.all_markets}</div><div class=muted>marchés découverts</div></div><div><div class=v>${g.candidate_2leg}</div><div class=muted>2-leg candidates</div></div><div><div class='v ${g.selected_2leg===g.candidate_2leg?'good':'bad'}'>${g.selected_2leg}</div><div class=muted>2-leg suivies</div></div><div><div class=v>${g.dropped_2leg||0}</div><div class=muted>2-leg exclues</div></div><div><div class=v>${g.candidate_3leg}</div><div class=muted>3-leg détectées mais ignorées</div></div><div><div class=v>${g.ws_group_size||'-'}</div><div class=muted>symboles maximum par WebSocket</div></div><div><div class=v>${g.ws_grouping_mode||'-'}</div><div class=muted>répartition des flux</div></div><div><div class=v>${g.mexc_app_ping_sec||'-'} s</div><div class=muted>PING applicatif MEXC</div></div></div>`}
 refresh();setInterval(refresh,3000)
 </script></body></html>
@@ -2240,8 +2374,8 @@ def index(): return render_template_string(HTML)
 
 def bootstrap():
     threading.Thread(target=db_writer,daemon=True).start()
-    # Give DB schema thread a moment before state restore.
-    time.sleep(.15); load_paper_state(); load_shadow_state()
+    if not db_ready.wait(10): raise RuntimeError("SQLite schema initialization timeout")
+    load_paper_state(); load_shadow_state()
     boot_ts=now_ms()
     for _p in SHADOW_PROFILES:
         shadow_last_rebalance_ms[_p]=boot_ts; shadow_last_rebalance_check_ms[_p]=boot_ts
@@ -2261,13 +2395,17 @@ def bootstrap():
     print(f"[Routes V{VERSION}] source={state['market_source']} markets={diag['all_markets']} candidates={diag['candidate_routes']} "
           f"(2L={diag['candidate_2leg']},3L={diag['candidate_3leg']}) selected_symbols={len(symbols)} selected_routes={len(routes)} "
           f"(2L={diag['selected_2leg']},3L={diag['selected_3leg']}) WS={len(groups)} group<={WS_GROUP_SIZE} "
-          f"grouping={grouping_mode} app_ping={MEXC_APP_PING_SEC:g}s")
+          f"grouping={grouping_mode} app_ping={MEXC_APP_PING_SEC:g}s replay>={REPLAY_MIN_EDGE*100:.2f}% "
+          f"online_matrix={'on' if ENABLE_ONLINE_RESEARCH_TRIALS else 'off'} db_batch={DB_COMMIT_BATCH}/{DB_COMMIT_MAX_MS}ms")
     put_db(("meta",("version",VERSION))); put_db(("meta",("paper_rearm_neutral_ms",str(PAPER_REARM_NEUTRAL_MS)))); put_db(("meta",("paper_hard_cooldown_ms",str(PAPER_HARD_COOLDOWN_MS)))); put_db(("meta",("paper_failed_leg_policy","reverse_leg1_then_persist_open_exposure_until_liquidated"))); put_db(("meta",("ws_depth_interval","10ms"))); put_db(("meta",("depth_snapshot_levels","100"))); put_db(("meta",("trace_window_ms",str(TRACE_WINDOW_MS)))); put_db(("meta",("market_source",state["market_source"])))
     put_db(("meta",("route_diag",json.dumps(diag,sort_keys=True))))
     put_db(("meta",("ws_grouping",grouping_mode)))
     put_db(("meta",("ws_keepalive",json.dumps({"method":"MEXC_JSON_PING","interval_sec":MEXC_APP_PING_SEC,"pong_timeout_sec":MEXC_APP_PONG_TIMEOUT_SEC},sort_keys=True))))
-    put_db(("meta",("decision_sampling","first_event_snapshot_then_first_0.35pct_crossing")))
+    put_db(("meta",("decision_sampling","first_0.10pct_replay_crossing_then_first_0.35pct_live_crossing")))
     put_db(("meta",("shadow_execution_worker","dedicated_priority_1ms")))
+    put_db(("meta",("online_research_trials",str(int(ENABLE_ONLINE_RESEARCH_TRIALS)))))
+    put_db(("meta",("event_hysteresis",json.dumps({"close_net":EVENT_CLOSE_NET,"neutral_ms":EVENT_NEUTRAL_CLOSE_MS,"gap_ms":EVENT_CLOSE_GAP_MS},sort_keys=True))))
+    put_db(("meta",("db_writer_batch",json.dumps({"max_items":DB_COMMIT_BATCH,"max_ms":DB_COMMIT_MAX_MS},sort_keys=True))))
     put_db(("meta",("shadow_profiles",json.dumps(SHADOW_PROFILES,sort_keys=True))))
     put_db(("meta",("v235_policy",json.dumps({"edge_min":SHADOW_MIN_EDGE,"target_weights":SHADOW_TARGET_WEIGHTS,
         "a_fraction":DEPTH_QUALITY_A_FRACTION,"b_fraction":DEPTH_QUALITY_B_FRACTION,"c_fraction":DEPTH_QUALITY_C_FRACTION,
@@ -2287,6 +2425,8 @@ def bootstrap():
     threading.Thread(target=stable_quote_worker,daemon=True).start()
     threading.Thread(target=stable_depth_capture_worker,daemon=True).start()
     threading.Thread(target=shadow_periodic_rebalance_worker,daemon=True).start()
+    refresh_dashboard_cache()
+    threading.Thread(target=dashboard_cache_worker,daemon=True).start()
     for i,g in enumerate(groups,1): threading.Thread(target=ws_worker,args=(g,i,group_loads[i-1]),daemon=True).start()
     time.sleep(1.0)
     threading.Thread(target=depth_resync_worker,daemon=True).start()
