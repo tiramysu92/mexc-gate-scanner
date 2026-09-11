@@ -6,10 +6,10 @@ from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, render_template_string
 import websocket
 
-VERSION = "2.3.5-depth-quality"
+VERSION = "2.3.6-all-2leg"
 HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", "8081"))
-DB_PATH = os.getenv("DB_PATH", "mexc_routes_v235.db")
+DB_PATH = os.getenv("DB_PATH", "mexc_routes_v236.db")
 MARKET_CACHE = os.getenv("MARKET_CACHE", "mexc_markets_cache.json")
 TZ_NAME = os.getenv("TZ_NAME", "Europe/Paris")
 TZ = ZoneInfo(TZ_NAME)
@@ -18,11 +18,13 @@ TZ = ZoneInfo(TZ_NAME)
 FEE = float(os.getenv("TAKER_FEE", "0.0005"))            # 0.05% taker / leg
 STABLES = tuple(x.strip().upper() for x in os.getenv("STABLES", "USDT,USDC,USD1").split(",") if x.strip())
 MIN_EXEC_USD = float(os.getenv("MIN_EXEC_USD", "10"))
-MAX_EXEC_USD = 0.0                                        # V2.3.5: no artificial trade cap
+MAX_EXEC_USD = 0.0                                        # V2.3.6: no artificial trade cap
 MIN_NET = float(os.getenv("MIN_NET_PCT", "0.01")) / 100.0
 MAX_BBO_AGE_MS = int(os.getenv("MAX_BBO_AGE_MS", "750"))
 EVENT_CLOSE_GAP_MS = int(os.getenv("EVENT_CLOSE_GAP_MS", "750"))
+FOLLOW_ALL_2LEG = os.getenv("FOLLOW_ALL_2LEG", "1") == "1"
 MAX_WS_SYMBOLS = int(os.getenv("MAX_WS_SYMBOLS", "600"))
+WS_GROUP_SIZE = max(1, min(30, int(os.getenv("WS_GROUP_SIZE", "20"))))
 MAX_ROUTES_PER_SYMBOL_SCAN = int(os.getenv("MAX_ROUTES_PER_SYMBOL_SCAN", "10000"))
 
 # Realistic paper-execution model
@@ -58,7 +60,7 @@ SHADOW_PROFILES = {
 }
 SHADOW_BBO_AGE_MS = int(os.getenv("SHADOW_BBO_AGE_MS", "150"))
 SHADOW_MAX_SKEW_MS = int(os.getenv("SHADOW_MAX_SKEW_MS", "50"))
-# V2.3.5 Depth Quality policy. The signal is classified once at T0 and the exact same
+# V2.3.6 Depth Quality policy. The signal is classified once at T0 and the exact same
 # selected size is then reserved independently by FAST / TARGET / DEGRADED.
 SHADOW_MIN_EDGE = float(os.getenv("SHADOW_MIN_EDGE_PCT", "0.35")) / 100.0
 DEPTH_QUALITY_A_FRACTION = float(os.getenv("DEPTH_QUALITY_A_FRACTION", "0.50"))
@@ -100,7 +102,10 @@ state = {
     "bbo": {}, "last_ws_ms": 0, "ws_connected": 0, "ws_expected": 0,
     "symbols": [], "routes": [], "routes_by_symbol": defaultdict(list), "market_meta": {},
     "errors": deque(maxlen=30), "started_ms": int(time.time()*1000), "market_source": "",
-    "scan_updates": 0, "latest_routes": {}, "route_diag": {},
+    "scan_updates": 0, "scan_coalesced": 0, "scan_queue_drops": 0, "db_queue_drops": 0,
+    "ws_disconnects": 0, "ws_reconnects": 0, "ws_workers": {},
+    "depth_gap_events": 0, "depth_resync_failures": 0, "depth_resync_recoveries": 0,
+    "latest_routes": {}, "route_diag": {},
     "depth": {}, "depth_ready": 0,
 }
 active_events = {}
@@ -304,6 +309,13 @@ def db_writer():
     );
     CREATE INDEX IF NOT EXISTS idx_quality_v235_ts ON decision_quality_v235(ts_ms,grade,eligible);
 
+    CREATE TABLE IF NOT EXISTS shadow_admissions_v236(
+      decision_id TEXT PRIMARY KEY, day TEXT NOT NULL, route_id TEXT NOT NULL,
+      event_start_ts_ms INTEGER NOT NULL, ts_ms INTEGER NOT NULL, grade TEXT NOT NULL,
+      selected_usd REAL NOT NULL, disposition TEXT NOT NULL, profiles_reserved INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_shadow_admission_v236_ts ON shadow_admissions_v236(day,ts_ms,disposition);
+
     CREATE TABLE IF NOT EXISTS decision_depth_samples_v234(
       id INTEGER PRIMARY KEY AUTOINCREMENT, decision_id TEXT NOT NULL, route_id TEXT NOT NULL, decision_ts_ms INTEGER NOT NULL,
       sample_ts_ms INTEGER NOT NULL, elapsed_ms INTEGER NOT NULL, leg INTEGER NOT NULL, symbol TEXT NOT NULL,
@@ -441,6 +453,8 @@ def db_writer():
                 con.execute("""INSERT OR REPLACE INTO decision_context_v234(decision_id,day,route_id,event_start_ts_ms,ts_ms,path,start_asset,end_asset,decision_net,decision_size_usd,start_mark,end_mark,leg1_last_ready_age_ms,leg2_last_ready_age_ms,shadow_policy_eligible,policy_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", payload)
             elif typ == "decision_quality_v235":
                 con.execute("""INSERT OR REPLACE INTO decision_quality_v235(decision_id,day,route_id,ts_ms,grade,eligible,reason,capacity_usd,size_fraction,selected_usd,normal_edge,half_bbo_edge,drop_l1_edge,coverage3,compute_us) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", payload)
+            elif typ == "shadow_admission_v236":
+                con.execute("""INSERT OR REPLACE INTO shadow_admissions_v236(decision_id,day,route_id,event_start_ts_ms,ts_ms,grade,selected_usd,disposition,profiles_reserved) VALUES(?,?,?,?,?,?,?,?,?)""", payload)
             elif typ == "depth_sample_v234":
                 con.execute("""INSERT INTO decision_depth_samples_v234(decision_id,route_id,decision_ts_ms,sample_ts_ms,elapsed_ms,leg,symbol,path_from,path_to,ready,version,book_ts_ms,send_ts_ms,recv_age_ms,last_ready_ts_ms,bids_json,asks_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", payload)
             elif typ == "shadow_exec_detail_v234":
@@ -478,7 +492,9 @@ def db_writer():
 
 def put_db(item):
     try: dbq.put_nowait(item)
-    except queue.Full: logerr("DB queue full")
+    except queue.Full:
+        with state_lock: state["db_queue_drops"]+=1
+        logerr("DB queue full")
 
 # ---------- MEXC market discovery ----------
 def save_market_cache(markets):
@@ -578,22 +594,29 @@ def select_routes_under_symbol_budget(markets):
     candidates,bysym,graph=build_all_candidate_routes(markets)
     r2=[r for r in candidates if r["type"]==2]
     r3=[r for r in candidates if r["type"]==3]
-    # V2.1 is deliberately 2-leg only. 3-leg candidates are counted for diagnostics
+    # This scanner is deliberately 2-leg only. 3-leg candidates are counted for diagnostics
     # but never subscribed/scanned; they will live in a separate scanner later.
-    selected=[]; symbols=set()
     direct_stable=[m["symbol"] for m in bysym.values() if m["base"] in STABLES and m["quote"] in STABLES]
-    symbols.update(direct_stable[:MAX_WS_SYMBOLS])
-    remaining=list(r2)
-    while remaining:
-        remaining.sort(key=lambda r:(len(set(r["symbols"])-symbols), r["id"]))
-        r=remaining.pop(0); new=set(r["symbols"])-symbols
-        if len(symbols)+len(new)>MAX_WS_SYMBOLS: continue
-        selected.append(r); symbols.update(r["symbols"])
-    chosen=[bysym[x] for x in symbols if x in bysym]
+    if FOLLOW_ALL_2LEG:
+        # V2.3.6: subscribe every symbol needed by every 2-leg route. Keep 3-leg
+        # routes diagnostic-only, as agreed, and keep conservative WS groups of 20.
+        selected=sorted(r2,key=lambda r:r["id"])
+        symbols=set(direct_stable)
+        for r in selected: symbols.update(r["symbols"])
+    else:
+        selected=[]; symbols=set(direct_stable[:MAX_WS_SYMBOLS])
+        remaining=list(r2)
+        while remaining:
+            remaining.sort(key=lambda r:(len(set(r["symbols"])-symbols), r["id"]))
+            r=remaining.pop(0); new=set(r["symbols"])-symbols
+            if len(symbols)+len(new)>MAX_WS_SYMBOLS: continue
+            selected.append(r); symbols.update(r["symbols"])
+    chosen=[bysym[x] for x in sorted(symbols) if x in bysym]
     diag={"all_markets":len(bysym),"candidate_routes":len(candidates),"candidate_2leg":len(r2),
           "candidate_3leg":len(r3),"selected_symbols":len(chosen),"selected_routes":len(selected),
-          "selected_2leg":len(selected),"selected_3leg":0,"dropped_routes":len(candidates)-len(selected),
-          "direct_stable_symbols":len(direct_stable),"mode":"2-leg only"}
+          "selected_2leg":len(selected),"selected_3leg":0,"dropped_2leg":len(r2)-len(selected),
+          "dropped_routes":len(candidates)-len(selected),"direct_stable_symbols":len(direct_stable),
+          "follow_all_2leg":FOLLOW_ALL_2LEG,"ws_group_size":WS_GROUP_SIZE,"mode":"2-leg only"}
     return chosen,selected,bysym,diag
 
 # ---------- protobuf BBO ----------
@@ -674,16 +697,20 @@ def _publish_depth_bbo(sym, send_ts):
 def queue_depth_resync(sym, reason="gap"):
     """Queue one serialized REST resync per symbol; never spawn resync threads from WS callbacks."""
     ts=now_ms()
+    new_gap=False
     with depth_resync_lock:
         d=depth_resync_diag[sym]
         d["last_reason"]=reason
         if d["not_ready_since"] is None:
             d["not_ready_since"]=ts; d["drops"]+=1
+            new_gap=reason!="bootstrap"
             put_db(("depth_sync",(ts,sym,"NOT_READY",reason,None,None)))
         if sym in depth_resync_pending:
             return False
         depth_resync_pending.add(sym)
         depth_resync_q.put(sym)
+    if new_gap:
+        with state_lock: state["depth_gap_events"]+=1
     return True
 
 
@@ -765,10 +792,14 @@ def depth_resync_worker():
                     with depth_resync_lock:
                         d=depth_resync_diag[sym]; since=d.get("not_ready_since")
                         dur=max(0,ts-since) if since is not None else None
+                        reason=d.get("last_reason","")
                         d["resync_ok"]+=1; d["not_ready_since"]=None; d["last_resync_ms"]=dur; d["last_ready_ts_ms"]=ts
-                    put_db(("depth_sync",(ts,sym,"READY",depth_resync_diag[sym].get("last_reason",""),dur,attempt)))
+                    put_db(("depth_sync",(ts,sym,"READY",reason,dur,attempt)))
+                    if reason!="bootstrap":
+                        with state_lock: state["depth_resync_recoveries"]+=1
                     break
                 with depth_resync_lock: depth_resync_diag[sym]["resync_fail"]+=1
+                with state_lock: state["depth_resync_failures"]+=1
                 put_db(("depth_sync",(now_ms(),sym,"RETRY",depth_resync_diag[sym].get("last_reason",""),None,attempt)))
                 # 0.5, 1, 2, 4, 8s; capped. One worker means no REST burst.
                 time.sleep(min(8.0,0.5*(2**min(attempt-1,4))))
@@ -938,7 +969,7 @@ def depth_quality_decision(route, event_x):
                 "reason":("eligible_B+" if b_usd>=SIM_MIN_TRADE_USD else "below_min_trade") if is_bplus else "rejected_B-"})
             return result
 
-        # C is logged for counterfactual replay but is never admitted by V2.3.5.
+        # C is logged for counterfactual replay but is never admitted by V2.3.6.
         c_usd=capacity*DEPTH_QUALITY_C_FRACTION
         c_normal=_quality_roundtrip(route,books,meta,c_usd,sm,em,"normal")
         result.update({"grade":"C" if c_normal and c_normal["edge"]>=SHADOW_MIN_EDGE else "D",
@@ -1163,7 +1194,7 @@ def reserve_paper_trade(route,event_x,event_start_ts,decision_id,decision_ts):
                     paper["balances"][s]+=conv["output"]
                     paper["rebalances"]+=1; paper["rebalance_cost"]+=conv["cost"]
                     # profit_bank is only a financing ledger; economic profit remains in balances/NAV and compounds.
-                    paper["profit_bank"]=max(0.0,paper["profit_bank"]-conv["cost"]*REBALANCE_COVER_MULT)
+                    paper["profit_bank"]-=conv["cost"]
                     put_db(("paper_rebalance",(paper["day"],decision_ts,donor,s,conv["input"],conv["output"],conv["input_usd"],
                         conv["output_usd"],conv["cost"],bank_before,expected)))
                     free=max(0.0,paper["balances"].get(s,0.0)-paper_reserved.get(s,0.0))
@@ -1344,7 +1375,10 @@ def reserve_shadow_trade(profile,route,event_x,event_start_ts,decision_id,decisi
         if shortage>0:
             rb=shadow_choose_rebalance(profile,s,shortage,event_x,books,meta)
             if rb:
-                donor,conv=rb; st["balances"][donor]-=conv["input"]; st["balances"][s]+=conv["output"]; st["rebalances"]+=1; st["rebalance_cost"]+=conv["cost"]; st["profit_bank"]=max(0.0,st["profit_bank"]-conv["cost"]*REBALANCE_COVER_MULT)
+                donor,conv=rb; st["balances"][donor]-=conv["input"]; st["balances"][s]+=conv["output"]; st["rebalances"]+=1; st["rebalance_cost"]+=conv["cost"]
+                # Preserve signed accounting: subtract the real cost only and
+                # never erase a loss by clamping the bank back to zero.
+                st["profit_bank"]-=conv["cost"]
                 free=max(0.0,st["balances"].get(s,0.0)-shadow_reserved[profile].get(s,0.0))
             else: st["skipped_rebalance"]+=1
         input_units=min(free,desired); input_usd=input_units*sm
@@ -1450,10 +1484,13 @@ def shadow_target_rebalance(profile, reason):
             if not fill or fill.get("input_used",0)<=0: break
             used=fill["input_used"]; out=fill["output"]
             in_usd=used*from_mark; out_usd=out*to_mark; cost=max(0.0,in_usd-out_usd)
+            budget=max(0.0,st["profit_bank"])*REBALANCE_MAX_PROFIT_SHARE
+            if cost>budget+1e-12:
+                st["skipped_rebalance"]+=1; persist_shadow(profile); break
             bbefore=json.dumps(st["balances"],sort_keys=True)
             st["balances"][from_asset]=max(0.0,st["balances"].get(from_asset,0.0)-used)
             st["balances"][to_asset]=st["balances"].get(to_asset,0.0)+out
-            st["rebalances"]+=1; st["rebalance_cost"]+=cost; st["profit_bank"]=max(0.0,st["profit_bank"]-cost)
+            st["rebalances"]+=1; st["rebalance_cost"]+=cost; st["profit_bank"]-=cost
             bafter=json.dumps(st["balances"],sort_keys=True)
             put_db(("shadow_rebalance_v234",(profile,st["day"],now_ms(),reason,from_asset,to_asset,used,out,in_usd,out_usd,cost,bbefore,bafter)))
             changed=True
@@ -1608,20 +1645,29 @@ def schedule_decision(route,x,ts,event_start_ts):
             with pending_lock: pending_paper_trials.append(q)
 
     # Shadow-live: same event, three independent portfolios and measured depth at profile latencies.
-    shadow_ok=(shadow_route_armed[rid] and ts-shadow_route_last_trade[rid]>=PAPER_HARD_COOLDOWN_MS)
-    if shadow_ok and event_key not in shadow_consumed_events and quality["eligible"]:
+    if quality["eligible"]:
+        disposition=None; reserved_profiles=0
+        if event_key in shadow_consumed_events: disposition="blocked_same_event"
+        elif not shadow_route_armed[rid]: disposition="blocked_not_rearmed"
+        elif ts-shadow_route_last_trade[rid]<PAPER_HARD_COOLDOWN_MS: disposition="blocked_cooldown"
+        else: disposition="candidate"
         shadow_x=dict(x)
         shadow_x.update({"size":quality["selected_usd"],"quality_grade":quality["grade"],
             "quality_fraction":quality["size_fraction"],"quality_normal_edge":quality.get("normal_edge"),
             "quality_half_bbo_edge":quality.get("half_bbo_edge"),"quality_drop_l1_edge":quality.get("drop_l1_edge"),
             "quality_coverage3":quality.get("coverage3"),"quality_compute_us":quality["compute_us"]})
         qs=[]
-        for profile in SHADOW_PROFILES:
-            sq=reserve_shadow_trade(profile,route,shadow_x,event_start_ts,did,ts)
-            if sq: qs.append(sq)
-        if qs:
-            shadow_consumed_events.add(event_key); shadow_route_armed[rid]=False; shadow_route_last_trade[rid]=ts; shadow_route_neutral_since.pop(rid,None)
-            with pending_lock: pending_shadow_trials.extend(qs)
+        if disposition=="candidate":
+            for profile in SHADOW_PROFILES:
+                sq=reserve_shadow_trade(profile,route,shadow_x,event_start_ts,did,ts)
+                if sq: qs.append(sq)
+            reserved_profiles=len(qs)
+            if qs:
+                disposition="executed_all_profiles" if len(qs)==len(SHADOW_PROFILES) else "executed_partial_profiles"
+                shadow_consumed_events.add(event_key); shadow_route_armed[rid]=False; shadow_route_last_trade[rid]=ts; shadow_route_neutral_since.pop(rid,None)
+                with pending_lock: pending_shadow_trials.extend(qs)
+            else: disposition="blocked_no_profile_balance"
+        put_db(("shadow_admission_v236",(did,day,route["id"],int(event_start_ts),ts,quality["grade"],quality["selected_usd"],disposition,reserved_profiles)))
 
 def execution_trial_worker():
     while True:
@@ -1777,11 +1823,14 @@ def stable_quote_worker():
 # ---------- Scan queue ----------
 def enqueue_scan(symbol):
     with queued_lock:
-        if symbol in queued_symbols: return
+        if symbol in queued_symbols:
+            with state_lock: state["scan_coalesced"]+=1
+            return
         queued_symbols.add(symbol)
     try: scanq.put_nowait(symbol)
     except queue.Full:
         with queued_lock: queued_symbols.discard(symbol)
+        with state_lock: state["scan_queue_drops"]+=1
 
 def scan_worker():
     while True:
@@ -1799,35 +1848,70 @@ def scan_worker():
 # ---------- WS ----------
 def ws_worker(symbols,worker_id):
     while True:
-        opened=False
+        opened=False; health_last_publish=0
         try:
             def on_open(ws):
                 nonlocal opened; opened=True
-                with state_lock: state["ws_connected"]+=1
+                ts=now_ms()
+                with state_lock:
+                    state["ws_connected"]+=1
+                    prev=state["ws_workers"].get(worker_id,{})
+                    opens=int(prev.get("opens",0))+1
+                    if opens>1: state["ws_reconnects"]+=1
+                    state["ws_workers"][worker_id]={"worker_id":worker_id,"symbols":len(symbols),"connected":True,
+                        "opens":opens,"disconnects":int(prev.get("disconnects",0)),"opened_ms":ts,
+                        "last_message_ms":None,"last_close_code":prev.get("last_close_code"),
+                        "last_error":prev.get("last_error")}
                 params=[f"spot@public.aggre.depth.v3.api.pb@10ms@{s}" for s in symbols]
                 ws.send(json.dumps({"method":"SUBSCRIPTION","params":params}))
                 print(f"[Routes V{VERSION}] WS {worker_id}: {len(symbols)} symbols")
             def on_message(ws,msg):
+                nonlocal health_last_publish
                 if isinstance(msg,str): return
                 try:
                     x=decode_depth(msg)
                     if not x: return
                     ts=now_ms()
+                    if ts-health_last_publish>=1000:
+                        health_last_publish=ts
+                        with state_lock:
+                            h=state["ws_workers"].get(worker_id)
+                            if h is not None: h["last_message_ms"]=ts
                     last_lat=ws_latency_last_sample.get(x["symbol"],0)
                     if ts-last_lat>=WS_LATENCY_SAMPLE_MS:
                         ws_latency_last_sample[x["symbol"]]=ts
                         put_db(("ws_lat_v22",(ts,x["symbol"],x["send"],ts,max(0,ts-x["send"]))))
                     apply_depth_update(x)
                 except Exception as e: logerr(f"decode WS {worker_id}: {e}")
-            def on_error(ws,e): logerr(f"WS {worker_id}: {e}")
+            def on_error(ws,e):
+                with state_lock:
+                    h=state["ws_workers"].get(worker_id)
+                    if h is not None: h["last_error"]=str(e)[:300]
+                logerr(f"WS {worker_id}: {e}")
             def on_close(ws,code,msg):
                 nonlocal opened
                 if opened:
-                    with state_lock: state["ws_connected"]=max(0,state["ws_connected"]-1)
+                    with state_lock:
+                        state["ws_connected"]=max(0,state["ws_connected"]-1); state["ws_disconnects"]+=1
+                        h=state["ws_workers"].get(worker_id)
+                        if h is not None:
+                            h["connected"]=False; h["disconnects"]=int(h.get("disconnects",0))+1
+                            h["closed_ms"]=now_ms(); h["last_close_code"]=code
                     opened=False
             w=websocket.WebSocketApp(WS,on_open=on_open,on_message=on_message,on_error=on_error,on_close=on_close)
             w.run_forever(ping_interval=20,ping_timeout=10)
         except Exception as e: logerr(f"WS loop {worker_id}: {e}")
+        finally:
+            # websocket-client normally invokes on_close. Keep the counters exact
+            # even if run_forever exits through an exception before that callback.
+            if opened:
+                with state_lock:
+                    state["ws_connected"]=max(0,state["ws_connected"]-1); state["ws_disconnects"]+=1
+                    h=state["ws_workers"].get(worker_id)
+                    if h is not None:
+                        h["connected"]=False; h["disconnects"]=int(h.get("disconnects",0))+1
+                        h["closed_ms"]=now_ms(); h["last_close_code"]="run_forever_exit"
+                opened=False
         time.sleep(2)
 
 # ---------- Dashboard ----------
@@ -1926,13 +2010,49 @@ def v235_quality_stats():
             AVG(coverage3) avg_coverage3,AVG(compute_us) avg_compute_us
             FROM decision_quality_v235 WHERE ts_ms>=? AND ts_ms<? GROUP BY grade,eligible,reason ORDER BY n DESC""",(start,end)).fetchall()
         accepted=con.execute("SELECT COUNT(*),AVG(selected_usd),MAX(selected_usd) FROM decision_quality_v235 WHERE ts_ms>=? AND ts_ms<? AND eligible=1",(start,end)).fetchone()
+        cf={}
+        for threshold in (1.0,2.0,3.0,4.0,5.0):
+            row=con.execute("""SELECT COUNT(*) FROM decision_quality_v235
+                WHERE ts_ms>=? AND ts_ms<? AND grade IN ('B+','B-')
+                  AND selected_usd>=? AND half_bbo_edge>=? AND drop_l1_edge>=? AND coverage3>=?""",
+                (start,end,SIM_MIN_TRADE_USD,DEPTH_QUALITY_BPLUS_HALF_EDGE,DEPTH_QUALITY_BPLUS_DROP_FLOOR,threshold)).fetchone()
+            cf[f"x{int(threshold)}"]=row[0] or 0
     finally: con.close()
     perf=sorted(depth_quality_compute_us)
     def pct(q):
         if not perf: return None
         return perf[min(len(perf)-1,int((len(perf)-1)*q))]
     return {"rows":[dict(r) for r in rows],"accepted":accepted[0] or 0,"avg_selected_usd":accepted[1],"max_selected_usd":accepted[2],
+            "coverage_counterfactual":cf,
             "compute":{"samples":len(perf),"p50_us":pct(.50),"p95_us":pct(.95),"p99_us":pct(.99),"max_us":max(perf) if perf else None}}
+
+def v236_admission_stats():
+    start,end,_=local_day_bounds_ms(0); con=db_connect()
+    try:
+        rows=con.execute("""SELECT grade,disposition,COUNT(*) n,SUM(profiles_reserved) profiles_reserved
+            FROM shadow_admissions_v236 WHERE ts_ms>=? AND ts_ms<?
+            GROUP BY grade,disposition ORDER BY n DESC""",(start,end)).fetchall()
+        return {"rows":[dict(r) for r in rows]}
+    finally: con.close()
+
+def runtime_health(now):
+    with state_lock:
+        workers=[dict(v) for _,v in sorted(state["ws_workers"].items())]
+        connected=state["ws_connected"]; expected=state["ws_expected"]
+        out={"ws_connected":connected,"ws_expected":expected,"ws_disconnects":state["ws_disconnects"],
+             "ws_reconnects":state["ws_reconnects"],"scan_coalesced":state["scan_coalesced"],
+             "scan_queue_drops":state["scan_queue_drops"],"db_queue_drops":state["db_queue_drops"],
+             "depth_gap_events":state["depth_gap_events"],"depth_resync_failures":state["depth_resync_failures"],
+             "depth_resync_recoveries":state["depth_resync_recoveries"]}
+    ages=[max(0,now-(w.get("last_message_ms") or w.get("opened_ms") or now)) for w in workers if w.get("connected")]
+    with depth_resync_lock:
+        resync_queue=depth_resync_q.qsize(); resync_pending=len(depth_resync_pending)
+    out.update({"workers":workers,"stale_workers":sum(a>30000 for a in ages),
+                "max_worker_message_age_ms":max(ages) if ages else None,
+                "scan_queue":scanq.qsize(),"scan_queue_capacity":scanq.maxsize,
+                "db_queue":dbq.qsize(),"db_queue_capacity":dbq.maxsize,
+                "resync_queue":resync_queue,"resync_pending":resync_pending})
+    return out
 
 @app.get("/api/status")
 def api_status():
@@ -1948,6 +2068,7 @@ def api_status():
                  "matrix":execution_matrix(),"raw_primary":raw_primary_status(),"rebalance_cover_mult":REBALANCE_COVER_MULT,"v22":v22_stats(),
                  "trace_window_ms":TRACE_WINDOW_MS,"decision_max_recv_age_ms":DECISION_MAX_RECV_AGE_MS,"decision_max_skew_ms":DECISION_MAX_SKEW_MS,"primary_max_skew_ms":PRIMARY_MAX_SKEW_MS,"paper_rearm_neutral_ms":PAPER_REARM_NEUTRAL_MS,"paper_hard_cooldown_ms":PAPER_HARD_COOLDOWN_MS,
                  "recent_decisions":recent_v22_decisions(),"shadows":shadow_status(),"quality":v235_quality_stats(),
+                 "admissions":v236_admission_stats(),"health":runtime_health(now),
                  "shadow_profiles":{k:{"leg1_ms":v[0],"leg2_ms":v[1]} for k,v in SHADOW_PROFILES.items()},
                  "v235_policy":{"edge_min_pct":SHADOW_MIN_EDGE*100,"target_weights":SHADOW_TARGET_WEIGHTS,
                     "rebalance_check_min":SHADOW_REBALANCE_CHECK_SEC/60,"rebalance_max_h":SHADOW_REBALANCE_MAX_SEC/3600,
@@ -1959,24 +2080,26 @@ def api_status():
                  "v235_capture":v234_capture_stats()})
     return jsonify(base)
 
-HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MEXC 2-Leg V2.3.5</title>
+HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MEXC 2-Leg V2.3.6</title>
 <style>body{background:#090d14;color:#e8edf5;font-family:system-ui;margin:0;padding:16px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.c,.panel{background:#111827;border:1px solid #273248;border-radius:10px;padding:12px}.v{font-weight:800;font-size:20px}.big{font-size:28px}.muted{color:#9aa7bd;font-size:12px}.good{color:#22d38a}.bad{color:#ff6677}.panel{margin-top:12px;overflow:auto}.latency{display:grid;grid-template-columns:repeat(3,minmax(250px,1fr));gap:10px}.latbox{background:#0c1421;border:1px solid #2a3850;border-radius:10px;padding:12px}.balance{margin-top:8px;line-height:1.7}.metricgrid{display:grid;grid-template-columns:repeat(2,minmax(95px,1fr));gap:7px;margin-top:10px}.metric{background:#111b2b;border-radius:8px;padding:8px}.tag{display:inline-block;border:1px solid #334155;border-radius:999px;padding:3px 7px;font-size:11px;color:#bac6d8}table{border-collapse:collapse;width:100%;font-size:12px}th,td{padding:8px;border-bottom:1px solid #263044;text-align:right}th:first-child,td:first-child{text-align:left}@media(max-width:900px){.latency{grid-template-columns:1fr}}</style></head><body>
-<h2>MEXC — Scanner Spot 2-leg V2.3.5 Depth Quality</h2><div class=cards id=cards></div>
+<h2>MEXC — Scanner Spot 2-leg V2.3.6 · univers complet</h2><div class=cards id=cards></div>
+<div class=panel id=health></div>
 <div class=panel id=latencies></div>
 <div class=panel id=policy></div>
 <div class=panel id=quality></div>
 <div class=panel><h3>Décisions récentes — Depth Quality à T0</h3><table><thead><tr><th>Heure</th><th>Route</th><th>Edge T0</th><th>Classe</th><th>Taille retenue</th><th>Edge −50% BBO</th><th>Edge sans L1</th><th>Réserve L1–L3</th><th>Calcul</th></tr></thead><tbody id=recent></tbody></table></div>
 <div class=panel id=capture></div><div class=panel id=diag></div>
 <script>
-async function refresh(){let d=await fetch('/api/status').then(r=>r.json()),g=d.diag,p=d.v235_policy||{},cap=d.v235_capture||{},ql=d.quality||{};
+async function refresh(){let d=await fetch('/api/status').then(r=>r.json()),g=d.diag,p=d.v235_policy||{},cap=d.v235_capture||{},ql=d.quality||{},ad=d.admissions||{},he=d.health||{};
 document.getElementById('cards').innerHTML=`<div class=c><div class=v>${d.symbols}</div><div class=muted>marchés WS</div></div><div class=c><div class=v>${d.routes}</div><div class=muted>routes 2-leg</div></div><div class=c><div class=v>${d.ws}/${d.ws_expected}</div><div class=muted>WebSockets</div></div><div class=c><div class=v>${d.age_ms??'-'} ms</div><div class=muted>dernier BBO reçu</div></div><div class=c><div class=v>${d.depth_ready||0}/${d.symbols}</div><div class=muted>carnets Depth prêts</div></div><div class=c><div class=v>${d.v22?.decisions||0}</div><div class=muted>décisions brutes tracées</div></div><div class=c><div class=v>${d.v22?.trace_points||0}</div><div class=muted>points trajectoire</div></div>`;
+let wsok=(he.ws_connected===he.ws_expected)&&(he.stale_workers||0)===0;document.getElementById('health').innerHTML=`<div class=tag>SANTÉ TEMPS RÉEL</div><h3 class='${wsok?'good':'bad'}'>WebSockets ${he.ws_connected||0}/${he.ws_expected||0} · ${he.stale_workers||0} silencieux &gt;30 s</h3><div class=cards><div><div class=v>${he.ws_disconnects||0}</div><div class=muted>chutes WS</div></div><div><div class=v>${he.ws_reconnects||0}</div><div class=muted>reconnexions WS</div></div><div><div class=v>${he.max_worker_message_age_ms==null?'-':he.max_worker_message_age_ms+' ms'}</div><div class=muted>âge max dernier message/socket</div></div><div><div class=v>${he.depth_gap_events||0}</div><div class=muted>gaps Depth hors bootstrap</div></div><div><div class=v>${he.depth_resync_failures||0}</div><div class=muted>échecs resync</div></div><div><div class=v>${he.resync_queue||0}/${he.resync_pending||0}</div><div class=muted>file/pending resync</div></div><div><div class=v>${he.scan_queue||0}/${he.scan_queue_capacity||0}</div><div class=muted>file scan</div></div><div><div class=v>${he.scan_queue_drops||0}</div><div class=muted>abandons file scan</div></div><div><div class=v>${he.scan_coalesced||0}</div><div class=muted>updates fusionnées</div></div><div><div class=v>${he.db_queue||0}/${he.db_queue_capacity||0}</div><div class=muted>file DB</div></div><div><div class=v>${he.db_queue_drops||0}</div><div class=muted>abandons DB</div></div></div>`;
 let sh=d.shadows||{},first=sh.FAST||{},h=`<div class=tag>LATENCE D'EXÉCUTION</div><h3>FAST / TARGET / DEGRADED — ${(first.capital||0).toFixed(0)} $ indépendants chacun</h3><div class=latency>`;
 for(let n of ['FAST','TARGET','DEGRADED']){let x=sh[n];if(!x)continue;let bal=Object.entries(x.balances||{}).map(([a,v])=>`${a} <b>${v.toFixed(2)}</b>`).join(' · ');h+=`<div class=latbox><div class=muted>${n} · Leg1 +${x.leg1_ms} ms · Leg2 +${x.leg2_ms} ms</div><div class='v big ${x.profit>=0?'good':'bad'}'>${x.profit>=0?'+':''}${x.profit.toFixed(2)} $</div><div class=muted>NAV ${x.nav.toFixed(2)} $</div><div class=metricgrid><div class=metric><div class=v>${x.trades}</div><div class=muted>trades</div></div><div class=metric><div class=v>${x.wins} / ${x.losses}</div><div class=muted>gagnés / perdus</div></div><div class=metric><div class=v>${x.avg_edge==null?'-':(100*x.avg_edge).toFixed(3)+'%'}</div><div class=muted>edge T0 moyen</div></div><div class=metric><div class=v>${x.rebalances}</div><div class=muted>rebalances</div></div></div><div class='balance muted'>Balance : ${bal}<br>Coût rebalance ${x.rebalance_cost.toFixed(3)} $ · refus balance ${x.skipped_balance} · expositions ${x.open_exposures}</div></div>`}h+=`</div><div class=muted style='margin-top:10px'>Même signal et mêmes carnets MEXC réels. Seuls les délais virtuels diffèrent. Aucun ordre réel n'est envoyé.</div>`;document.getElementById('latencies').innerHTML=h;
-let tw=Object.entries(p.target_weights||{}).map(([a,v])=>`${a} ${(100*v).toFixed(0)}%`).join(' · ');document.getElementById('policy').innerHTML=`<div class=tag>POLITIQUE V2.3.5</div><h3>Depth Quality adaptatif — aucun cap absolu</h3><div class=cards><div><div class=v>${(p.edge_min_pct??0).toFixed(2)}%</div><div class=muted>edge initial minimum</div></div><div><div class=v>A · ${(p.a_fraction_pct??0).toFixed(0)}%</div><div class=muted>capacité si suppression L1 ≥ edge min</div></div><div><div class=v>B+ · ${(p.b_fraction_pct??0).toFixed(0)}%</div><div class=muted>capacité si −50% BBO ≥ ${(p.bplus_half_edge_pct??0).toFixed(2)}%</div></div><div><div class=v>×${(p.coverage3_min??0).toFixed(0)}</div><div class=muted>réserve minimum niveaux 1–3</div></div><div><div class=v>${tw}</div><div class=muted>allocation cible</div></div><div><div class=v>${p.rebalance_check_min??'-'} min / ${p.rebalance_max_h??'-'} h</div><div class=muted>contrôle / rebalance maximum</div></div></div><div class=muted style='margin-top:10px'>A : 50% de la capacité robuste. B+ : 33%, edge après −50% BBO ≥0,75%, edge sans niveau 1 ≥−2%, réserve L1–L3 ≥×3. B−, C et D sont enregistrés mais refusés. Taille finale limitée uniquement par le solde disponible.</div>`;
-let qc={};for(let r of (ql.rows||[])){qc[r.grade]=(qc[r.grade]||0)+r.n}let perf=ql.compute||{};document.getElementById('quality').innerHTML=`<div class=tag>QUALITÉ DEPTH AUJOURD'HUI</div><h3>A / B+ admis — B− / C / D observés</h3><div class=cards><div><div class=v good>${qc['A']||0}</div><div class=muted>classe A</div></div><div><div class=v good>${qc['B+']||0}</div><div class=muted>classe B+</div></div><div><div class=v>${qc['B-']||0}</div><div class=muted>B− refusés</div></div><div><div class=v>${(qc['C']||0)+(qc['D']||0)}</div><div class=muted>C / D refusés</div></div><div><div class=v>${ql.max_selected_usd==null?'-':ql.max_selected_usd.toFixed(2)+' $'}</div><div class=muted>taille Depth max admise</div></div><div><div class=v>${perf.p95_us==null?'-':perf.p95_us.toFixed(1)+' µs'}</div><div class=muted>temps calcul p95</div></div></div>`;
+let tw=Object.entries(p.target_weights||{}).map(([a,v])=>`${a} ${(100*v).toFixed(0)}%`).join(' · ');document.getElementById('policy').innerHTML=`<div class=tag>POLITIQUE V2.3.6</div><h3>Depth Quality adaptatif — aucun cap absolu</h3><div class=cards><div><div class=v>${(p.edge_min_pct??0).toFixed(2)}%</div><div class=muted>edge initial minimum</div></div><div><div class=v>A · ${(p.a_fraction_pct??0).toFixed(0)}%</div><div class=muted>capacité si suppression L1 ≥ edge min</div></div><div><div class=v>B+ · ${(p.b_fraction_pct??0).toFixed(0)}%</div><div class=muted>capacité si −50% BBO ≥ ${(p.bplus_half_edge_pct??0).toFixed(2)}%</div></div><div><div class=v>×${(p.coverage3_min??0).toFixed(0)}</div><div class=muted>réserve minimum niveaux 1–3</div></div><div><div class=v>${tw}</div><div class=muted>allocation cible</div></div><div><div class=v>${p.rebalance_check_min??'-'} min / ${p.rebalance_max_h??'-'} h</div><div class=muted>contrôle / rebalance maximum</div></div></div><div class=muted style='margin-top:10px'>A : 50% de la capacité robuste. B+ : 33%, edge après −50% BBO ≥0,75%, edge sans niveau 1 ≥−2%, réserve L1–L3 ≥×3. B−, C et D sont enregistrés mais refusés. Taille finale limitée uniquement par le solde disponible.</div>`;
+let qa=0,qb=0,qsmall=0,qbm=0,qcd=0;for(let r of (ql.rows||[])){if(r.grade==='A'&&r.eligible===1)qa+=r.n;if(r.grade==='B+'&&r.eligible===1)qb+=r.n;if((r.grade==='A'||r.grade==='B+')&&r.reason==='below_min_trade')qsmall+=r.n;if(r.grade==='B-')qbm+=r.n;if(r.grade==='C'||r.grade==='D')qcd+=r.n}let ac={};for(let r of (ad.rows||[]))ac[r.disposition]=(ac[r.disposition]||0)+r.n;let aexec=(ac.executed_all_profiles||0)+(ac.executed_partial_profiles||0),ablock=(ac.blocked_same_event||0)+(ac.blocked_not_rearmed||0)+(ac.blocked_cooldown||0),perf=ql.compute||{},cf=ql.coverage_counterfactual||{};document.getElementById('quality').innerHTML=`<div class=tag>QUALITÉ DEPTH AUJOURD'HUI</div><h3>A / B+ admis — entonnoir d'exécution explicite</h3><div class=cards><div><div class=v good>${qa}</div><div class=muted>A admissibles</div></div><div><div class=v good>${qb}</div><div class=muted>B+ admissibles</div></div><div><div class=v>${qsmall}</div><div class=muted>A/B+ sous 10 $</div></div><div><div class=v good>${aexec}</div><div class=muted>signaux exécutés</div></div><div><div class=v>${ablock}</div><div class=muted>bloqués event/réarmement/cooldown</div></div><div><div class=v>${ac.blocked_no_profile_balance||0}</div><div class=muted>bloqués balance</div></div><div><div class=v>${qbm}</div><div class=muted>B− refusés</div></div><div><div class=v>${qcd}</div><div class=muted>C / D refusés</div></div><div><div class=v>${cf.x1??0} / ${cf.x3??0}</div><div class=muted>B+ potentiels si couverture ×1 / ×3</div></div><div><div class=v>${ql.max_selected_usd==null?'-':ql.max_selected_usd.toFixed(2)+' $'}</div><div class=muted>taille Depth max admise</div></div><div><div class=v>${perf.p95_us==null?'-':perf.p95_us.toFixed(1)+' µs'}</div><div class=muted>temps calcul p95</div></div></div>`;
 let fp=v=>v==null?'-':(100*v).toFixed(3)+'%',fn=v=>v==null?'-':Number(v).toFixed(2);let rh='';for(let q of (d.recent_decisions||[])){let t=new Date(q.ts_ms),ok=q.eligible===1;rh+=`<tr><td>${t.toLocaleTimeString()}</td><td>${q.route_id}</td><td>${fp(q.decision_net)}</td><td class='${ok?'good':'muted'}'>${q.grade||q.reason||'-'}</td><td>${q.selected_usd==null?'-':q.selected_usd.toFixed(2)+' $'}</td><td>${fp(q.half_bbo_edge)}</td><td>${fp(q.drop_l1_edge)}</td><td>${q.coverage3==null?'-':'×'+fn(q.coverage3)}</td><td>${q.compute_us==null?'-':fn(q.compute_us)+' µs'}</td></tr>`}document.getElementById('recent').innerHTML=rh;
-document.getElementById('capture').innerHTML=`<div class=tag>DATASET REPLAY V2.3.5</div><h3>Collecte jusqu'à T0 + 5 secondes</h3><div class=cards><div><div class=v>${cap.depth_decisions||0}</div><div class=muted>décisions avec Depth</div></div><div><div class=v>${cap.depth_samples||0}</div><div class=muted>snapshots multi-level</div></div><div><div class=v>${cap.exec_details||0}</div><div class=muted>exécutions VWAP détaillées</div></div><div><div class=v>${cap.stable_depth_samples||0}</div><div class=muted>snapshots Depth stablecoins</div></div></div><div class=muted style='margin-top:10px'>Offsets Depth : ${(p.depth_capture_offsets_ms||[]).join(', ')} ms · top ${(p.depth_capture_levels||'-')} niveaux par côté. Les trois latences, tailles, stress BBO, rebalances, partial fills et expositions restent rejouables.</div>`;
-document.getElementById('diag').innerHTML=`<h3>Univers</h3><div class=cards><div><div class=v>${g.all_markets}</div><div class=muted>marchés découverts</div></div><div><div class=v>${g.candidate_2leg}</div><div class=muted>2-leg candidates</div></div><div><div class=v>${g.selected_2leg}</div><div class=muted>2-leg suivies</div></div><div><div class=v>${g.candidate_3leg}</div><div class=muted>3-leg détectées mais ignorées</div></div></div>`}
+document.getElementById('capture').innerHTML=`<div class=tag>DATASET REPLAY V2.3.6</div><h3>Collecte jusqu'à T0 + 5 secondes</h3><div class=cards><div><div class=v>${cap.depth_decisions||0}</div><div class=muted>décisions avec Depth</div></div><div><div class=v>${cap.depth_samples||0}</div><div class=muted>snapshots multi-level</div></div><div><div class=v>${cap.exec_details||0}</div><div class=muted>exécutions VWAP détaillées</div></div><div><div class=v>${cap.stable_depth_samples||0}</div><div class=muted>snapshots Depth stablecoins</div></div></div><div class=muted style='margin-top:10px'>Offsets Depth : ${(p.depth_capture_offsets_ms||[]).join(', ')} ms · top ${(p.depth_capture_levels||'-')} niveaux par côté. Les trois latences, tailles, stress BBO, rebalances, partial fills et expositions restent rejouables.</div>`;
+document.getElementById('diag').innerHTML=`<h3>Univers</h3><div class=cards><div><div class=v>${g.all_markets}</div><div class=muted>marchés découverts</div></div><div><div class=v>${g.candidate_2leg}</div><div class=muted>2-leg candidates</div></div><div><div class='v ${g.selected_2leg===g.candidate_2leg?'good':'bad'}'>${g.selected_2leg}</div><div class=muted>2-leg suivies</div></div><div><div class=v>${g.dropped_2leg||0}</div><div class=muted>2-leg exclues</div></div><div><div class=v>${g.candidate_3leg}</div><div class=muted>3-leg détectées mais ignorées</div></div><div><div class=v>${g.ws_group_size||'-'}</div><div class=muted>symboles par WebSocket</div></div></div>`}
 refresh();setInterval(refresh,3000)
 </script></body></html>
 '''
@@ -1999,11 +2122,11 @@ def bootstrap():
     symbols=[m["symbol"] for m in chosen]
     with state_lock:
         state["symbols"]=symbols; state["routes"]=routes; state["routes_by_symbol"]=bysym; state["market_meta"]=meta; state["route_diag"]=diag
-    groups=[symbols[i:i+20] for i in range(0,len(symbols),20)]
+    groups=[symbols[i:i+WS_GROUP_SIZE] for i in range(0,len(symbols),WS_GROUP_SIZE)]
     with state_lock: state["ws_expected"]=len(groups)
     print(f"[Routes V{VERSION}] source={state['market_source']} markets={diag['all_markets']} candidates={diag['candidate_routes']} "
           f"(2L={diag['candidate_2leg']},3L={diag['candidate_3leg']}) selected_symbols={len(symbols)} selected_routes={len(routes)} "
-          f"(2L={diag['selected_2leg']},3L={diag['selected_3leg']}) WS={len(groups)}")
+          f"(2L={diag['selected_2leg']},3L={diag['selected_3leg']}) WS={len(groups)} group={WS_GROUP_SIZE}")
     put_db(("meta",("version",VERSION))); put_db(("meta",("paper_rearm_neutral_ms",str(PAPER_REARM_NEUTRAL_MS)))); put_db(("meta",("paper_hard_cooldown_ms",str(PAPER_HARD_COOLDOWN_MS)))); put_db(("meta",("paper_failed_leg_policy","reverse_leg1_then_persist_open_exposure_until_liquidated"))); put_db(("meta",("ws_depth_interval","10ms"))); put_db(("meta",("depth_snapshot_levels","100"))); put_db(("meta",("trace_window_ms",str(TRACE_WINDOW_MS)))); put_db(("meta",("market_source",state["market_source"])))
     put_db(("meta",("route_diag",json.dumps(diag,sort_keys=True))))
     put_db(("meta",("shadow_profiles",json.dumps(SHADOW_PROFILES,sort_keys=True))))
