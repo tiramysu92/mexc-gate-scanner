@@ -8,12 +8,12 @@ from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, render_template_string
 import websocket
 
-VERSION = "2.4.3-latency-hardened"
+VERSION = "2.4.4-coverage-prevalidated"
 HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", "8081"))
-DB_PATH = os.getenv("DB_PATH", "mexc_routes_v243.db")
-LIVE_DB_PATH = os.getenv("LIVE_DB_PATH", "mexc_live_v243.db")
-LIVE_IMPORT_CAPABILITIES_DB = os.getenv("LIVE_IMPORT_CAPABILITIES_DB", "mexc_routes_v242.db")
+DB_PATH = os.getenv("DB_PATH", "mexc_routes_v244.db")
+LIVE_DB_PATH = os.getenv("LIVE_DB_PATH", "mexc_live_v244.db")
+LIVE_IMPORT_CAPABILITIES_DB = os.getenv("LIVE_IMPORT_CAPABILITIES_DB", "mexc_live_v243.db")
 MARKET_CACHE = os.getenv("MARKET_CACHE", "mexc_markets_cache.json")
 TZ_NAME = os.getenv("TZ_NAME", "Europe/Paris")
 TZ = ZoneInfo(TZ_NAME)
@@ -96,7 +96,7 @@ TRADING_MODE = os.getenv("TRADING_MODE", "shadow").strip().lower()
 if TRADING_MODE not in ("shadow", "test", "live"):
     TRADING_MODE = "shadow"
 LIVE_ARMED = os.getenv("LIVE_ARMED", "0") == "1"
-LIVE_CAP_USD = max(0.0, float(os.getenv("LIVE_CAP_USD", "10")))
+LIVE_CAP_USD = max(0.0, float(os.getenv("LIVE_CAP_USD", "20")))
 LIVE_CAPITAL_LIMIT_USD = max(0.0, float(os.getenv("LIVE_CAPITAL_LIMIT_USD", "200")))
 LIVE_DAILY_LOSS_LIMIT_USD = max(0.0, float(os.getenv("LIVE_DAILY_LOSS_LIMIT_USD", "2")))
 LIVE_MAX_CONCURRENT = max(1, int(os.getenv("LIVE_MAX_CONCURRENT", "1")))
@@ -112,6 +112,7 @@ LIVE_ACCOUNT_REFRESH_SEC = max(5.0, float(os.getenv("LIVE_ACCOUNT_REFRESH_SEC", 
 LIVE_ACCOUNT_CACHE_MAX_AGE_MS = max(1000, int(os.getenv("LIVE_ACCOUNT_CACHE_MAX_AGE_MS", "10000")))
 LIVE_DUST_USD = max(0.0, float(os.getenv("LIVE_DUST_USD", "0.05")))
 LIVE_FEE_SAFETY = max(FEE, float(os.getenv("LIVE_FEE_SAFETY_PCT", "0.20")) / 100.0)
+LIVE_LEG2_MIN_EDGE = float(os.getenv("LIVE_LEG2_MIN_EDGE_PCT", "0.15")) / 100.0
 # The leg-1 fill quantity is known from GET /order.  Its commission detail is
 # useful for exact accounting but must not add another private REST round trip
 # while the route is exposed to the intermediate asset.  A conservative fee
@@ -122,6 +123,15 @@ LIVE_REQUIRE_ROUTE_WS = os.getenv("LIVE_REQUIRE_ROUTE_WS", "1") == "1"
 LIVE_REQUIRE_TESTED_ROUTE = os.getenv("LIVE_REQUIRE_TESTED_ROUTE", "1") == "1"
 LIVE_TEST_MAX_AGE_HOURS = max(1.0, float(os.getenv("LIVE_TEST_MAX_AGE_HOURS", "72")))
 LIVE_TEST_PROBE_DEPTH_AGE_MS = max(LIVE_BBO_AGE_MS, int(os.getenv("LIVE_TEST_PROBE_DEPTH_AGE_MS", "10000")))
+LIVE_PREVALIDATE_ENABLED = os.getenv("LIVE_PREVALIDATE_ENABLED", "1") == "1"
+LIVE_PREVALIDATE_INTERVAL_SEC = max(1.0, float(os.getenv("LIVE_PREVALIDATE_INTERVAL_SEC", "5")))
+LIVE_PREVALIDATE_REFRESH_HOURS = min(LIVE_TEST_MAX_AGE_HOURS, max(1.0, float(
+    os.getenv("LIVE_PREVALIDATE_REFRESH_HOURS", "60"))))
+# Syntax-only /order/test probes may use a quiet book: the full paced sweep can
+# take about one hour. This age can never admit a BOT signal; the real gateway
+# independently enforces LIVE_BBO_AGE_MS / LIVE_MAX_SKEW_MS at <= 50 ms.
+LIVE_PREVALIDATE_DEPTH_AGE_MS = max(LIVE_BBO_AGE_MS, int(os.getenv(
+    "LIVE_PREVALIDATE_DEPTH_AGE_MS", "7200000")))
 # Route discovery may wait for a fresh A/B+ window because /order/test never
 # reaches the matching engine. Real orders use a deliberately much shorter
 # retry budget: a late arbitrage is discarded instead of being chased.
@@ -145,9 +155,14 @@ LIVE_ARM_FILE = os.getenv("LIVE_ARM_FILE", "/home/ubuntu/.config/mexc-bot/LIVE_A
 LIVE_STOP_FILE = os.getenv("LIVE_STOP_FILE", "/home/ubuntu/.config/mexc-bot/LIVE_STOP")
 LIVE_ARM_PHRASE = f"ENABLE MEXC LIVE {LIVE_CAP_USD:g} USD"
 
+# Coverage accounting is updated in RAM on the scan path and persisted as only
+# 800 aggregate rows at this cadence. It never writes one row per market tick.
+ROUTE_COVERAGE_FLUSH_SEC = max(30.0, float(os.getenv("ROUTE_COVERAGE_FLUSH_SEC", "60")))
+BOT_SHADOW_REBALANCE_ENABLED = os.getenv("BOT_SHADOW_REBALANCE_ENABLED", "1") == "1"
+
 # Independent Shadow portfolios mirror the private gateway: the three historic
 # clocks plus deliberately slower stress profiles, only on test-validated
-# routes, with the live cap/capital and no automatic rebalance.
+# routes, with the live cap/capital and the same 30 min / 4 h simulated rebalance.
 BOT_SHADOW_PROFILES = {
     "BOT_FAST": SHADOW_PROFILES["FAST"],
     "BOT_TARGET": SHADOW_PROFILES["TARGET"],
@@ -242,6 +257,12 @@ db_ready = threading.Event()
 dashboard_cache_lock = threading.RLock()
 dashboard_cache = {"updated_ms":0,"data":None,"last_error":None}
 
+# Fixed-size per-route telemetry. Scan workers only mutate already allocated
+# dictionaries; the writer takes one aggregate snapshot per minute.
+route_coverage = {}
+route_coverage_day = None
+route_coverage_flush_lock = threading.Lock()
+
 # The private gateway is deliberately independent from the three Shadow portfolios.
 # It has one serial queue and its own durable journal. No HTTP route can arm it.
 live_lock = threading.RLock()
@@ -276,6 +297,7 @@ live_runtime = {
 }
 live_client = None
 live_account_client = None
+live_prevalidation_client = None
 live_route_capabilities = {}
 live_account_refresh_event = threading.Event()
 live_gateway_first_check_ms = deque(maxlen=10000)
@@ -291,6 +313,21 @@ live_leg2_confirm_ms = deque(maxlen=10000)
 live_prepare_journal_ms = deque(maxlen=10000)
 live_response_journal_ms = deque(maxlen=10000)
 bot_shadow_schedule_lag_ms = deque(maxlen=10000)
+prevalidation_runtime = {
+    "enabled": LIVE_PREVALIDATE_ENABLED,
+    "running": False,
+    "checked": 0,
+    "validated": 0,
+    "skipped_depth": 0,
+    "skipped_size": 0,
+    "errors": 0,
+    "last_route": None,
+    "last_status": None,
+    "last_error": None,
+    "last_latency_ms": None,
+    "cycle_started_ts_ms": None,
+    "cycle_completed_ts_ms": None,
+}
 
 
 def now_ms(): return int(time.time()*1000)
@@ -593,7 +630,8 @@ def db_writer():
       leg1_post_http_ms REAL, leg2_post_http_ms REAL,
       leg1_http_queue_ms REAL, leg2_http_queue_ms REAL,
       leg1_confirm_ms INTEGER, leg2_confirm_ms INTEGER,
-      leg1_prepare_journal_ms REAL, leg2_prepare_journal_ms REAL
+      leg1_prepare_journal_ms REAL, leg2_prepare_journal_ms REAL,
+      leg2_guard_edge REAL
     );
     CREATE INDEX IF NOT EXISTS idx_live_attempts_day ON live_attempts_v240(day,created_ts_ms);
 
@@ -633,7 +671,31 @@ def db_writer():
     );
     CREATE INDEX IF NOT EXISTS idx_live_admissions_v241_day
       ON live_admissions_v241(day,decision_ts_ms,disposition);
+
+    CREATE TABLE IF NOT EXISTS route_coverage_v244(
+      day TEXT NOT NULL, route_id TEXT NOT NULL, path TEXT NOT NULL,
+      first_ts_ms INTEGER, last_ts_ms INTEGER,
+      evaluations INTEGER NOT NULL DEFAULT 0,
+      calculable INTEGER NOT NULL DEFAULT 0,
+      research_fresh INTEGER NOT NULL DEFAULT 0,
+      live_fresh INTEGER NOT NULL DEFAULT 0,
+      positive INTEGER NOT NULL DEFAULT 0,
+      edge_ge_030 INTEGER NOT NULL DEFAULT 0,
+      edge_ge_035 INTEGER NOT NULL DEFAULT 0,
+      quality_a INTEGER NOT NULL DEFAULT 0,
+      quality_bplus INTEGER NOT NULL DEFAULT 0,
+      quality_eligible INTEGER NOT NULL DEFAULT 0,
+      validated_seen INTEGER NOT NULL DEFAULT 0,
+      bot_admitted INTEGER NOT NULL DEFAULT 0,
+      max_edge REAL,
+      PRIMARY KEY(day,route_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_route_coverage_v244_day
+      ON route_coverage_v244(day,last_ts_ms);
     """)
+    coverage_existing={r[1] for r in con.execute("PRAGMA table_info(route_coverage_v244)")}
+    if "quality_eligible" not in coverage_existing:
+        con.execute("ALTER TABLE route_coverage_v244 ADD COLUMN quality_eligible INTEGER NOT NULL DEFAULT 0")
     # Safe migration when an operator deliberately reuses a V2.4.0 database.
     existing={r[1] for r in con.execute("PRAGMA table_info(live_attempts_v240)")}
     for name,decl in (
@@ -645,7 +707,8 @@ def db_writer():
         ("leg1_post_http_ms","REAL"),("leg2_post_http_ms","REAL"),
         ("leg1_http_queue_ms","REAL"),("leg2_http_queue_ms","REAL"),
         ("leg1_confirm_ms","INTEGER"),("leg2_confirm_ms","INTEGER"),
-        ("leg1_prepare_journal_ms","REAL"),("leg2_prepare_journal_ms","REAL")):
+        ("leg1_prepare_journal_ms","REAL"),("leg2_prepare_journal_ms","REAL"),
+        ("leg2_guard_edge","REAL")):
         if name not in existing: con.execute(f"ALTER TABLE live_attempts_v240 ADD COLUMN {name} {decl}")
     order_existing={r[1] for r in con.execute("PRAGMA table_info(live_orders_v240)")}
     for name,decl in (("price","TEXT"),("request_started_ts_ms","INTEGER"),
@@ -774,6 +837,21 @@ def db_writer():
                     route_depth_skew_ms=COALESCE(excluded.route_depth_skew_ms,live_admissions_v241.route_depth_skew_ms),
                     gateway_check_us=COALESCE(excluded.gateway_check_us,live_admissions_v241.gateway_check_us),
                     retry_reasons_json=COALESCE(excluded.retry_reasons_json,live_admissions_v241.retry_reasons_json)""", payload)
+            elif typ == "route_coverage_many_v244":
+                con.executemany("""INSERT INTO route_coverage_v244(
+                    day,route_id,path,first_ts_ms,last_ts_ms,evaluations,calculable,research_fresh,
+                    live_fresh,positive,edge_ge_030,edge_ge_035,quality_a,quality_bplus,
+                    quality_eligible,validated_seen,bot_admitted,max_edge)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(day,route_id) DO UPDATE SET
+                    path=excluded.path,first_ts_ms=excluded.first_ts_ms,last_ts_ms=excluded.last_ts_ms,
+                    evaluations=excluded.evaluations,calculable=excluded.calculable,
+                    research_fresh=excluded.research_fresh,live_fresh=excluded.live_fresh,
+                    positive=excluded.positive,edge_ge_030=excluded.edge_ge_030,
+                    edge_ge_035=excluded.edge_ge_035,quality_a=excluded.quality_a,
+                    quality_bplus=excluded.quality_bplus,quality_eligible=excluded.quality_eligible,
+                    validated_seen=excluded.validated_seen,
+                    bot_admitted=excluded.bot_admitted,max_edge=excluded.max_edge""", payload)
             pending_commit+=1
             if pending_commit>=DB_COMMIT_BATCH or (time.monotonic()-last_commit)*1000>=DB_COMMIT_MAX_MS:
                 con.commit(); pending_commit=0; last_commit=time.monotonic()
@@ -789,6 +867,120 @@ def put_db(item):
     except queue.Full:
         with state_lock: state["db_queue_drops"]+=1
         logerr("DB queue full")
+
+
+# ---------- Fixed-size route coverage audit (V2.4.4) ----------
+_ROUTE_COVERAGE_COUNTERS = (
+    "evaluations","calculable","research_fresh","live_fresh","positive",
+    "edge_ge_030","edge_ge_035","quality_a","quality_bplus",
+    "quality_eligible","validated_seen","bot_admitted",
+)
+
+
+def _empty_route_coverage(route, day):
+    row={"day":day,"route_id":route["id"],"path":">".join(route["path"]),
+         "first_ts_ms":None,"last_ts_ms":None,"max_edge":None}
+    row.update({name:0 for name in _ROUTE_COVERAGE_COUNTERS})
+    return row
+
+
+def initialize_route_coverage(routes):
+    """Restore today's 800 aggregate rows; no raw per-tick records are created."""
+    global route_coverage_day
+    _,_,day=local_day_bounds_ms(0)
+    restored={}
+    try:
+        con=sqlite3.connect(DB_PATH,timeout=10); con.row_factory=sqlite3.Row
+        for row in con.execute("SELECT * FROM route_coverage_v244 WHERE day=?",(day,)):
+            restored[row["route_id"]]=dict(row)
+        con.close()
+    except Exception as exc:
+        logerr(f"route coverage restore: {exc}")
+    route_coverage.clear()
+    for route in routes:
+        route_coverage[route["id"]]=restored.get(route["id"],_empty_route_coverage(route,day))
+    route_coverage_day=day
+
+
+def _coverage_observe(route, x, ts):
+    """Constant-time RAM counters only; called by scan workers."""
+    row=route_coverage.get(route["id"])
+    if row is None: return
+    row["evaluations"]+=1
+    row["first_ts_ms"]=row["first_ts_ms"] or ts; row["last_ts_ms"]=ts
+    if not x: return
+    row["calculable"]+=1
+    net=float(x.get("net") or 0.0)
+    old=row.get("max_edge")
+    if old is None or net>old: row["max_edge"]=net
+    research_fresh=(x.get("max_age",999999)<=SHADOW_BBO_AGE_MS and
+                    x.get("bbo_skew",999999)<=SHADOW_MAX_SKEW_MS)
+    live_fresh=(x.get("max_age",999999)<=LIVE_BBO_AGE_MS and
+                x.get("bbo_skew",999999)<=LIVE_MAX_SKEW_MS)
+    if research_fresh:
+        row["research_fresh"]+=1
+        if net>0: row["positive"]+=1
+        if net>=REPLAY_MIN_EDGE: row["edge_ge_030"]+=1
+        if net>=SHADOW_MIN_EDGE: row["edge_ge_035"]+=1
+    if live_fresh: row["live_fresh"]+=1
+
+
+def _coverage_mark_quality(route_id, quality):
+    row=route_coverage.get(route_id)
+    if row is None or not quality or not quality.get("eligible"): return
+    row["quality_eligible"]+=1
+    if quality.get("grade")=="A": row["quality_a"]+=1
+    elif quality.get("grade")=="B+": row["quality_bplus"]+=1
+
+
+def _coverage_mark_bot(route_id):
+    row=route_coverage.get(route_id)
+    if row is not None: row["bot_admitted"]+=1
+
+
+def _route_coverage_rows():
+    ts=now_ms()
+    with live_lock:
+        valid={rid for rid,item in live_route_capabilities.items()
+               if int(item.get("expires_ts_ms") or 0)>=ts}
+    rows=[]
+    for rid,row in list(route_coverage.items()):
+        if rid in valid: row["validated_seen"]=1
+        rows.append((row["day"],rid,row["path"],row.get("first_ts_ms"),row.get("last_ts_ms"),
+            *[int(row.get(name,0)) for name in _ROUTE_COVERAGE_COUNTERS],row.get("max_edge")))
+    return rows
+
+
+def route_coverage_flush_worker():
+    global route_coverage_day
+    while True:
+        time.sleep(ROUTE_COVERAGE_FLUSH_SEC)
+        if not route_coverage_flush_lock.acquire(blocking=False): continue
+        try:
+            rows=_route_coverage_rows()
+            if rows: put_db(("route_coverage_many_v244",rows))
+            _,_,today=local_day_bounds_ms(0)
+            if route_coverage_day!=today:
+                with state_lock: routes=list(state.get("routes") or [])
+                initialize_route_coverage(routes)
+        finally:
+            route_coverage_flush_lock.release()
+
+
+def route_coverage_status():
+    rows=list(route_coverage.values()); total=len(rows)
+    def routes_with(field): return sum(1 for row in rows if int(row.get(field,0))>0)
+    def ticks(field): return sum(int(row.get(field,0)) for row in rows)
+    with live_lock:
+        valid=sum(1 for item in live_route_capabilities.values()
+                  if int(item.get("expires_ts_ms") or 0)>=now_ms())
+    return {
+        "day":route_coverage_day,"total_routes":total,
+        "route_counts":{field:routes_with(field) for field in _ROUTE_COVERAGE_COUNTERS},
+        "tick_counts":{field:ticks(field) for field in _ROUTE_COVERAGE_COUNTERS},
+        "validated_now":valid,"flush_sec":ROUTE_COVERAGE_FLUSH_SEC,
+        "storage_rows_per_day":total,
+    }
 
 # ---------- MEXC market discovery ----------
 def save_market_cache(markets):
@@ -1613,7 +1805,8 @@ def initialize_live_journal():
           leg1_post_http_ms REAL, leg2_post_http_ms REAL,
           leg1_http_queue_ms REAL, leg2_http_queue_ms REAL,
           leg1_confirm_ms INTEGER, leg2_confirm_ms INTEGER,
-          leg1_prepare_journal_ms REAL, leg2_prepare_journal_ms REAL
+          leg1_prepare_journal_ms REAL, leg2_prepare_journal_ms REAL,
+          leg2_guard_edge REAL
         );
         CREATE INDEX IF NOT EXISTS idx_live_attempts_day ON live_attempts_v240(day,created_ts_ms);
         CREATE TABLE IF NOT EXISTS live_orders_v240(
@@ -1640,7 +1833,8 @@ def initialize_live_journal():
         for name,decl in (("admission_to_leg1_post_ms","INTEGER"),("leg1_post_http_ms","REAL"),
             ("leg2_post_http_ms","REAL"),("leg1_http_queue_ms","REAL"),("leg2_http_queue_ms","REAL"),
             ("leg1_confirm_ms","INTEGER"),("leg2_confirm_ms","INTEGER"),
-            ("leg1_prepare_journal_ms","REAL"),("leg2_prepare_journal_ms","REAL")):
+            ("leg1_prepare_journal_ms","REAL"),("leg2_prepare_journal_ms","REAL"),
+            ("leg2_guard_edge","REAL")):
             if name not in existing: con.execute(f"ALTER TABLE live_attempts_v240 ADD COLUMN {name} {decl}")
         order_existing={r[1] for r in con.execute("PRAGMA table_info(live_orders_v240)")}
         for name,decl in (("price","TEXT"),("request_started_ts_ms","INTEGER"),
@@ -1649,7 +1843,7 @@ def initialize_live_journal():
             ("fallback_index","INTEGER")):
             if name not in order_existing: con.execute(f"ALTER TABLE live_orders_v240 ADD COLUMN {name} {decl}")
         con.commit()
-        # Preserve still-valid V2.4.2 route probes on the first V2.4.3 start.
+        # Preserve still-valid route probes on the first V2.4.4 start.
         # Set LIVE_IMPORT_CAPABILITIES_DB="" to deliberately start empty.
         try:
             cap_count=con.execute("SELECT COUNT(*) FROM live_route_capabilities_v241").fetchone()[0]
@@ -1873,7 +2067,7 @@ def live_order_spec(symbol, frm, to, input_units, market, meta, client_order_id,
 def _live_client_id(attempt_id, purpose, variant=""):
     tag={"leg1":"L1","leg2":"L2","unwind":"UW"}.get(purpose,"OR")
     vt={"MARKET":"M","FILL_OR_KILL":"F","IMMEDIATE_OR_CANCEL":"I"}.get(str(variant).upper(),"")
-    return ("v243"+tag+vt+attempt_id.replace("-","")[-22:])[:32]
+    return ("v244"+tag+vt+attempt_id.replace("-","")[-22:])[:32]
 
 
 def _live_attempt_insert_values(q, requested_usd, x, attempt_id=None, status="prepared"):
@@ -1902,7 +2096,7 @@ _LIVE_ATTEMPT_COLUMNS={"status","input_units","mid_acquired","mid_used","output_
     "leg2_order_type","unwind_order_type","admission_to_leg1_post_ms","leg1_post_http_ms",
     "leg2_post_http_ms","leg1_http_queue_ms","leg2_http_queue_ms",
     "leg1_confirm_ms","leg2_confirm_ms","leg1_prepare_journal_ms",
-    "leg2_prepare_journal_ms"}
+    "leg2_prepare_journal_ms","leg2_guard_edge"}
 
 
 def _live_attempt_update(attempt_id, **values):
@@ -2060,7 +2254,9 @@ def _order_commissions(trades):
 def _order_effects(order, commissions, market, side, commission_known=True):
     base,quote=market["base"],market["quote"]; executed,cum_quote=_order_numbers(order)
     if side=="BUY":
-        safe_input=cum_quote+commissions.get(quote,0.0) if commission_known else cum_quote*(1.0+LIVE_FEE_SAFETY)
+        # Unknown commission: reserve one conservative haircut on the acquired
+        # asset only. Inflating input *and* shrinking output counted 0.20% twice.
+        safe_input=cum_quote+commissions.get(quote,0.0) if commission_known else cum_quote
         safe_output=max(0.0,executed-commissions.get(base,0.0)) if commission_known else executed*(1.0-LIVE_FEE_SAFETY)
         return {"input":safe_input,"output":safe_output,
                 "executed_qty":executed,"quote_qty":cum_quote}
@@ -2364,6 +2560,108 @@ def _live_test_attempt(q, attempt_id, x, quality, requested_usd, balances, meta)
     return "test_validated",r1["latency_ms"],r2["latency_ms"],None
 
 
+def _prevalidation_test_best(route_id, leg, purpose, symbol, frm, to, input_units, market, meta):
+    """Probe one order shape on a dedicated TEST-only HTTP session."""
+    if live_prevalidation_client is None:
+        raise MexcAPIError("Client de prévalidation indisponible")
+    nonce=uuid.uuid4().hex
+    candidates=live_order_candidates(symbol,frm,to,input_units,market,meta,
+        lambda order_type:("v244PV"+str(leg)+order_type[:1]+nonce[-22:])[:32],
+        age_limit_ms=LIVE_PREVALIDATE_DEPTH_AGE_MS)
+    errors=[]
+    for fallback_index,spec in enumerate(candidates):
+        spec["fallback_index"]=fallback_index
+        try:
+            _,timing=live_prevalidation_client.new_order(
+                spec["symbol"],spec["side"],spec["order_type"],spec["client_order_id"],
+                quantity=spec.get("quantity"),quote_order_qty=spec.get("quote_order_qty"),
+                price=spec.get("price"),test=True,with_timing=True)
+            return spec,float(timing.get("http_ms") or 0.0)
+        except Exception as exc:
+            errors.append(f"{spec['order_type']}/{spec['amount_mode']}: {exc}")
+    raise MexcAPIError(f"Prévalidation impossible pour {purpose} {symbol}: " + " | ".join(errors))
+
+
+def _route_needs_prevalidation(route_id, ts=None):
+    ts=int(ts or now_ms())
+    with live_lock: item=live_route_capabilities.get(route_id)
+    if not item: return True
+    return ts-int(item.get("validated_ts_ms") or 0)>=int(LIVE_PREVALIDATE_REFRESH_HOURS*3600000)
+
+
+def _prevalidate_route(route):
+    """Validate leg1/leg2/unwind syntax without requiring an arbitrage signal."""
+    if not _route_needs_prevalidation(route["id"]): return "recent",None
+    with state_lock: books=dict(state["bbo"]); meta=state["market_meta"]
+    x=route_calc(route,books,meta,age_limit_ms=LIVE_PREVALIDATE_DEPTH_AGE_MS)
+    if not x: return "depth",None
+    requested=min(LIVE_CAP_USD,LIVE_CAPITAL_LIMIT_USD,float(x.get("size") or 0.0))
+    if requested<MIN_EXEC_USD: return "size",None
+    start,mid,end=route["path"]; input_units=requested/max(float(x["start_mark"]),1e-12)
+    fill1=depth_walk(route["symbols"][0],start,mid,input_units,meta,
+                     age_limit_ms=LIVE_PREVALIDATE_DEPTH_AGE_MS)
+    if not fill1 or fill1.get("fill_ratio",0)<0.999999: return "depth",None
+    http_total=0.0
+    spec1,ms=_prevalidation_test_best(route["id"],1,"leg1",route["symbols"][0],
+        start,mid,input_units,meta[route["symbols"][0]],meta); http_total+=ms
+    spec2,ms=_prevalidation_test_best(route["id"],2,"leg2",route["symbols"][1],
+        mid,end,fill1["output"],meta[route["symbols"][1]],meta); http_total+=ms
+    unwind,ms=_prevalidation_test_best(route["id"],3,"unwind",route["symbols"][0],
+        mid,start,fill1["output"],meta[route["symbols"][0]],meta); http_total+=ms
+    _save_route_capability(route["id"],f"prevalidate:{route['id']}@{now_ms()}",spec1,spec2,unwind)
+    return "validated",http_total
+
+
+def live_prevalidation_worker():
+    """Progressively cover all 800 routes in TEST, fully outside the order path."""
+    if not LIVE_PREVALIDATE_ENABLED or TRADING_MODE!="test" or live_prevalidation_client is None:
+        return
+    with live_lock: prevalidation_runtime["running"]=True
+    while True:
+        with state_lock: routes=list(state.get("routes") or [])
+        # Untested routes first; old capabilities are renewed before 72 h.
+        with live_lock:
+            routes.sort(key=lambda r:int((live_route_capabilities.get(r["id"]) or {}).get("validated_ts_ms") or 0))
+            prevalidation_runtime["cycle_started_ts_ms"]=now_ms()
+            prevalidation_runtime["cycle_completed_ts_ms"]=None
+            prevalidation_runtime["checked"]=0
+        api_calls=0
+        for route in routes:
+            if TRADING_MODE!="test": return
+            with live_lock:
+                prevalidation_runtime["checked"]+=1
+                busy=bool(live_runtime.get("busy"))
+            if busy:
+                time.sleep(0.10)
+                continue
+            if not _route_needs_prevalidation(route["id"]): continue
+            try:
+                status,latency=_prevalidate_route(route)
+                with live_lock:
+                    prevalidation_runtime["last_route"]=route["id"]
+                    prevalidation_runtime["last_status"]=status
+                    prevalidation_runtime["last_latency_ms"]=latency
+                    prevalidation_runtime["last_error"]=None
+                    if status=="validated": prevalidation_runtime["validated"]+=1
+                    elif status=="depth": prevalidation_runtime["skipped_depth"]+=1
+                    elif status=="size": prevalidation_runtime["skipped_size"]+=1
+                if status=="validated":
+                    api_calls+=3
+                    time.sleep(LIVE_PREVALIDATE_INTERVAL_SEC)
+            except Exception as exc:
+                with live_lock:
+                    prevalidation_runtime["errors"]+=1
+                    prevalidation_runtime["last_route"]=route["id"]
+                    prevalidation_runtime["last_status"]="error"
+                    prevalidation_runtime["last_error"]=str(exc)[:500]
+                # An endpoint/rate error gets the same conservative pacing.
+                time.sleep(LIVE_PREVALIDATE_INTERVAL_SEC)
+        with live_lock: prevalidation_runtime["cycle_completed_ts_ms"]=now_ms()
+        # Fast no-Depth passes must not spin; completed coverage is revisited
+        # periodically to catch quiet books and capabilities approaching 72 h.
+        time.sleep(30.0 if api_calls else 10.0)
+
+
 def _live_real_attempt(q, attempt_id, x, quality, requested_usd, balances, meta):
     route=q["route"]; start,mid,end=route["path"]; sm=x["start_mark"]
     capability=_route_capability(route["id"])
@@ -2392,15 +2690,16 @@ def _live_real_attempt(q, attempt_id, x, quality, requested_usd, balances, meta)
     mid_acquired=e1["output"]; l2id=_live_client_id(attempt_id,"leg2")
     mid_used=0.0; end_out=0.0; r2=None; leg2_error=None
     try:
-        # Recompute leg 2 from the exact acquired intermediate balance. If the
-        # complete route no longer clears 0.35%, unwind instead of chasing it.
+        # Recompute leg 2 from the acquired intermediate balance after exactly
+        # one 0.20% conservative haircut. Continue at >=0.15%; otherwise unwind.
         fill2=depth_walk(route["symbols"][1],mid,end,mid_acquired,meta,age_limit_ms=LIVE_BBO_AGE_MS)
         if not fill2 or fill2.get("fill_ratio",0)<0.999999: raise MexcAPIError("Jambe 2 devenue inexécutable")
         with state_lock: live_books=dict(state["bbo"])
         input_usd_guard=e1["input"]*stable_mark_usdt(start,live_books,meta)
         output_usd_guard=fill2["output"]*stable_mark_usdt(end,live_books,meta)
         guard_edge=output_usd_guard/max(input_usd_guard,1e-12)-1.0
-        if guard_edge<SHADOW_MIN_EDGE: raise MexcAPIError(f"Edge après jambe 1 insuffisant: {guard_edge*100:.4f}%")
+        if guard_edge<LIVE_LEG2_MIN_EDGE:
+            raise MexcAPIError(f"Edge après jambe 1 insuffisant: {guard_edge*100:.4f}% < {LIVE_LEG2_MIN_EDGE*100:.4f}%")
         spec2=live_order_spec(route["symbols"][1],mid,end,mid_acquired,meta[route["symbols"][1]],meta,l2id,capability["leg2"])
         prep2=_live_prepare_followup_order(attempt_id,2,"leg2",spec2,status="leg2_submitting",
             input_units=e1["input"],mid_acquired=mid_acquired,leg1_client_id=l1id,leg2_client_id=l2id,
@@ -2410,7 +2709,7 @@ def _live_real_attempt(q, attempt_id, x, quality, requested_usd, balances, meta)
             leg1_confirm_ms=r1.get("confirm_ms"),leg1_prepare_journal_ms=prep1,
             t0_to_leg1_submit_ms=max(0,int(r1.get("request_started_ts_ms") or t0)-t0),
             admission_to_leg1_post_ms=max(0,int(r1.get("request_started_ts_ms") or admitted_ts)-admitted_ts),
-            t0_to_leg1_done_ms=max(0,l1_done-t0))
+            t0_to_leg1_done_ms=max(0,l1_done-t0),leg2_guard_edge=guard_edge)
         spec2["_prepare_journal_ms"]=prep2
         r2=_submit_live_order(attempt_id,2,"leg2",spec2,False,prepared=True)
         e2=_order_effects(r2["order"],r2["commissions"],meta[route["symbols"][1]],spec2["side"],r2["commission_known"])
@@ -2461,6 +2760,7 @@ def _live_real_attempt(q, attempt_id, x, quality, requested_usd, balances, meta)
         t0_to_leg1_done_ms=max(0,l1_done-t0),
         leg1_done_to_leg2_submit_ms=(max(0,int(r2.get("request_started_ts_ms") or l1_done)-l1_done) if r2 else None),
         t0_to_done_ms=max(0,now_ms()-t0),
+        leg2_guard_edge=guard_edge if 'guard_edge' in locals() else None,
         error=str(leg2_error)[:1000] if leg2_error else None)
     return status,r1["latency_ms"],r2["latency_ms"] if r2 else None,pnl
 
@@ -2496,6 +2796,7 @@ def _schedule_bot_shadows_from_gateway(q, x, quality, admitted_ts, route_tested)
         bot_shadow_route_last_trade[rid]=admitted_ts; bot_shadow_route_neutral_since.pop(rid,None)
         with pending_lock: pending_shadow_trials.extend(qs)
     with live_lock: live_runtime["bot_shadow_admissions"]+=1
+    _coverage_mark_bot(rid)
     return len(qs)
 
 
@@ -2804,7 +3105,7 @@ def live_http_keepalive_worker():
 
 
 def initialize_live_gateway():
-    global live_client,live_account_client
+    global live_client,live_account_client,live_prevalidation_client
     initialize_live_journal()
     load_live_state()
     _load_route_capabilities()
@@ -2824,8 +3125,12 @@ def initialize_live_gateway():
         persist_live_state(); return
     live_client=MexcPrivateClient(MEXC_API_KEY,MEXC_API_SECRET,role="orders")
     live_account_client=MexcPrivateClient(MEXC_API_KEY,MEXC_API_SECRET,role="account")
+    if TRADING_MODE=="test" and LIVE_PREVALIDATE_ENABLED:
+        live_prevalidation_client=MexcPrivateClient(MEXC_API_KEY,MEXC_API_SECRET,role="prevalidation")
     try:
-        live_client.sync_time(); live_account_client.sync_time(); _refresh_live_account(); persist_live_state()
+        live_client.sync_time(); live_account_client.sync_time()
+        if live_prevalidation_client is not None: live_prevalidation_client.sync_time()
+        _refresh_live_account(); persist_live_state()
     except Exception as exc:
         with live_lock: live_runtime["api_ok"]=False; live_runtime["last_error"]=str(exc)[:500]
         persist_live_state(); logerr(f"private API startup: {exc}")
@@ -2833,6 +3138,8 @@ def initialize_live_gateway():
     threading.Thread(target=live_account_worker,daemon=True).start()
     threading.Thread(target=live_http_keepalive_worker,daemon=True).start()
     threading.Thread(target=bot_shadow_schedule_worker,daemon=True).start()
+    if live_prevalidation_client is not None:
+        threading.Thread(target=live_prevalidation_worker,daemon=True).start()
 
 
 def _runtime_series_stats(series, unit="ms"):
@@ -2849,6 +3156,7 @@ def live_status():
         out={k:v for k,v in live_runtime.items() if k!="balances"}; out["balances"]={k:dict(v) for k,v in live_runtime.get("balances",{}).items()}
         validated_routes=sum(int(v.get("expires_ts_ms") or 0)>=now_ms() for v in live_route_capabilities.values())
         account_ts=live_runtime.get("account_ts_ms")
+        prevalidation=dict(prevalidation_runtime)
     retry_window=LIVE_EXEC_RETRY_WINDOW_MS if TRADING_MODE=="live" else LIVE_RETRY_WINDOW_MS
     retry_interval=LIVE_EXEC_RETRY_INTERVAL_MS if TRADING_MODE=="live" else LIVE_RETRY_INTERVAL_MS
     retry_max=LIVE_EXEC_RETRY_MAX if TRADING_MODE=="live" else LIVE_RETRY_MAX
@@ -2856,9 +3164,11 @@ def live_status():
         "capital_limit_usd":LIVE_CAPITAL_LIMIT_USD,"daily_loss_limit_usd":LIVE_DAILY_LOSS_LIMIT_USD,
         "max_concurrent":LIVE_MAX_CONCURRENT,"bbo_age_ms":LIVE_BBO_AGE_MS,"max_skew_ms":LIVE_MAX_SKEW_MS,
         "fee_safety_pct":LIVE_FEE_SAFETY*100,
+        "leg2_min_edge_pct":LIVE_LEG2_MIN_EDGE*100,
         "defer_leg1_commission":LIVE_DEFER_LEG1_COMMISSION,
         "protected_bags":PROTECT_EXISTING_BAGS,"allowed_start_assets":MEXC_ALLOWED_START_ASSETS,
-        "automatic_rebalancing":False,"require_tested_route":LIVE_REQUIRE_TESTED_ROUTE,
+        "automatic_rebalancing":False,"bot_shadow_rebalancing":BOT_SHADOW_REBALANCE_ENABLED,
+        "require_tested_route":LIVE_REQUIRE_TESTED_ROUTE,
         "test_max_age_hours":LIVE_TEST_MAX_AGE_HOURS,"validated_routes":validated_routes,
         "require_all_ws":LIVE_REQUIRE_ALL_WS,"require_route_ws":LIVE_REQUIRE_ROUTE_WS,
         "retry_window_ms":retry_window,"retry_interval_ms":retry_interval,"retry_max":retry_max,
@@ -2870,6 +3180,9 @@ def live_status():
         "account_refresh_sec":LIVE_ACCOUNT_REFRESH_SEC,"account_cache_max_age_ms":LIVE_ACCOUNT_CACHE_MAX_AGE_MS,
         "live_journal_path":LIVE_DB_PATH,"http_keepalive_sec":LIVE_HTTP_KEEPALIVE_SEC,
         "http_keepalive_timeout_sec":LIVE_HTTP_KEEPALIVE_TIMEOUT_SEC,
+        "prevalidation":prevalidation,
+        "prevalidation_interval_sec":LIVE_PREVALIDATE_INTERVAL_SEC,
+        "prevalidation_refresh_hours":LIVE_PREVALIDATE_REFRESH_HOURS,
         "account_cache_age_ms":max(0,now_ms()-int(account_ts)) if account_ts else None,
         "first_check_latency":_runtime_series_stats(live_gateway_first_check_ms),
         "gateway_admit_latency":_runtime_series_stats(live_gateway_admit_ms),
@@ -3218,10 +3531,14 @@ def settle_shadow_trade(q,exec_ts):
         age_limit=LIVE_BBO_AGE_MS if is_bot_shadow_profile(profile) else PRIMARY_BBO_AGE_MS
         fill2=depth_walk(sym2,mid,e,mid_total,meta,age_limit_ms=age_limit)
         if is_bot_shadow_profile(profile):
-            # Mirror the real post-leg1 guard: only submit leg 2 if the exact
-            # acquired amount remains completely executable above 0.35%.
-            predicted=(fill2["output"]*stable_mark_usdt(e,books,meta)/max(input_usd,1e-12)-1.0) if fill2 and fill2.get("fill_ratio",0)>=0.999999 else -1.0
-            if predicted<SHADOW_MIN_EDGE: fill2=None
+            # Mirror the live guard without altering final Shadow accounting:
+            # test one 0.20% total haircut on the modeled leg-1 gross output,
+            # then allow leg 2 only while the conservative route keeps >=0.15%.
+            gross_mid=float(leg1.get("gross_output") or 0.0)
+            guard_mid=gross_mid*(1.0-LIVE_FEE_SAFETY)
+            guard_fill2=depth_walk(sym2,mid,e,guard_mid,meta,age_limit_ms=age_limit)
+            predicted=(guard_fill2["output"]*stable_mark_usdt(e,books,meta)/max(input_usd,1e-12)-1.0) if guard_fill2 and guard_fill2.get("fill_ratio",0)>=0.999999 else -1.0
+            if predicted<LIVE_LEG2_MIN_EDGE: fill2=None
         leg2_used=fill2["input_used"] if fill2 else 0.0; end_out=fill2["output"] if fill2 else 0.0
         remaining=max(0.0,mid_total-leg2_used); unwind=depth_walk(sym1,mid,s,remaining,meta,age_limit_ms=age_limit) if remaining>1e-12 else None
         unwind_used=unwind["input_used"] if unwind else 0.0; start_back=unwind["output"] if unwind else 0.0; open_units=max(0.0,remaining-unwind_used)
@@ -3279,6 +3596,8 @@ def _shadow_weight_snapshot(profile, books, meta):
 
 def shadow_target_rebalance(profile, reason):
     """Virtual periodic rebalance through real local stablecoin Depth. Never touches reserved funds or open exposures."""
+    if is_bot_shadow_profile(profile) and not BOT_SHADOW_REBALANCE_ENABLED:
+        return False
     with shadow_lock:
         st=ensure_shadow_day(profile)
         if any(v>1e-9 for v in shadow_reserved[profile].values()) or shadow_open_exposures[profile]:
@@ -3324,7 +3643,7 @@ def shadow_periodic_rebalance_worker():
     while True:
         time.sleep(5.0); ts=now_ms()
         for profile in SHADOW_PROFILES:
-            if is_bot_shadow_profile(profile): continue
+            if is_bot_shadow_profile(profile) and not BOT_SHADOW_REBALANCE_ENABLED: continue
             last_check=shadow_last_rebalance_check_ms.get(profile,0)
             if ts-last_check < SHADOW_REBALANCE_CHECK_SEC*1000: continue
             shadow_last_rebalance_check_ms[profile]=ts
@@ -3464,6 +3783,8 @@ def schedule_decision(route,x,ts,event_start_ts):
     if _policy_reason=="base_eligible":
         quality=depth_quality_decision(route,x)
         _policy_reason=quality["reason"]
+    if quality_due:
+        _coverage_mark_quality(rid,quality)
     # Private gateway gets the same A/B+ signal but performs a fresh, stricter
     # 50 ms validation before touching either /order/test or the real endpoint.
     # It is queued before research persistence/capture work so an 8 ms freshness
@@ -3602,6 +3923,7 @@ def process_route(route,ts):
     with state_lock:
         books=dict(state["bbo"]); meta=state["market_meta"]
     x=route_calc(route,books,meta)
+    _coverage_observe(route,x,ts)
     with state_lock:
         if x: state["latest_routes"][route["id"]]={"ts":ts,"net":x["net"],"size":x["size"],"type":route["type"],"max_age":x["max_age"]}
     key=route["id"]
@@ -4121,6 +4443,7 @@ def api_status():
                  "recent_decisions":cached.get("recent_decisions",[]),"shadows":cached.get("shadows",{}),"quality":cached.get("quality",{}),
                  "admissions":cached.get("admissions",{}),"shadow_skips":cached.get("shadow_skips",{}),"health":runtime_health(now),
                  "live":live_status(),"live_funnel":cached.get("live_funnel",{}),
+                 "coverage":route_coverage_status(),
                  "shadow_profiles":{k:{"leg1_ms":v[0],"leg2_ms":v[1]} for k,v in SHADOW_PROFILES.items()},
                  "v235_policy":{"edge_min_pct":SHADOW_MIN_EDGE*100,"target_weights":SHADOW_TARGET_WEIGHTS,
                     "rebalance_check_min":SHADOW_REBALANCE_CHECK_SEC/60,"rebalance_max_h":SHADOW_REBALANCE_MAX_SEC/3600,
@@ -4129,15 +4452,18 @@ def api_status():
                     "a_fraction_pct":DEPTH_QUALITY_A_FRACTION*100,"b_fraction_pct":DEPTH_QUALITY_B_FRACTION*100,
                     "bplus_half_edge_pct":DEPTH_QUALITY_BPLUS_HALF_EDGE*100,"bplus_drop_floor_pct":DEPTH_QUALITY_BPLUS_DROP_FLOOR*100,
                     "coverage3_min":DEPTH_QUALITY_COVERAGE3_MIN,"absolute_cap_usd":SHADOW_TRADE_CAP_USD,
+                    "leg2_min_edge_pct":LIVE_LEG2_MIN_EDGE*100,"fee_safety_pct":LIVE_FEE_SAFETY*100,
+                    "bot_shadow_rebalance":BOT_SHADOW_REBALANCE_ENABLED,
                     "replay_min_edge_pct":REPLAY_MIN_EDGE*100,"online_research_trials":ENABLE_ONLINE_RESEARCH_TRIALS,
                     "event_neutral_close_ms":EVENT_NEUTRAL_CLOSE_MS},
                  "v235_capture":cached.get("v235_capture",{})})
     return jsonify(base)
 
-HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MEXC 2-Leg V2.4.3</title>
+HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MEXC 2-Leg V2.4.4</title>
 <style>body{background:#090d14;color:#e8edf5;font-family:system-ui;margin:0;padding:16px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.c,.panel{background:#111827;border:1px solid #273248;border-radius:10px;padding:12px}.v{font-weight:800;font-size:20px}.big{font-size:28px}.muted{color:#9aa7bd;font-size:12px}.good{color:#22d38a}.bad{color:#ff6677}.panel{margin-top:12px;overflow:auto}.latency{display:grid;grid-template-columns:repeat(3,minmax(250px,1fr));gap:10px}.latbox{background:#0c1421;border:1px solid #2a3850;border-radius:10px;padding:12px}.balance{margin-top:8px;line-height:1.7}.metricgrid{display:grid;grid-template-columns:repeat(2,minmax(95px,1fr));gap:7px;margin-top:10px}.metric{background:#111b2b;border-radius:8px;padding:8px}.tag{display:inline-block;border:1px solid #334155;border-radius:999px;padding:3px 7px;font-size:11px;color:#bac6d8}table{border-collapse:collapse;width:100%;font-size:12px}th,td{padding:8px;border-bottom:1px solid #263044;text-align:right}th:first-child,td:first-child{text-align:left}@media(max-width:900px){.latency{grid-template-columns:1fr}}</style></head><body>
-<h2>MEXC — Scanner + micro-bot Spot 2-leg V2.4.3</h2><div class=cards id=cards></div>
+<h2>MEXC — Scanner + micro-bot Spot 2-leg V2.4.4</h2><div class=cards id=cards></div>
 <div class=panel id=health></div>
+<div class=panel id=coverage></div>
 <div class=panel id=live></div>
 <div class=panel id=livefunnel></div>
 <div class=panel id=botlatencies></div>
@@ -4147,16 +4473,21 @@ HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" 
 <div class=panel><h3>Décisions récentes — Depth Quality à T0</h3><table><thead><tr><th>Heure</th><th>Route</th><th>Edge T0</th><th>Classe</th><th>Taille retenue</th><th>Edge −50% BBO</th><th>Edge sans L1</th><th>Réserve L1–L3</th><th>Calcul</th></tr></thead><tbody id=recent></tbody></table></div>
 <div class=panel id=capture></div><div class=panel id=diag></div>
 <script>
-async function refresh(){let d=await fetch('/api/status').then(r=>r.json()),g=d.diag,p=d.v235_policy||{},cap=d.v235_capture||{},ql=d.quality||{},ad=d.admissions||{},sk=d.shadow_skips||{},he=d.health||{},lv=d.live||{},lf=d.live_funnel||{},la=lv.arm||{};
+async function refresh(){let d=await fetch('/api/status').then(r=>r.json()),g=d.diag,p=d.v235_policy||{},cap=d.v235_capture||{},ql=d.quality||{},ad=d.admissions||{},sk=d.shadow_skips||{},he=d.health||{},lv=d.live||{},lf=d.live_funnel||{},la=lv.arm||{},cv=d.coverage||{},rc=cv.route_counts||{},tc=cv.tick_counts||{},pv=lv.prevalidation||{};
 document.getElementById('cards').innerHTML=`<div class=c><div class=v>${d.symbols}</div><div class=muted>marchés WS</div></div><div class=c><div class=v>${d.routes}</div><div class=muted>routes 2-leg</div></div><div class=c><div class=v>${d.ws}/${d.ws_expected}</div><div class=muted>WebSockets</div></div><div class=c><div class=v>${d.age_ms??'-'} ms</div><div class=muted>dernier BBO reçu</div></div><div class=c><div class=v>${d.depth_ready||0}/${d.symbols}</div><div class=muted>carnets Depth prêts</div></div><div class=c><div class=v>${d.v22?.decisions||0}</div><div class=muted>décisions replay ≥${(p.replay_min_edge_pct??0.30).toFixed(2)}%</div></div><div class=c><div class=v>${d.v22?.trace_points||0}</div><div class=muted>points trajectoire</div></div>`;
 let wsok=(he.ws_connected===he.ws_expected)&&(he.stale_workers||0)===0&&(he.workers_without_pong||0)===0&&(d.depth_ready===d.symbols)&&(he.resync_pending||0)===0;document.getElementById('health').innerHTML=`<div class=tag>SANTÉ TEMPS RÉEL</div><h3 class='${wsok?'good':'bad'}'>WebSockets ${he.ws_connected||0}/${he.ws_expected||0} · ${he.stale_workers||0} silencieux &gt;30 s</h3><div class=cards><div><div class=v>${he.ws_disconnects||0}</div><div class=muted>chutes WS</div></div><div><div class=v>${he.ws_reconnects||0}</div><div class=muted>reconnexions WS</div></div><div><div class=v>${he.ws_app_pings||0} / ${he.ws_app_pongs||0}</div><div class=muted>PING / PONG MEXC</div></div><div><div class=v>${he.max_pong_age_ms==null?'-':he.max_pong_age_ms+' ms'}</div><div class=muted>âge maximal PONG</div></div><div><div class=v>${he.workers_without_pong||0} / ${he.ws_ping_errors||0}</div><div class=muted>PONG en retard / erreurs ping</div></div><div><div class=v>${he.max_worker_message_age_ms==null?'-':he.max_worker_message_age_ms+' ms'}</div><div class=muted>silence maximal worker WS</div></div><div><div class=v>${he.depth_book_age_p95_ms==null?'-':he.depth_book_age_p95_ms+' ms'}</div><div class=muted>âge Depth p95</div></div><div><div class=v>${he.depth_book_age_max_ms==null?'-':he.depth_book_age_max_ms+' ms'}</div><div class=muted>âge Depth maximum prêt</div></div><div><div class=v>${he.depth_gap_events||0}</div><div class=muted>gaps Depth hors bootstrap</div></div><div><div class=v>${he.depth_resync_failures||0}</div><div class=muted>échecs resync</div></div><div><div class=v>${he.resync_queue||0}/${he.resync_pending||0}</div><div class=muted>file/pending resync</div></div><div><div class=v>${he.scan_queue||0}/${he.scan_queue_capacity||0}</div><div class=muted>file scan</div></div><div><div class=v>${he.scan_queue_drops||0}</div><div class=muted>abandons file scan</div></div><div><div class=v>${he.scan_coalesced||0}</div><div class=muted>updates fusionnées</div></div><div><div class=v>${he.db_queue||0}/${he.db_queue_capacity||0}</div><div class=muted>file DB</div></div><div><div class=v>${he.db_queue_drops||0}</div><div class=muted>abandons DB</div></div><div><div class=v>${((he.db_size_bytes||0)/1048576).toFixed(0)} / ${((he.db_wal_size_bytes||0)/1048576).toFixed(0)} MB</div><div class=muted>base / WAL</div></div><div><div class=v>${he.research_pending||0} / ${he.depth_capture_pending||0}</div><div class=muted>matrice live / captures pending</div></div><div><div class='v ${(he.shadow_overdue||0)===0?'good':'bad'}'>${he.shadow_pending||0} / ${he.shadow_overdue||0}</div><div class=muted>pending Shadow / en retard</div></div><div><div class=v>${he.shadow_execution_lag?.p95_ms==null?'-':he.shadow_execution_lag.p95_ms+' ms'}</div><div class=muted>retard worker Shadow p95</div></div><div><div class=v>${he.dashboard_cache_age_ms==null?'-':Math.round(he.dashboard_cache_age_ms/1000)+' s'}</div><div class=muted>âge statistiques page</div></div><div><div class=v>${he.dashboard_refresh_ms==null?'-':he.dashboard_refresh_ms+' ms'}</div><div class=muted>durée calcul statistiques</div></div></div>`;
-let lb=Object.entries(lv.balances||{}).filter(([a])=>(lv.allowed_start_assets||[]).includes(a)).map(([a,v])=>`${a} <b>${Number(v.free||0).toFixed(4)}</b>`).join(' · '),liveok=la.effective&&!lv.circuit_open,mode=(lv.configured_mode||'shadow').toUpperCase();document.getElementById('live').innerHTML=`<div class=tag>PASSERELLE PRIVÉE V2.4.3</div><h3 class='${liveok?'good':(mode==='SHADOW'?'':'bad')}'>Mode ${mode} · ${la.reason||'-'}</h3><div class=cards><div><div class=v>${lv.api_ok?'OK':'NON'}</div><div class=muted>API privée / canTrade</div></div><div><div class=v>${Number(lv.cap_usd||0).toFixed(0)} $</div><div class=muted>cap par ordre initial</div></div><div><div class=v>${Number(lv.capital_limit_usd||0).toFixed(0)} $</div><div class=muted>capital dédié maximal</div></div><div><div class=v>${Number(lv.daily_loss_limit_usd||0).toFixed(0)} $</div><div class=muted>coupe-circuit perte journalière</div></div><div><div class=v>${lv.validated_routes||0}</div><div class=muted>routes directionnelles valides</div></div><div><div class=v>${lv.test_validations||0}</div><div class=muted>validations /order/test aujourd'hui</div></div><div><div class=v>${lv.capability_reuses||0}</div><div class=muted>validations réutilisées</div></div><div><div class=v>${lv.completed||0}</div><div class=muted>trades réels terminés</div></div><div><div class=v>${lv.wins||0} / ${lv.losses||0}</div><div class=muted>gagnés / perdus réels</div></div><div><div class='v ${(lv.realized_pnl||0)>=0?'good':'bad'}'>${(lv.realized_pnl||0)>=0?'+':''}${Number(lv.realized_pnl||0).toFixed(4)} $</div><div class=muted>PnL réel journalisé</div></div><div><div class=v>${lv.busy?'1':'0'} / ${lv.queued||0}</div><div class=muted>actif / en file</div></div><div><div class=v>${lv.first_check_latency?.p95_ms==null?'-':lv.first_check_latency.p95_ms+' ms'}</div><div class=muted>T0 → premier contrôle p95</div></div><div><div class=v>${lv.gateway_admit_latency?.p95_ms==null?'-':lv.gateway_admit_latency.p95_ms+' ms'}</div><div class=muted>T0 → admission fraîche p95</div></div><div><div class=v>${lv.admission_to_post?.p95_ms==null?'-':lv.admission_to_post.p95_ms+' ms'}</div><div class=muted>admission → POST jambe 1 p95</div></div><div><div class=v>${lv.leg1_post_http?.p95_ms==null?'-':Number(lv.leg1_post_http.p95_ms).toFixed(1)+' ms'}</div><div class=muted>HTTP POST jambe 1 p95</div></div><div><div class=v>${lv.leg2_post_http?.p95_ms==null?'-':Number(lv.leg2_post_http.p95_ms).toFixed(1)+' ms'}</div><div class=muted>HTTP POST jambe 2 p95</div></div><div><div class=v>${lv.leg1_confirmation?.p95_ms==null?'-':lv.leg1_confirmation.p95_ms+' ms'}</div><div class=muted>POST → confirmation jambe 1 p95 LIVE</div></div><div><div class=v>${lv.leg2_confirmation?.p95_ms==null?'-':lv.leg2_confirmation.p95_ms+' ms'}</div><div class=muted>POST → confirmation jambe 2 p95 LIVE</div></div><div><div class=v>${lv.prepare_journal?.p95_ms==null?'-':Number(lv.prepare_journal.p95_ms).toFixed(1)+' ms'}</div><div class=muted>journal avant ordre p95</div></div><div><div class=v>${lv.response_journal?.p95_ms==null?'-':Number(lv.response_journal.p95_ms).toFixed(1)+' ms'}</div><div class=muted>journal réponse p95</div></div><div><div class=v>${lv.gateway_check_compute?.p95_us==null?'-':Number(lv.gateway_check_compute.p95_us).toFixed(1)+' µs'}</div><div class=muted>contrôle gateway p95</div></div><div><div class=v>${lv.bot_shadow_schedule_lag?.p95_ms==null?'-':lv.bot_shadow_schedule_lag.p95_ms+' ms'}</div><div class=muted>copie Shadow hors chemin p95</div></div><div><div class=v>${lv.last_keepalive_rtt_ms==null?'-':Number(lv.last_keepalive_rtt_ms).toFixed(1)+' ms'}</div><div class=muted>dernier keep-alive HTTP</div></div><div><div class=v>${lv.keepalive_ok||0} / ${lv.keepalive_errors||0}</div><div class=muted>keep-alive OK / erreurs</div></div><div><div class=v>${lv.account_cache_age_ms==null?'-':lv.account_cache_age_ms+' ms'}</div><div class=muted>âge cache compte</div></div></div><div class=muted style='margin-top:10px'>Soldes libres dédiés : ${lb||'-'} · Protection autres actifs ${lv.protected_bags?'active':'inactive'} · Rééquilibrage bot automatique désactivé · Commission jambe 1 différée ${lv.defer_leg1_commission?'oui':'non'} · Circuit ${lv.circuit_open?'OUVERT: '+(lv.circuit_reason||'-'):'fermé'} · journal critique séparé : ${lv.live_journal_path||'-'} · HTTP ordres gardé chaud toutes les ${lv.http_keepalive_sec||'-'} s · route testée dans les ${Number(lv.test_max_age_hours||0).toFixed(0)} h requise : ${lv.require_tested_route?'oui':'non'}. ${mode==='TEST'?'Les requêtes sont envoyées à /api/v3/order/test : aucune entrée dans le carnet et aucun fonds déplacé.':(mode==='LIVE'?'Les ordres réels exigent les trois verrous locaux.':'Passerelle inactive.')}</div>`;
+document.getElementById('coverage').innerHTML=`<div class=tag>AUDIT COMPLET DES ${cv.total_routes||d.routes} ROUTES</div><h3>Couverture reçue → qualité → exécution BOT</h3><div class=cards><div><div class=v>${rc.evaluations||0}/${cv.total_routes||0}</div><div class=muted>routes évaluées aujourd'hui</div></div><div><div class=v>${rc.calculable||0}</div><div class=muted>routes avec deux carnets calculables</div></div><div><div class=v>${rc.research_fresh||0}</div><div class=muted>routes Depth frais ≤${d.primary_age_ms||150} ms</div></div><div><div class=v>${rc.live_fresh||0}</div><div class=muted>routes fraîches passerelle ≤${lv.bbo_age_ms||50} ms</div></div><div><div class=v>${rc.edge_ge_030||0}</div><div class=muted>routes ayant atteint 0,30%</div></div><div><div class=v>${rc.edge_ge_035||0}</div><div class=muted>routes ayant atteint 0,35%</div></div><div><div class=v good>${rc.quality_eligible||0}</div><div class=muted>routes classées A/B+</div></div><div><div class=v>${cv.validated_now||0}</div><div class=muted>routes /order/test valides</div></div><div><div class=v good>${rc.bot_admitted||0}</div><div class=muted>routes arrivées en Shadow BOT</div></div></div><div class=muted style='margin-top:10px'>Observations agrégées : ≥0,30% ${tc.edge_ge_030||0} · ≥0,35% ${tc.edge_ge_035||0} · A/B+ ${tc.quality_eligible||0} (A ${tc.quality_a||0} · B+ ${tc.quality_bplus||0}). Écriture fixe : ${cv.storage_rows_per_day||0} lignes/jour, mise à jour toutes les ${cv.flush_sec||60} s — aucune ligne par tick.</div>`;
+let lb=Object.entries(lv.balances||{}).filter(([a])=>(lv.allowed_start_assets||[]).includes(a)).map(([a,v])=>`${a} <b>${Number(v.free||0).toFixed(4)}</b>`).join(' · '),liveok=la.effective&&!lv.circuit_open,mode=(lv.configured_mode||'shadow').toUpperCase();document.getElementById('live').innerHTML=`<div class=tag>PASSERELLE PRIVÉE V2.4.4</div><h3 class='${liveok?'good':(mode==='SHADOW'?'':'bad')}'>Mode ${mode} · ${la.reason||'-'}</h3><div class=cards><div><div class=v>${lv.api_ok?'OK':'NON'}</div><div class=muted>API privée / canTrade</div></div><div><div class=v>${Number(lv.cap_usd||0).toFixed(0)} $</div><div class=muted>cap par ordre initial</div></div><div><div class=v>${Number(lv.capital_limit_usd||0).toFixed(0)} $</div><div class=muted>capital dédié maximal</div></div><div><div class=v>${Number(lv.daily_loss_limit_usd||0).toFixed(0)} $</div><div class=muted>coupe-circuit perte journalière</div></div><div><div class=v>${lv.validated_routes||0}</div><div class=muted>routes directionnelles valides</div></div><div><div class=v>${lv.test_validations||0}</div><div class=muted>validations opportunité /order/test</div></div><div><div class=v>${lv.capability_reuses||0}</div><div class=muted>validations réutilisées</div></div><div><div class=v>${lv.completed||0}</div><div class=muted>trades réels terminés</div></div><div><div class=v>${lv.wins||0} / ${lv.losses||0}</div><div class=muted>gagnés / perdus réels</div></div><div><div class='v ${(lv.realized_pnl||0)>=0?'good':'bad'}'>${(lv.realized_pnl||0)>=0?'+':''}${Number(lv.realized_pnl||0).toFixed(4)} $</div><div class=muted>PnL réel journalisé</div></div><div><div class=v>${lv.busy?'1':'0'} / ${lv.queued||0}</div><div class=muted>actif / en file</div></div><div><div class=v>${lv.first_check_latency?.p95_ms==null?'-':lv.first_check_latency.p95_ms+' ms'}</div><div class=muted>T0 → premier contrôle p95</div></div><div><div class=v>${lv.gateway_admit_latency?.p95_ms==null?'-':lv.gateway_admit_latency.p95_ms+' ms'}</div><div class=muted>T0 → admission fraîche p95</div></div><div><div class=v>${lv.admission_to_post?.p95_ms==null?'-':lv.admission_to_post.p95_ms+' ms'}</div><div class=muted>admission → POST jambe 1 p95</div></div><div><div class=v>${lv.leg1_post_http?.p95_ms==null?'-':Number(lv.leg1_post_http.p95_ms).toFixed(1)+' ms'}</div><div class=muted>HTTP POST jambe 1 p95</div></div><div><div class=v>${lv.leg2_post_http?.p95_ms==null?'-':Number(lv.leg2_post_http.p95_ms).toFixed(1)+' ms'}</div><div class=muted>HTTP POST jambe 2 p95</div></div><div><div class=v>${lv.leg1_confirmation?.p95_ms==null?'-':lv.leg1_confirmation.p95_ms+' ms'}</div><div class=muted>POST → confirmation jambe 1 p95 LIVE</div></div><div><div class=v>${lv.leg2_confirmation?.p95_ms==null?'-':lv.leg2_confirmation.p95_ms+' ms'}</div><div class=muted>POST → confirmation jambe 2 p95 LIVE</div></div><div><div class=v>${lv.prepare_journal?.p95_ms==null?'-':Number(lv.prepare_journal.p95_ms).toFixed(1)+' ms'}</div><div class=muted>journal avant ordre p95</div></div><div><div class=v>${lv.response_journal?.p95_ms==null?'-':Number(lv.response_journal.p95_ms).toFixed(1)+' ms'}</div><div class=muted>journal réponse p95</div></div><div><div class=v>${lv.gateway_check_compute?.p95_us==null?'-':Number(lv.gateway_check_compute.p95_us).toFixed(1)+' µs'}</div><div class=muted>contrôle gateway p95</div></div><div><div class=v>${lv.bot_shadow_schedule_lag?.p95_ms==null?'-':lv.bot_shadow_schedule_lag.p95_ms+' ms'}</div><div class=muted>copie Shadow hors chemin p95</div></div><div><div class=v>${lv.last_keepalive_rtt_ms==null?'-':Number(lv.last_keepalive_rtt_ms).toFixed(1)+' ms'}</div><div class=muted>dernier keep-alive HTTP</div></div><div><div class=v>${lv.keepalive_ok||0} / ${lv.keepalive_errors||0}</div><div class=muted>keep-alive OK / erreurs</div></div><div><div class=v>${lv.account_cache_age_ms==null?'-':lv.account_cache_age_ms+' ms'}</div><div class=muted>âge cache compte</div></div></div><div class=muted style='margin-top:10px'>Soldes libres dédiés : ${lb||'-'} · Protection autres actifs ${lv.protected_bags?'active':'inactive'} · Rééquilibrage réel désactivé ; Shadows BOT ${lv.bot_shadow_rebalancing?'30 min / 4 h':'désactivé'} · Haircut unique ${Number(lv.fee_safety_pct||0).toFixed(2)}% · jambe 2 seulement si edge conservateur ≥${Number(lv.leg2_min_edge_pct||0).toFixed(2)}% · Commission jambe 1 différée ${lv.defer_leg1_commission?'oui':'non'} · Circuit ${lv.circuit_open?'OUVERT: '+(lv.circuit_reason||'-'):'fermé'} · journal critique séparé : ${lv.live_journal_path||'-'} · HTTP ordres gardé chaud toutes les ${lv.http_keepalive_sec||'-'} s · route testée dans les ${Number(lv.test_max_age_hours||0).toFixed(0)} h requise : ${lv.require_tested_route?'oui':'non'}. ${mode==='TEST'?'Les requêtes sont envoyées à /api/v3/order/test : aucune entrée dans le carnet et aucun fonds déplacé.':(mode==='LIVE'?'Les ordres réels exigent les trois verrous locaux.':'Passerelle inactive.')}</div>`;
 document.getElementById('live').insertAdjacentHTML('beforeend',`<div class=cards style='margin-top:10px'><div><div class=v>${lv.leg1_http_queue?.p95_ms==null?'-':Number(lv.leg1_http_queue.p95_ms).toFixed(1)+' ms'}</div><div class=muted>attente verrou HTTP jambe 1 p95</div></div><div><div class=v>${lv.leg2_http_queue?.p95_ms==null?'-':Number(lv.leg2_http_queue.p95_ms).toFixed(1)+' ms'}</div><div class=muted>attente verrou HTTP jambe 2 p95</div></div><div><div class=v>${Number(lv.http_keepalive_timeout_sec||0).toFixed(2)} s</div><div class=muted>timeout keep-alive HTTP</div></div></div>`);
-let fc={};for(let r of (lf.rows||[])){let k=r.disposition+(r.reason?': '+r.reason:'');fc[k]=(fc[k]||0)+r.n}let fr=(lf.recent||[]).map(x=>`<tr><td>${new Date(x.decision_ts_ms).toLocaleTimeString()}</td><td>${x.route_id}</td><td>${x.grade} → ${x.fresh_grade||'-'}</td><td>${Number(x.selected_usd||0).toFixed(2)} $ → ${x.fresh_selected_usd==null?'-':Number(x.fresh_selected_usd).toFixed(2)+' $'}</td><td>${x.requested_usd==null?'-':Number(x.requested_usd).toFixed(2)+' $'}</td><td>${x.disposition}</td><td>${x.reason||'-'}</td><td>${x.retry_count||0}</td><td>${x.first_check_delay_ms==null?'-':x.first_check_delay_ms+' ms'} / ${x.gateway_delay_ms==null?'-':x.gateway_delay_ms+' ms'}</td><td>${x.route_depth_age_ms==null?'-':x.route_depth_age_ms+' ms'} / ${x.route_depth_skew_ms==null?'-':x.route_depth_skew_ms+' ms'}</td></tr>`).join('');document.getElementById('livefunnel').innerHTML=`<div class=tag>ENTONNOIR BOT V2.4.3</div><h3>Classe initiale → classe fraîche réellement admise</h3><div class=cards><div><div class=v>${lv.validated_routes||0}</div><div class=muted>routes directionnelles valides</div></div><div><div class=v>${lv.bot_shadow_admissions||0}</div><div class=muted>signaux simulation BOT admis</div></div><div><div class=v>${he.ws_disconnects_5m||0} / ${he.ws_disconnects_15m||0} / ${he.ws_disconnects_60m||0}</div><div class=muted>chutes WS sur 5 / 15 / 60 min</div></div><div><div class=v>${lv.last_t0_to_leg1_submit_ms==null?'-':lv.last_t0_to_leg1_submit_ms+' ms'}</div><div class=muted>T0 → POST jambe 1</div></div><div><div class=v>${lv.last_leg1_done_to_leg2_submit_ms==null?'-':lv.last_leg1_done_to_leg2_submit_ms+' ms'}</div><div class=muted>confirmation jambe 1 → POST jambe 2</div></div><div><div class=v>${lv.last_t0_to_done_ms==null?'-':lv.last_t0_to_done_ms+' ms'}</div><div class=muted>T0 → route terminée</div></div></div><div class=muted style='margin-top:10px'>Mode TEST : jusqu'à ${lv.test_retry_max||0} relances / ${lv.test_retry_window_ms||0} ms pour découvrir une route. Mode LIVE : au plus ${lv.live_retry_max||0} relances / ${lv.live_retry_window_ms||0} ms, abandon avant tout POST si T0 dépasse ${lv.max_t0_to_leg1_post_ms||0} ms. Une route déjà validée est réutilisée pendant ${Number(lv.test_max_age_hours||0).toFixed(0)} h sans nouvel /order/test. Cooldown ${Number(lv.hard_cooldown_ms||0)/1000||5} s par crypto intermédiaire ; une autre crypto reste libre. Les six Shadows BOT sont planifiés hors du chemin critique.</div><table><thead><tr><th>Heure</th><th>Route</th><th>Classe T0 → fraîche</th><th>Taille T0 → fraîche</th><th>Demande bot</th><th>Disposition</th><th>Raison</th><th>Retries</th><th>1er contrôle / admission</th><th>Âge / skew Depth</th></tr></thead><tbody>${fr}</tbody></table>`;
+document.getElementById('live').insertAdjacentHTML('beforeend',`<div class=cards style='margin-top:10px'><div><div class=v>${pv.running?'ACTIVE':'OFF'}</div><div class=muted>prévalidation de fond TEST</div></div><div><div class=v>${pv.checked||0}/${cv.total_routes||0}</div><div class=muted>progression cycle courant</div></div><div><div class=v good>${pv.validated||0}</div><div class=muted>routes prévalidées depuis démarrage</div></div><div><div class=v>${pv.skipped_depth||0}/${pv.skipped_size||0}</div><div class=muted>reportées Depth / taille</div></div><div><div class='v ${(pv.errors||0)===0?'good':'bad'}'>${pv.errors||0}</div><div class=muted>erreurs de prévalidation</div></div></div><div class=muted style='margin-top:8px'>Session HTTP dédiée, une route toutes les ${Number(lv.prevalidation_interval_sec||0).toFixed(0)} s ; suspendue automatiquement en LIVE. Le carnet éventuellement ancien sert uniquement à construire la requête syntaxique /order/test : aucune admission BOT ne contourne la fraîcheur stricte de ${lv.bbo_age_ms||50} ms. Dernier état : ${pv.last_route||'-'} · ${pv.last_status||'-'}${pv.last_error?' · '+pv.last_error:''}.</div>`);
+let fc={};for(let r of (lf.rows||[])){let k=r.disposition+(r.reason?': '+r.reason:'');fc[k]=(fc[k]||0)+r.n}let fr=(lf.recent||[]).map(x=>`<tr><td>${new Date(x.decision_ts_ms).toLocaleTimeString()}</td><td>${x.route_id}</td><td>${x.grade} → ${x.fresh_grade||'-'}</td><td>${Number(x.selected_usd||0).toFixed(2)} $ → ${x.fresh_selected_usd==null?'-':Number(x.fresh_selected_usd).toFixed(2)+' $'}</td><td>${x.requested_usd==null?'-':Number(x.requested_usd).toFixed(2)+' $'}</td><td>${x.disposition}</td><td>${x.reason||'-'}</td><td>${x.retry_count||0}</td><td>${x.first_check_delay_ms==null?'-':x.first_check_delay_ms+' ms'} / ${x.gateway_delay_ms==null?'-':x.gateway_delay_ms+' ms'}</td><td>${x.route_depth_age_ms==null?'-':x.route_depth_age_ms+' ms'} / ${x.route_depth_skew_ms==null?'-':x.route_depth_skew_ms+' ms'}</td></tr>`).join('');document.getElementById('livefunnel').innerHTML=`<div class=tag>ENTONNOIR BOT V2.4.4</div><h3>Classe initiale → classe fraîche réellement admise</h3><div class=cards><div><div class=v>${lv.validated_routes||0}</div><div class=muted>routes directionnelles valides</div></div><div><div class=v>${lv.bot_shadow_admissions||0}</div><div class=muted>signaux simulation BOT admis</div></div><div><div class=v>${he.ws_disconnects_5m||0} / ${he.ws_disconnects_15m||0} / ${he.ws_disconnects_60m||0}</div><div class=muted>chutes WS sur 5 / 15 / 60 min</div></div><div><div class=v>${lv.last_t0_to_leg1_submit_ms==null?'-':lv.last_t0_to_leg1_submit_ms+' ms'}</div><div class=muted>T0 → POST jambe 1</div></div><div><div class=v>${lv.last_leg1_done_to_leg2_submit_ms==null?'-':lv.last_leg1_done_to_leg2_submit_ms+' ms'}</div><div class=muted>confirmation jambe 1 → POST jambe 2</div></div><div><div class=v>${lv.last_t0_to_done_ms==null?'-':lv.last_t0_to_done_ms+' ms'}</div><div class=muted>T0 → route terminée</div></div></div><div class=muted style='margin-top:10px'>Mode TEST : jusqu'à ${lv.test_retry_max||0} relances / ${lv.test_retry_window_ms||0} ms pour découvrir une route. Mode LIVE : au plus ${lv.live_retry_max||0} relances / ${lv.live_retry_window_ms||0} ms, abandon avant tout POST si T0 dépasse ${lv.max_t0_to_leg1_post_ms||0} ms. Les capacités sont prévalidées en arrière-plan en TEST puis réutilisées pendant ${Number(lv.test_max_age_hours||0).toFixed(0)} h. Cooldown ${Number(lv.hard_cooldown_ms||0)/1000||5} s par crypto intermédiaire ; une autre crypto reste libre. Les six Shadows BOT sont planifiés hors du chemin critique.</div><table><thead><tr><th>Heure</th><th>Route</th><th>Classe T0 → fraîche</th><th>Taille T0 → fraîche</th><th>Demande bot</th><th>Disposition</th><th>Raison</th><th>Retries</th><th>1er contrôle / admission</th><th>Âge / skew Depth</th></tr></thead><tbody>${fr}</tbody></table>`;
 let sh=d.shadows||{},bf=sh.BOT_FAST||{},bn=['BOT_FAST','BOT_TARGET','BOT_DEGRADED','BOT_100_200','BOT_150_300','BOT_200_400'],bh=`<div class=tag>SIMULATION CONFIG BOT — CAP ${Number(lv.cap_usd||10).toFixed(0)} $</div><h3>6 profils de latence — ${(bf.capital||0).toFixed(0)} $ indépendants, routes validées uniquement</h3><div class=latency>`;for(let n of bn){let x=sh[n];if(!x)continue;let label=n.replace('BOT_','').split('_').join(' / '),bal=Object.entries(x.balances||{}).map(([a,v])=>`${a} <b>${v.toFixed(2)}</b>`).join(' · ');bh+=`<div class=latbox><div class=muted>${label} · Leg1 +${x.leg1_ms} ms · Leg2 +${x.leg2_ms} ms depuis l'admission</div><div class='v big ${x.profit>=0?'good':'bad'}'>${x.profit>=0?'+':''}${x.profit.toFixed(2)} $</div><div class=muted>NAV ${x.nav.toFixed(2)} $</div><div class=metricgrid><div class=metric><div class=v>${x.trades}</div><div class=muted>trades</div></div><div class=metric><div class=v>${x.wins} / ${x.losses}</div><div class=muted>gagnés / perdus</div></div></div><div class='balance muted'>Balance : ${bal}<br>cap ${Number(lv.cap_usd||10).toFixed(0)} $ · aucun rebalance · refus balance ${x.skipped_balance} · jambe 1 annulée ${x.skipped_flash}</div></div>`}bh+=`</div><div class=muted style='margin-top:10px'>Chaque délai virtuel est ajouté après l'admission fraîche du gateway. Les Shadows n'ajoutent aucune attente au bot : leur réservation et leur exécution sont hors du chemin critique. Ils utilisent le même capital ${Number(lv.capital_limit_usd||200).toFixed(0)} $, le même cap, la fraîcheur ${lv.bbo_age_ms||50} ms, le contrôle après jambe 1 et uniquement des routes dont jambe 1 / jambe 2 / unwind ont été acceptées par MEXC.</div>`;document.getElementById('botlatencies').innerHTML=bh;
+if(lv.bot_shadow_rebalancing){document.getElementById('botlatencies').innerHTML=document.getElementById('botlatencies').innerHTML.replaceAll('aucun rebalance','rebalance 30 min / 4 h actif')}
+document.querySelectorAll('#botlatencies .latbox').forEach((box,i)=>{let x=sh[bn[i]];if(x)box.insertAdjacentHTML('beforeend',`<div class=muted style='margin-top:5px'>Rééquilibrages ${x.rebalances||0} · coût ${Number(x.rebalance_cost||0).toFixed(3)} $</div>`)});
 let first=sh.FAST||{},h=`<div class=tag>LATENCE D'EXÉCUTION — RECHERCHE</div><h3>FAST / TARGET / DEGRADED — ${(first.capital||0).toFixed(0)} $ indépendants chacun</h3><div class=latency>`;
 for(let n of ['FAST','TARGET','DEGRADED']){let x=sh[n];if(!x)continue;let bal=Object.entries(x.balances||{}).map(([a,v])=>`${a} <b>${v.toFixed(2)}</b>`).join(' · ');h+=`<div class=latbox><div class=muted>${n} · Leg1 +${x.leg1_ms} ms · Leg2 +${x.leg2_ms} ms</div><div class='v big ${x.profit>=0?'good':'bad'}'>${x.profit>=0?'+':''}${x.profit.toFixed(2)} $</div><div class=muted>NAV ${x.nav.toFixed(2)} $</div><div class=metricgrid><div class=metric><div class=v>${x.trades}</div><div class=muted>trades</div></div><div class=metric><div class=v>${x.wins} / ${x.losses}</div><div class=muted>gagnés / perdus</div></div><div class=metric><div class=v>${x.avg_edge==null?'-':(100*x.avg_edge).toFixed(3)+'%'}</div><div class=muted>edge T0 moyen</div></div><div class=metric><div class=v>${x.rebalances}</div><div class=muted>rebalances</div></div></div><div class='balance muted'>Balance : ${bal}<br>Coût rebalance ${x.rebalance_cost.toFixed(3)} $ · refus balance ${x.skipped_balance} · jambe 1 annulée ${x.skipped_flash} · expositions ${x.open_exposures}</div></div>`}h+=`</div><div class=muted style='margin-top:10px'>Même signal et mêmes carnets MEXC réels. Seuls les délais virtuels diffèrent. Cette section reste 100% simulée.</div>`;document.getElementById('latencies').innerHTML=h;
 let tw=Object.entries(p.target_weights||{}).map(([a,v])=>`${a} ${(100*v).toFixed(0)}%`).join(' · ');document.getElementById('policy').innerHTML=`<div class=tag>POLITIQUE V2.4</div><h3>Depth Quality adaptatif — cap Shadow ${(p.absolute_cap_usd||0).toFixed(0)} $</h3><div class=cards><div><div class=v>${(p.edge_min_pct??0).toFixed(2)}%</div><div class=muted>edge initial minimum</div></div><div><div class=v>A · ${(p.a_fraction_pct??0).toFixed(0)}%</div><div class=muted>capacité si suppression L1 ≥ edge min</div></div><div><div class=v>B+ · ${(p.b_fraction_pct??0).toFixed(0)}%</div><div class=muted>capacité si −50% BBO ≥ ${(p.bplus_half_edge_pct??0).toFixed(2)}%</div></div><div><div class=v>×${(p.coverage3_min??0).toFixed(0)}</div><div class=muted>réserve minimum niveaux 1–3</div></div><div><div class=v>${tw}</div><div class=muted>allocation cible Shadow</div></div><div><div class=v>${p.rebalance_check_min??'-'} min / ${p.rebalance_max_h??'-'} h</div><div class=muted>contrôle / rebalance Shadow</div></div><div><div class=v>${(p.replay_min_edge_pct??0).toFixed(2)}%</div><div class=muted>plancher dataset replay</div></div><div><div class=v>${p.online_research_trials?'ON':'OFF'}</div><div class=muted>matrice 66 essais en ligne</div></div></div><div class=muted style='margin-top:10px'>A : 50% de la capacité robuste. B+ : 33%, edge après −50% BBO ≥0,75%, edge sans niveau 1 ≥−2%, réserve L1–L3 ≥×3. B−, C et D sont refusés. Le Shadow est plafonné à ${(p.absolute_cap_usd||0).toFixed(0)} $ ; la passerelle privée reste plafonnée séparément.</div>`;
+document.getElementById('policy').insertAdjacentHTML('beforeend',`<div class=muted style='margin-top:8px'>Après confirmation de la jambe 1 : haircut appliqué une seule fois à ${Number(p.fee_safety_pct||0).toFixed(2)}%, puis jambe 2 autorisée si l'edge conservateur reste ≥${Number(p.leg2_min_edge_pct||0).toFixed(2)}%. Rééquilibrage 30 min / 4 h actif dans les Shadows BOT ; rééquilibrage réel toujours désactivé.</div>`);
 let qa=0,qb=0,qsmall=0,qbm=0,qcd=0;for(let r of (ql.rows||[])){if(r.grade==='A'&&r.eligible===1)qa+=r.n;if(r.grade==='B+'&&r.eligible===1)qb+=r.n;if((r.grade==='A'||r.grade==='B+')&&r.reason==='below_min_trade')qsmall+=r.n;if(r.grade==='B-')qbm+=r.n;if(r.grade==='C'||r.grade==='D')qcd+=r.n}let ac={},aprofiles=0;for(let r of (ad.rows||[])){ac[r.disposition]=(ac[r.disposition]||0)+r.n;aprofiles+=r.profiles_reserved||0}let sr={};for(let r of (sk.rows||[]))sr[r.reason]=(sr[r.reason]||0)+r.n;let aexec=(ac.executed_all_profiles||0)+(ac.executed_partial_profiles||0),finished=['FAST','TARGET','DEGRADED'].reduce((n,k)=>n+((sh[k]||{}).trades||0),0),ablock=(ac.blocked_same_event||0)+(ac.blocked_not_rearmed||0)+(ac.blocked_cooldown||0),perf=ql.compute||{},cf=ql.coverage_counterfactual||{};document.getElementById('quality').innerHTML=`<div class=tag>QUALITÉ DEPTH AUJOURD'HUI</div><h3>A / B+ admis — entonnoir d'exécution explicite</h3><div class=cards><div><div class=v good>${qa}</div><div class=muted>A admissibles</div></div><div><div class=v good>${qb}</div><div class=muted>B+ admissibles</div></div><div><div class=v>${qsmall}</div><div class=muted>A/B+ sous 10 $</div></div><div><div class=v good>${aexec}</div><div class=muted>signaux réservés</div></div><div><div class=v>${aprofiles}</div><div class=muted>exécutions profil réservées</div></div><div><div class=v>${finished}</div><div class=muted>exécutions profil terminées</div></div><div><div class='v ${(he.shadow_overdue||0)===0?'good':'bad'}'>${he.shadow_pending||0} / ${he.shadow_overdue||0}</div><div class=muted>Shadow pending / en retard</div></div><div><div class=v>${sr.depth_stale||0} / ${sr.depth_not_ready||0}</div><div class=muted>annulées Depth ancien / absent</div></div><div><div class=v>${sr.no_liquidity||0} / ${sr.below_min_fill||0}</div><div class=muted>annulées sans liquidité / sous 10 $</div></div><div><div class=v>${ablock}</div><div class=muted>bloqués event/réarmement/cooldown</div></div><div><div class=v>${ac.blocked_no_profile_balance||0}</div><div class=muted>bloqués balance</div></div><div><div class=v>${qbm}</div><div class=muted>B− refusés</div></div><div><div class=v>${qcd}</div><div class=muted>C / D refusés</div></div><div><div class=v>${cf.x1??0} / ${cf.x3??0}</div><div class=muted>B+ potentiels si couverture ×1 / ×3</div></div><div><div class=v>${ql.max_selected_usd==null?'-':ql.max_selected_usd.toFixed(2)+' $'}</div><div class=muted>taille Depth max admise</div></div><div><div class=v>${perf.p95_us==null?'-':perf.p95_us.toFixed(1)+' µs'}</div><div class=muted>temps calcul qualité p95</div></div></div>`;
 let fp=v=>v==null?'-':(100*v).toFixed(3)+'%',fn=v=>v==null?'-':Number(v).toFixed(2);let rh='';for(let q of (d.recent_decisions||[])){let t=new Date(q.ts_ms),ok=q.eligible===1;rh+=`<tr><td>${t.toLocaleTimeString()}</td><td>${q.route_id}</td><td>${fp(q.decision_net)}</td><td class='${ok?'good':'muted'}'>${q.grade||q.reason||'-'}</td><td>${q.selected_usd==null?'-':q.selected_usd.toFixed(2)+' $'}</td><td>${fp(q.half_bbo_edge)}</td><td>${fp(q.drop_l1_edge)}</td><td>${q.coverage3==null?'-':'×'+fn(q.coverage3)}</td><td>${q.compute_us==null?'-':fn(q.compute_us)+' µs'}</td></tr>`}document.getElementById('recent').innerHTML=rh;
 document.getElementById('capture').innerHTML=`<div class=tag>DATASET REPLAY V2.4</div><h3>Collecte jusqu'à T0 + 5 secondes</h3><div class=cards><div><div class=v>${cap.depth_decisions||0}</div><div class=muted>décisions avec Depth</div></div><div><div class=v>${cap.depth_samples||0}</div><div class=muted>snapshots multi-level</div></div><div><div class=v>${cap.exec_details||0}</div><div class=muted>exécutions VWAP détaillées</div></div><div><div class=v>${cap.stable_depth_samples||0}</div><div class=muted>snapshots Depth stablecoins</div></div></div><div class=muted style='margin-top:10px'>Aucune décision détaillée sous ${(p.replay_min_edge_pct??0.30).toFixed(2)}%. Une capture au premier franchissement de ce seuil, puis une seconde uniquement si le même événement franchit ${(p.edge_min_pct??0.35).toFixed(2)}%. Offsets Depth : ${(p.depth_capture_offsets_ms||[]).join(', ')} ms · top ${(p.depth_capture_levels||'-')} niveaux par côté.</div>`;
@@ -4189,13 +4520,17 @@ def bootstrap():
     with state_lock:
         state["symbols"]=symbols; state["routes"]=routes; state["routes_by_symbol"]=bysym; state["market_meta"]=meta; state["route_diag"]=diag
     with state_lock: state["ws_expected"]=len(groups)
+    initialize_route_coverage(routes)
     print(f"[Routes V{VERSION}] source={state['market_source']} markets={diag['all_markets']} candidates={diag['candidate_routes']} "
           f"(2L={diag['candidate_2leg']},3L={diag['candidate_3leg']}) selected_symbols={len(symbols)} selected_routes={len(routes)} "
           f"(2L={diag['selected_2leg']},3L={diag['selected_3leg']}) WS={len(groups)} group<={WS_GROUP_SIZE} "
           f"grouping={grouping_mode} app_ping={MEXC_APP_PING_SEC:g}s replay>={REPLAY_MIN_EDGE*100:.2f}% "
           f"online_matrix={'on' if ENABLE_ONLINE_RESEARCH_TRIALS else 'off'} db_batch={DB_COMMIT_BATCH}/{DB_COMMIT_MAX_MS}ms "
           f"test_retry={LIVE_RETRY_MAX}/{LIVE_RETRY_WINDOW_MS}ms live_retry={LIVE_EXEC_RETRY_MAX}/{LIVE_EXEC_RETRY_WINDOW_MS}ms "
-          f"cooldown=crypto:{LIVE_HARD_COOLDOWN_MS}ms http_keepalive={LIVE_HTTP_KEEPALIVE_SEC:g}s")
+          f"cooldown=crypto:{LIVE_HARD_COOLDOWN_MS}ms http_keepalive={LIVE_HTTP_KEEPALIVE_SEC:g}s "
+          f"leg2_guard>={LIVE_LEG2_MIN_EDGE*100:.2f}% haircut={LIVE_FEE_SAFETY*100:.2f}% "
+          f"prevalidate={'on' if LIVE_PREVALIDATE_ENABLED and TRADING_MODE=='test' else 'off'} "
+          f"coverage_flush={ROUTE_COVERAGE_FLUSH_SEC:g}s")
     put_db(("meta",("version",VERSION))); put_db(("meta",("paper_rearm_neutral_ms",str(PAPER_REARM_NEUTRAL_MS)))); put_db(("meta",("paper_hard_cooldown_ms",str(PAPER_HARD_COOLDOWN_MS)))); put_db(("meta",("paper_failed_leg_policy","reverse_leg1_then_persist_open_exposure_until_liquidated"))); put_db(("meta",("ws_depth_interval","10ms"))); put_db(("meta",("ws_latency_sample_ms",str(WS_LATENCY_SAMPLE_MS)))); put_db(("meta",("route_snapshot_interval_sec",str(SNAPSHOT_INTERVAL_SEC)))); put_db(("meta",("route_snapshot_top_n",str(SNAPSHOT_TOP_N)))); put_db(("meta",("depth_snapshot_levels","100"))); put_db(("meta",("trace_window_ms",str(TRACE_WINDOW_MS)))); put_db(("meta",("market_source",state["market_source"])))
     put_db(("meta",("route_diag",json.dumps(diag,sort_keys=True))))
     put_db(("meta",("ws_grouping",grouping_mode)))
@@ -4213,10 +4548,11 @@ def bootstrap():
         "rebalance_check_sec":SHADOW_REBALANCE_CHECK_SEC,"rebalance_max_sec":SHADOW_REBALANCE_MAX_SEC,
         "early_dev":SHADOW_REBALANCE_EARLY_DEV,"post_resync_grace_ms":POST_RESYNC_GRACE_MS,
         "depth_capture_offsets_ms":DEPTH_CAPTURE_OFFSETS_MS,"depth_capture_levels":DEPTH_CAPTURE_LEVELS},sort_keys=True))))
-    put_db(("meta",("v243_private_gateway",json.dumps({"mode":TRADING_MODE,"live_cap_usd":LIVE_CAP_USD,
+    put_db(("meta",("v244_private_gateway",json.dumps({"mode":TRADING_MODE,"live_cap_usd":LIVE_CAP_USD,
         "capital_limit_usd":LIVE_CAPITAL_LIMIT_USD,"daily_loss_limit_usd":LIVE_DAILY_LOSS_LIMIT_USD,
         "max_concurrent":LIVE_MAX_CONCURRENT,"live_bbo_age_ms":LIVE_BBO_AGE_MS,"live_max_skew_ms":LIVE_MAX_SKEW_MS,
         "defer_leg1_commission":LIVE_DEFER_LEG1_COMMISSION,
+        "fee_safety":LIVE_FEE_SAFETY,"leg2_min_edge":LIVE_LEG2_MIN_EDGE,
         "protected_bags":PROTECT_EXISTING_BAGS,"allowed_start_assets":MEXC_ALLOWED_START_ASSETS,
         "require_tested_route":LIVE_REQUIRE_TESTED_ROUTE,"test_max_age_hours":LIVE_TEST_MAX_AGE_HOURS,
         "require_all_ws":LIVE_REQUIRE_ALL_WS,"require_route_ws":LIVE_REQUIRE_ROUTE_WS,
@@ -4230,6 +4566,12 @@ def bootstrap():
         "http_sessions":"dedicated_orders_and_account","http_keepalive_sec":LIVE_HTTP_KEEPALIVE_SEC,
         "http_keepalive_timeout_sec":LIVE_HTTP_KEEPALIVE_TIMEOUT_SEC,
         "capability_reuse_hours":LIVE_TEST_MAX_AGE_HOURS,
+        "background_prevalidation":LIVE_PREVALIDATE_ENABLED,
+        "prevalidation_interval_sec":LIVE_PREVALIDATE_INTERVAL_SEC,
+        "prevalidation_refresh_hours":LIVE_PREVALIDATE_REFRESH_HOURS,
+        "prevalidation_depth_age_ms":LIVE_PREVALIDATE_DEPTH_AGE_MS,
+        "route_coverage_flush_sec":ROUTE_COVERAGE_FLUSH_SEC,
+        "bot_shadow_rebalance":BOT_SHADOW_REBALANCE_ENABLED,
         "admission_db_mode":"async_telemetry","critical_order_journal":"single_transaction_before_each_post",
         "bot_shadow_admission":"fresh_gateway_A_or_Bplus_off_critical_path",
         "order_fallback":["MARKET","FILL_OR_KILL","IMMEDIATE_OR_CANCEL"],
@@ -4247,6 +4589,7 @@ def bootstrap():
     threading.Thread(target=stable_quote_worker,daemon=True).start()
     threading.Thread(target=stable_depth_capture_worker,daemon=True).start()
     threading.Thread(target=shadow_periodic_rebalance_worker,daemon=True).start()
+    threading.Thread(target=route_coverage_flush_worker,daemon=True).start()
     refresh_dashboard_cache()
     threading.Thread(target=dashboard_cache_worker,daemon=True).start()
     for i,g in enumerate(groups,1): threading.Thread(target=ws_worker,args=(g,i,group_loads[i-1]),daemon=True).start()
