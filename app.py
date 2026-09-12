@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Release artifact: upload this file as app.py on the scanner server.
 import os, json, time, math, queue, sqlite3, threading, random, requests, hashlib, hmac, uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
@@ -8,12 +9,12 @@ from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, render_template_string
 import websocket
 
-VERSION = "2.4.4-coverage-prevalidated"
+VERSION = "2.4.5-private-order-ws"
 HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", "8081"))
-DB_PATH = os.getenv("DB_PATH", "mexc_routes_v244.db")
-LIVE_DB_PATH = os.getenv("LIVE_DB_PATH", "mexc_live_v244.db")
-LIVE_IMPORT_CAPABILITIES_DB = os.getenv("LIVE_IMPORT_CAPABILITIES_DB", "mexc_live_v243.db")
+DB_PATH = os.getenv("DB_PATH", "mexc_routes_v245.db")
+LIVE_DB_PATH = os.getenv("LIVE_DB_PATH", "mexc_live_v245.db")
+LIVE_IMPORT_CAPABILITIES_DB = os.getenv("LIVE_IMPORT_CAPABILITIES_DB", "mexc_live_v244.db")
 MARKET_CACHE = os.getenv("MARKET_CACHE", "mexc_markets_cache.json")
 TZ_NAME = os.getenv("TZ_NAME", "Europe/Paris")
 TZ = ZoneInfo(TZ_NAME)
@@ -98,7 +99,7 @@ if TRADING_MODE not in ("shadow", "test", "live"):
 LIVE_ARMED = os.getenv("LIVE_ARMED", "0") == "1"
 LIVE_CAP_USD = max(0.0, float(os.getenv("LIVE_CAP_USD", "20")))
 LIVE_CAPITAL_LIMIT_USD = max(0.0, float(os.getenv("LIVE_CAPITAL_LIMIT_USD", "200")))
-LIVE_DAILY_LOSS_LIMIT_USD = max(0.0, float(os.getenv("LIVE_DAILY_LOSS_LIMIT_USD", "2")))
+LIVE_DAILY_LOSS_LIMIT_USD = max(0.0, float(os.getenv("LIVE_DAILY_LOSS_LIMIT_USD", "5")))
 LIVE_MAX_CONCURRENT = max(1, int(os.getenv("LIVE_MAX_CONCURRENT", "1")))
 LIVE_BBO_AGE_MS = max(1, int(os.getenv("LIVE_BBO_AGE_MS", "50")))
 LIVE_MAX_SKEW_MS = max(0, int(os.getenv("LIVE_MAX_SKEW_MS", "50")))
@@ -145,6 +146,19 @@ LIVE_MAX_T0_TO_LEG1_POST_MS = max(LIVE_EXEC_RETRY_WINDOW_MS, int(os.getenv(
     "LIVE_MAX_T0_TO_LEG1_POST_MS", "50")))
 LIVE_HTTP_KEEPALIVE_SEC = max(5.0, float(os.getenv("LIVE_HTTP_KEEPALIVE_SEC", "15")))
 LIVE_HTTP_KEEPALIVE_TIMEOUT_SEC = max(0.25, float(os.getenv("LIVE_HTTP_KEEPALIVE_TIMEOUT_SEC", "0.75")))
+# Private order stream. OBSERVE records its timing while REST remains the sole
+# execution authority. HYBRID may later release a leg on the first terminal
+# WS/REST result, but only after OBSERVE has been measured on real micro-trades.
+LIVE_PRIVATE_WS_MODE = os.getenv("LIVE_PRIVATE_WS_MODE", "observe").strip().lower()
+if LIVE_PRIVATE_WS_MODE not in ("off", "observe", "hybrid"):
+    LIVE_PRIVATE_WS_MODE = "observe"
+LIVE_PRIVATE_WS_KEEPALIVE_SEC = max(60.0, min(3300.0, float(os.getenv(
+    "LIVE_PRIVATE_WS_KEEPALIVE_SEC", "1500"))))
+LIVE_PRIVATE_WS_PING_SEC = max(5.0, float(os.getenv("LIVE_PRIVATE_WS_PING_SEC", "15")))
+LIVE_PRIVATE_WS_PONG_TIMEOUT_SEC = max(LIVE_PRIVATE_WS_PING_SEC+5.0, float(os.getenv(
+    "LIVE_PRIVATE_WS_PONG_TIMEOUT_SEC", "45")))
+LIVE_PRIVATE_WS_MAX_CONNECTION_SEC = max(3600.0, min(23.75*3600.0, float(os.getenv(
+    "LIVE_PRIVATE_WS_MAX_CONNECTION_SEC", str(23*3600)))))
 LIVE_RESET_CIRCUIT = os.getenv("LIVE_RESET_CIRCUIT", "0") == "1"
 PROTECT_EXISTING_BAGS = os.getenv("PROTECT_EXISTING_BAGS", "1") == "1"
 MEXC_ALLOWED_START_ASSETS = tuple(x.strip().upper() for x in os.getenv(
@@ -292,12 +306,15 @@ live_runtime = {
     "last_first_check_delay_ms": None, "last_gateway_admit_delay_ms": None,
     "bot_shadow_admissions": 0, "bot_shadow_schedule_drops": 0,
     "last_keepalive_rtt_ms": None, "last_keepalive_ts_ms": None,
+    "last_status_keepalive_rtt_ms": None,
     "keepalive_ok": 0, "keepalive_errors": 0, "last_keepalive_error": None,
     "trade_epoch": 0,
 }
 live_client = None
+live_order_status_client = None
 live_account_client = None
 live_prevalidation_client = None
+live_user_stream_client = None
 live_route_capabilities = {}
 live_account_refresh_event = threading.Event()
 live_gateway_first_check_ms = deque(maxlen=10000)
@@ -313,6 +330,31 @@ live_leg2_confirm_ms = deque(maxlen=10000)
 live_prepare_journal_ms = deque(maxlen=10000)
 live_response_journal_ms = deque(maxlen=10000)
 bot_shadow_schedule_lag_ms = deque(maxlen=10000)
+private_ws_post_to_event_ms = deque(maxlen=10000)
+private_ws_rest_delta_ms = deque(maxlen=10000)
+private_ws_lock = threading.RLock()
+private_ws_waiters = {}
+private_ws_order_aliases = {}
+private_ws_event_cache = {}
+private_ws_submission_meta = {}
+private_ws_journal_q = queue.Queue(maxsize=1000)
+private_ws_runtime = {
+    "mode": LIVE_PRIVATE_WS_MODE,
+    "connected": False, "subscribed": False,
+    "opens": 0, "disconnects": 0, "reconnects": 0,
+    "messages": 0, "order_events": 0, "terminal_events": 0,
+    "matched_events": 0, "unmatched_events": 0, "decode_errors": 0,
+    "pings": 0, "pongs": 0,
+    "listenkey_creates": 0, "listenkey_keepalive_ok": 0,
+    "listenkey_keepalive_errors": 0,
+    "ws_before_rest": 0, "rest_before_ws": 0, "same_ms": 0,
+    "confirmations_ws": 0, "confirmations_rest": 0, "confirmations_post": 0,
+    "journal_drops": 0,
+    "last_open_ms": None, "last_close_ms": None,
+    "last_message_ms": None, "last_order_event_ms": None,
+    "last_pong_ms": None, "listenkey_created_ms": None,
+    "last_listenkey_keepalive_ms": None, "last_error": None,
+}
 prevalidation_runtime = {
     "enabled": LIVE_PREVALIDATE_ENABLED,
     "running": False,
@@ -645,7 +687,10 @@ def db_writer():
       prepared_ts_ms INTEGER NOT NULL, submitted_ts_ms INTEGER, final_ts_ms INTEGER,
       response_json TEXT, error TEXT, request_started_ts_ms INTEGER,
       response_received_ts_ms INTEGER, post_http_ms REAL,
-      http_queue_ms REAL, response_journal_ms REAL, settle_ms INTEGER, fallback_index INTEGER
+      http_queue_ms REAL, response_journal_ms REAL, settle_ms INTEGER, fallback_index INTEGER,
+      confirmation_source TEXT, rest_poll_count INTEGER,
+      ws_received_ts_ms INTEGER, ws_send_ts_ms INTEGER,
+      ws_post_ms REAL, ws_rest_delta_ms REAL
     );
     CREATE INDEX IF NOT EXISTS idx_live_orders_attempt ON live_orders_v240(attempt_id,leg);
 
@@ -671,6 +716,20 @@ def db_writer():
     );
     CREATE INDEX IF NOT EXISTS idx_live_admissions_v241_day
       ON live_admissions_v241(day,decision_ts_ms,disposition);
+
+    CREATE TABLE IF NOT EXISTS private_order_ws_events_v245(
+      event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      received_ts_ms INTEGER NOT NULL, send_ts_ms INTEGER, create_ts_ms INTEGER,
+      channel TEXT NOT NULL, symbol TEXT, exchange_order_id TEXT,
+      client_order_id TEXT, status_code INTEGER, status TEXT,
+      executed_qty REAL, cumulative_quote_qty REAL,
+      post_started_ts_ms INTEGER, post_to_ws_ms REAL,
+      rest_confirmed_ts_ms INTEGER, ws_rest_delta_ms REAL,
+      matched_bot_order INTEGER NOT NULL DEFAULT 0, raw_json TEXT NOT NULL,
+      UNIQUE(client_order_id,send_ts_ms,status_code,executed_qty,cumulative_quote_qty)
+    );
+    CREATE INDEX IF NOT EXISTS idx_private_order_ws_v245_client
+      ON private_order_ws_events_v245(client_order_id,received_ts_ms);
 
     CREATE TABLE IF NOT EXISTS route_coverage_v244(
       day TEXT NOT NULL, route_id TEXT NOT NULL, path TEXT NOT NULL,
@@ -714,7 +773,10 @@ def db_writer():
     for name,decl in (("price","TEXT"),("request_started_ts_ms","INTEGER"),
         ("response_received_ts_ms","INTEGER"),("post_http_ms","REAL"),
         ("http_queue_ms","REAL"),("response_journal_ms","REAL"),("settle_ms","INTEGER"),
-        ("fallback_index","INTEGER")):
+        ("fallback_index","INTEGER"),("confirmation_source","TEXT"),
+        ("rest_poll_count","INTEGER"),("ws_received_ts_ms","INTEGER"),
+        ("ws_send_ts_ms","INTEGER"),("ws_post_ms","REAL"),
+        ("ws_rest_delta_ms","REAL")):
         if name not in order_existing: con.execute(f"ALTER TABLE live_orders_v240 ADD COLUMN {name} {decl}")
     admission_existing={r[1] for r in con.execute("PRAGMA table_info(live_admissions_v241)")}
     for name,decl in (
@@ -805,6 +867,16 @@ def db_writer():
                     leg2_bid,leg2_ask,leg2_bidq,leg2_askq,leg2_send_ts_ms,leg2_recv_ts_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", payload)
             elif typ == "ws_lat_v22":
                 con.execute("INSERT INTO ws_latency_v22(ts_ms,symbol,send_ts_ms,recv_ts_ms,transport_ms) VALUES(?,?,?,?,?)", payload)
+            elif typ == "private_order_ws_v245":
+                con.execute("""INSERT OR IGNORE INTO private_order_ws_events_v245(
+                    received_ts_ms,send_ts_ms,create_ts_ms,channel,symbol,exchange_order_id,
+                    client_order_id,status_code,status,executed_qty,cumulative_quote_qty,
+                    post_started_ts_ms,post_to_ws_ms,rest_confirmed_ts_ms,ws_rest_delta_ms,
+                    matched_bot_order,raw_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",payload)
+            elif typ == "private_order_ws_rest_v245":
+                con.execute("""UPDATE private_order_ws_events_v245
+                    SET rest_confirmed_ts_ms=?,ws_rest_delta_ms=?
+                    WHERE client_order_id=?""",payload)
             elif typ == "depth_sync":
                 con.execute("INSERT INTO depth_sync_events(ts_ms,symbol,event,reason,duration_ms,attempt) VALUES(?,?,?,?,?,?)", payload)
             elif typ == "trial":
@@ -1222,6 +1294,69 @@ def decode_depth(payload):
             try: tv=int(v.decode())
             except: pass
     return {"symbol":symbol,"send":int(send or now_ms()),"asks":asks,"bids":bids,"from":fv,"to":tv}
+
+
+_PRIVATE_ORDER_STATUS = {
+    1:"NEW", 2:"FILLED", 3:"PARTIALLY_FILLED", 4:"CANCELED",
+    5:"PARTIALLY_CANCELED",
+}
+_TERMINAL_ORDER_STATUS = {
+    "FILLED","CANCELED","PARTIALLY_CANCELED","REJECTED","EXPIRED",
+}
+
+
+def _pb_text(value):
+    try: return value.decode("utf-8","ignore")
+    except Exception: return ""
+
+
+def decode_private_order(payload):
+    """Decode MEXC's official privateOrders wrapper without a protobuf runtime."""
+    channel=None; symbol=None; create_ts=None; send_ts=None; body=None
+    for field,wire,value in _pb_fields(payload):
+        if field==1 and wire==2: channel=_pb_text(value)
+        elif field==3 and wire==2: symbol=_pb_text(value)
+        elif field==5 and wire==0: create_ts=int(value)
+        elif field==6 and wire==0: send_ts=int(value)
+        elif field==304 and wire==2: body=value
+    if body is None: return None
+    texts={}; ints={}
+    text_fields={1,2,3,4,5,6,10,11,12,13,14,17,19,21,22,23,24,25,26}
+    int_fields={7,8,9,15,16,18,20}
+    for field,wire,value in _pb_fields(body):
+        if wire==2 and field in text_fields: texts[field]=_pb_text(value)
+        elif wire==0 and field in int_fields: ints[field]=int(value)
+    status_code=ints.get(15)
+    status=_PRIVATE_ORDER_STATUS.get(status_code,str(status_code) if status_code is not None else "")
+    order_id=texts.get(1) or None
+    client_id=texts.get(2) or None
+    try: executed=float(texts.get(13) or 0.0)
+    except (TypeError,ValueError): executed=0.0
+    try: cumulative_quote=float(texts.get(14) or 0.0)
+    except (TypeError,ValueError): cumulative_quote=0.0
+    nested_create=ints.get(16)
+    event={
+        "channel":channel or "spot@private.orders.v3.api.pb",
+        "symbol":symbol or texts.get(17) or "",
+        "send_ts_ms":send_ts,
+        "create_ts_ms":nested_create or create_ts,
+        "exchange_order_id":order_id,
+        "client_order_id":client_id,
+        "status_code":status_code,
+        "status":status,
+        "executed_qty":executed,
+        "cumulative_quote_qty":cumulative_quote,
+    }
+    event["terminal"]=status in _TERMINAL_ORDER_STATUS
+    event["order"]={
+        "symbol":event["symbol"], "orderId":order_id,
+        "clientOrderId":client_id, "price":texts.get(3,"0"),
+        "origQty":texts.get(4,"0"), "executedQty":texts.get(13,"0"),
+        "cummulativeQuoteQty":texts.get(14,"0"), "status":status,
+        "type":str(ints.get(7,"")), "side":str(ints.get(8,"")),
+        "transactTime":event["create_ts_ms"],
+    }
+    return event
 
 def _publish_depth_bbo(sym, send_ts):
     with depth_lock:
@@ -1673,10 +1808,13 @@ class MexcPrivateClient:
         try: return response.json()
         except Exception: return {"raw":response.text[:1000]}
 
-    def _request(self, method, url, *, params=None, headers=None, timeout=None):
+    def _request(self, method, url, *, params=None, headers=None, timeout=None, on_start=None):
         queued_ns=time.perf_counter_ns()
         with self.http_lock:
             started_wall=now_ms(); started_ns=time.perf_counter_ns()
+            if on_start is not None:
+                try: on_start(started_wall)
+                except Exception as exc: logerr(f"HTTP start hook {self.role}: {exc}")
             r=self.session.request(method,url,params=params,headers=headers,
                                    timeout=timeout or LIVE_API_TIMEOUT_SEC)
             received_wall=now_ms(); received_ns=time.perf_counter_ns(); self.last_activity_ms=received_wall
@@ -1694,7 +1832,8 @@ class MexcPrivateClient:
         self.time_offset_ms=int(payload["serverTime"])-now_ms()
         return self.time_offset_ms
 
-    def signed(self, method, path, params=None, retry_timestamp=False, with_timing=False):
+    def signed(self, method, path, params=None, retry_timestamp=False, with_timing=False,
+               on_start=None):
         params=dict(params or {})
         params["recvWindow"]=LIVE_RECV_WINDOW_MS
         params["timestamp"]=now_ms()+self.time_offset_ms
@@ -1702,7 +1841,7 @@ class MexcPrivateClient:
         params["signature"]=hmac.new(self.api_secret,query.encode("utf-8"),hashlib.sha256).hexdigest()
         headers={"X-MEXC-APIKEY":self.api_key,"Accept":"application/json"}
         try:
-            response,timing=self._request(method,REST+path,params=params,headers=headers)
+            response,timing=self._request(method,REST+path,params=params,headers=headers,on_start=on_start)
         except requests.RequestException as exc:
             if method.upper()=="POST" and path=="/api/v3/order":
                 raise MexcOrderUncertain(f"Résultat POST inconnu: {exc}") from exc
@@ -1713,7 +1852,7 @@ class MexcPrivateClient:
         except (TypeError,ValueError): code_num=code
         if response.ok and code_num in (None,0,200): return (payload,timing) if with_timing else payload
         if retry_timestamp and method.upper()!="POST" and code_num in (-1021,700003):
-            self.sync_time(); return self.signed(method,path,{k:v for k,v in params.items() if k not in ("timestamp","recvWindow","signature")},False,with_timing)
+            self.sync_time(); return self.signed(method,path,{k:v for k,v in params.items() if k not in ("timestamp","recvWindow","signature")},False,with_timing,on_start)
         msg=payload.get("msg") if isinstance(payload,dict) else None
         if method.upper()=="POST" and path=="/api/v3/order" and response.status_code>=500:
             raise MexcOrderUncertain(f"Ordre potentiellement accepté, HTTP {response.status_code}: {msg or payload}",response.status_code,payload)
@@ -1723,13 +1862,14 @@ class MexcPrivateClient:
         return self.signed("GET","/api/v3/account",retry_timestamp=True)
 
     def new_order(self, symbol, side, order_type, client_order_id, quantity=None,
-                  quote_order_qty=None, price=None, test=False, with_timing=False):
+                  quote_order_qty=None, price=None, test=False, with_timing=False,
+                  on_start=None):
         p={"symbol":symbol,"side":side,"type":order_type,"newClientOrderId":client_order_id}
         if quantity is not None: p["quantity"]=quantity
         if quote_order_qty is not None: p["quoteOrderQty"]=quote_order_qty
         if price is not None: p["price"]=price
         return self.signed("POST","/api/v3/order/test" if test else "/api/v3/order",p,
-                           with_timing=with_timing)
+                           with_timing=with_timing,on_start=on_start)
 
     def new_market_order(self, symbol, side, client_order_id, quantity=None, quote_order_qty=None, test=False):
         return self.new_order(symbol,side,"MARKET",client_order_id,quantity,quote_order_qty,None,test)
@@ -1739,6 +1879,30 @@ class MexcPrivateClient:
 
     def trades(self, symbol, order_id):
         return self.signed("GET","/api/v3/myTrades",{"symbol":symbol,"orderId":order_id},retry_timestamp=True)
+
+    def api_key_request(self, method, path, params=None):
+        headers={"X-MEXC-APIKEY":self.api_key,"Accept":"application/json"}
+        try:
+            response,_=self._request(method,REST+path,params=params,headers=headers)
+        except requests.RequestException as exc:
+            raise MexcAPIError(f"Erreur réseau user stream MEXC: {exc}") from exc
+        payload=self._payload(response)
+        code=payload.get("code") if isinstance(payload,dict) else None
+        if response.ok and code in (None,0,200,"0","200"): return payload
+        msg=payload.get("msg") if isinstance(payload,dict) else payload
+        raise MexcAPIError(f"MEXC user stream HTTP {response.status_code}: {msg}",response.status_code,payload)
+
+    def create_listen_key(self):
+        payload=self.api_key_request("POST","/api/v3/userDataStream")
+        key=payload.get("listenKey") if isinstance(payload,dict) else None
+        if not key: raise MexcAPIError(f"listenKey absent: {payload}")
+        return str(key)
+
+    def keepalive_listen_key(self, listen_key):
+        return self.api_key_request("PUT","/api/v3/userDataStream",{"listenKey":listen_key})
+
+    def close_listen_key(self, listen_key):
+        return self.api_key_request("DELETE","/api/v3/userDataStream",{"listenKey":listen_key})
 
     def keepalive_if_idle(self, idle_ms, timeout_sec, abort_if=None):
         """Warm this exact pool without ever queueing behind an order."""
@@ -1761,6 +1925,295 @@ class MexcPrivateClient:
             return elapsed
         finally:
             self.http_lock.release()
+
+
+def _private_ws_prune_locked(ts=None):
+    ts=int(ts or now_ms())
+    stale=[]
+    for client_id,waiter in private_ws_waiters.items():
+        age=ts-int(waiter.get("created_ts_ms") or ts)
+        if age>300000 and (waiter.get("released") or age>900000): stale.append(client_id)
+    for client_id in stale:
+        waiter=private_ws_waiters.pop(client_id,None)
+        if waiter:
+            order_id=waiter.get("exchange_order_id")
+            if order_id is not None: private_ws_order_aliases.pop(str(order_id),None)
+        private_ws_submission_meta.pop(client_id,None)
+
+
+def _private_ws_register(spec, attempt_id, leg, purpose):
+    client_id=str(spec["client_order_id"])
+    waiter={
+        "client_order_id":client_id,"attempt_id":attempt_id,"leg":int(leg),
+        "purpose":purpose,"symbol":spec["symbol"],"created_ts_ms":now_ms(),
+        "post_started_ts_ms":None,"exchange_order_id":None,
+        "ws_event":threading.Event(),"rest_event":threading.Event(),"terminal_event":threading.Event(),
+        "ws_order":None,"ws_received_ts_ms":None,"ws_send_ts_ms":None,
+        "rest_order":None,"rest_confirmed_ts_ms":None,"rest_error":None,
+        "rest_poll_count":0,"comparison_recorded":False,"released":False,
+    }
+    with private_ws_lock:
+        _private_ws_prune_locked()
+        private_ws_waiters[client_id]=waiter
+        private_ws_submission_meta[client_id]={
+            "attempt_id":attempt_id,"leg":int(leg),"purpose":purpose,
+            "symbol":spec["symbol"],"created_ts_ms":waiter["created_ts_ms"],
+        }
+    return waiter
+
+
+def _private_ws_link_submission(waiter, post_started_ts_ms, exchange_order_id=None):
+    if not waiter: return
+    with private_ws_lock:
+        waiter["post_started_ts_ms"]=int(post_started_ts_ms)
+        meta=private_ws_submission_meta.get(waiter["client_order_id"])
+        if meta is not None: meta["post_started_ts_ms"]=int(post_started_ts_ms)
+        if exchange_order_id is not None:
+            waiter["exchange_order_id"]=str(exchange_order_id)
+            private_ws_order_aliases[str(exchange_order_id)]=waiter["client_order_id"]
+
+
+def _private_ws_queue(item):
+    try: private_ws_journal_q.put_nowait(item)
+    except queue.Full:
+        with private_ws_lock:
+            private_ws_runtime["journal_drops"]+=1
+
+
+def _private_ws_comparison_locked(waiter):
+    ws_ts=waiter.get("ws_received_ts_ms"); rest_ts=waiter.get("rest_confirmed_ts_ms")
+    if ws_ts is None or rest_ts is None or waiter.get("comparison_recorded"): return None
+    delta=float(ws_ts-rest_ts)
+    waiter["comparison_recorded"]=True
+    private_ws_rest_delta_ms.append(delta)
+    if delta<0: private_ws_runtime["ws_before_rest"]+=1
+    elif delta>0: private_ws_runtime["rest_before_ws"]+=1
+    else: private_ws_runtime["same_ms"]+=1
+    _private_ws_queue({"kind":"rest_update","client_order_id":waiter["client_order_id"],
+        "rest_confirmed_ts_ms":rest_ts,"ws_rest_delta_ms":delta})
+    return delta
+
+
+def _private_ws_note_rest(waiter, order=None, confirmed_ts_ms=None, poll_count=0, error=None,
+                          source="rest"):
+    if not waiter: return
+    with private_ws_lock:
+        waiter["rest_order"]=order if isinstance(order,dict) else waiter.get("rest_order")
+        waiter["rest_confirmed_ts_ms"]=int(confirmed_ts_ms or now_ms())
+        waiter["rest_poll_count"]=int(poll_count or 0)
+        waiter["rest_error"]=str(error)[:500] if error else None
+        waiter["rest_event"].set()
+        waiter["terminal_event"].set()
+        if source=="post": private_ws_runtime["confirmations_post"]+=1
+        else: private_ws_runtime["confirmations_rest"]+=1
+        _private_ws_comparison_locked(waiter)
+
+
+def _private_ws_release(waiter, keep_rest_probe=False):
+    if not waiter: return
+    with private_ws_lock:
+        waiter["released"]=True
+        waiter["keep_rest_probe"]=bool(keep_rest_probe)
+        _private_ws_prune_locked()
+
+
+def _private_ws_publish(event, received_ts_ms=None):
+    received=int(received_ts_ms or now_ms())
+    client_id=str(event.get("client_order_id") or "")
+    order_id=event.get("exchange_order_id")
+    with private_ws_lock:
+        private_ws_runtime["order_events"]+=1
+        private_ws_runtime["last_order_event_ms"]=received
+        if event.get("terminal"): private_ws_runtime["terminal_events"]+=1
+        if not client_id and order_id is not None:
+            client_id=private_ws_order_aliases.get(str(order_id),"")
+        waiter=private_ws_waiters.get(client_id) if client_id else None
+        meta=private_ws_submission_meta.get(client_id) if client_id else None
+        matched=bool(waiter or meta or client_id.startswith(("v244","v245")))
+        private_ws_runtime["matched_events" if matched else "unmatched_events"]+=1
+        post_started=(waiter or {}).get("post_started_ts_ms") or (meta or {}).get("post_started_ts_ms")
+        post_to_ws=float(received-post_started) if post_started is not None else None
+        if post_to_ws is not None: private_ws_post_to_event_ms.append(post_to_ws)
+        if waiter and order_id is not None:
+            waiter["exchange_order_id"]=str(order_id)
+            private_ws_order_aliases[str(order_id)]=client_id
+        if waiter and event.get("terminal"):
+            waiter["ws_order"]=dict(event.get("order") or {})
+            waiter["ws_received_ts_ms"]=received
+            waiter["ws_send_ts_ms"]=event.get("send_ts_ms")
+            waiter["ws_event"].set()
+            waiter["terminal_event"].set()
+            _private_ws_comparison_locked(waiter)
+        payload=(received,event.get("send_ts_ms"),event.get("create_ts_ms"),
+            event.get("channel") or "spot@private.orders.v3.api.pb",event.get("symbol"),
+            str(order_id) if order_id is not None else None,client_id or None,
+            event.get("status_code"),event.get("status"),event.get("executed_qty"),
+            event.get("cumulative_quote_qty"),post_started,post_to_ws,
+            (waiter or {}).get("rest_confirmed_ts_ms"),
+            (float(received-waiter["rest_confirmed_ts_ms"]) if waiter and waiter.get("rest_confirmed_ts_ms") is not None else None),
+            1 if matched else 0,json.dumps(event,separators=(",",":"),ensure_ascii=False,default=str))
+    _private_ws_queue({"kind":"event","payload":payload})
+
+
+def private_ws_journal_worker():
+    while True:
+        item=private_ws_journal_q.get()
+        try:
+            if item.get("kind")=="event":
+                payload=item["payload"]
+                put_db(("private_order_ws_v245",payload))
+                # The critical order journal wins every SQLite lock while a route
+                # is exposed. Private stream telemetry catches up afterwards.
+                while True:
+                    with live_lock: busy=bool(live_runtime.get("busy"))
+                    if not busy: break
+                    time.sleep(0.005)
+                live_db_execute("""INSERT OR IGNORE INTO private_order_ws_events_v245(
+                    received_ts_ms,send_ts_ms,create_ts_ms,channel,symbol,exchange_order_id,
+                    client_order_id,status_code,status,executed_qty,cumulative_quote_qty,
+                    post_started_ts_ms,post_to_ws_ms,rest_confirmed_ts_ms,ws_rest_delta_ms,
+                    matched_bot_order,raw_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",payload)
+            elif item.get("kind")=="rest_update":
+                params=(item.get("rest_confirmed_ts_ms"),item.get("ws_rest_delta_ms"),item.get("client_order_id"))
+                put_db(("private_order_ws_rest_v245",params))
+                while True:
+                    with live_lock: busy=bool(live_runtime.get("busy"))
+                    if not busy: break
+                    time.sleep(0.005)
+                live_db_execute("""UPDATE private_order_ws_events_v245
+                    SET rest_confirmed_ts_ms=?,ws_rest_delta_ms=? WHERE client_order_id=?""",params)
+        except Exception as exc:
+            logerr(f"private WS journal: {exc}")
+        finally:
+            private_ws_journal_q.task_done()
+
+
+def private_order_ws_worker():
+    if LIVE_PRIVATE_WS_MODE=="off": return
+    retry_delay=2.0
+    while True:
+        listen_key=None; opened=False; stop=threading.Event(); started=time.monotonic()
+        try:
+            if live_user_stream_client is None or not MEXC_API_KEY:
+                raise MexcAPIError("Client user stream privé indisponible")
+            listen_key=live_user_stream_client.create_listen_key()
+            with private_ws_lock:
+                private_ws_runtime["listenkey_creates"]+=1
+                private_ws_runtime["listenkey_created_ms"]=now_ms()
+
+            def maintenance(ws):
+                next_ping=time.monotonic()+LIVE_PRIVATE_WS_PING_SEC
+                next_key=time.monotonic()+LIVE_PRIVATE_WS_KEEPALIVE_SEC
+                unanswered_since=None
+                while not stop.wait(0.25):
+                    now=time.monotonic(); ts=now_ms()
+                    if now-started>=LIVE_PRIVATE_WS_MAX_CONNECTION_SEC:
+                        try: ws.close()
+                        except Exception: pass
+                        return
+                    with private_ws_lock:
+                        last_pong=private_ws_runtime.get("last_pong_ms") or private_ws_runtime.get("last_open_ms") or ts
+                    if unanswered_since is not None and last_pong>=unanswered_since:
+                        unanswered_since=None
+                    if unanswered_since is not None and ts-unanswered_since>LIVE_PRIVATE_WS_PONG_TIMEOUT_SEC*1000:
+                        with private_ws_lock: private_ws_runtime["last_error"]="private application PONG timeout"
+                        try: ws.close()
+                        except Exception: pass
+                        return
+                    if now>=next_ping:
+                        try:
+                            ws.send(json.dumps({"method":"PING"}))
+                            with private_ws_lock: private_ws_runtime["pings"]+=1
+                            if unanswered_since is None: unanswered_since=ts
+                        except Exception as exc:
+                            with private_ws_lock: private_ws_runtime["last_error"]=str(exc)[:500]
+                            return
+                        next_ping=now+LIVE_PRIVATE_WS_PING_SEC
+                    if now>=next_key:
+                        try:
+                            live_user_stream_client.keepalive_listen_key(listen_key)
+                            with private_ws_lock:
+                                private_ws_runtime["listenkey_keepalive_ok"]+=1
+                                private_ws_runtime["last_listenkey_keepalive_ms"]=now_ms()
+                        except Exception as exc:
+                            with private_ws_lock:
+                                private_ws_runtime["listenkey_keepalive_errors"]+=1
+                                private_ws_runtime["last_error"]=str(exc)[:500]
+                        next_key=now+LIVE_PRIVATE_WS_KEEPALIVE_SEC
+
+            def on_open(ws):
+                nonlocal opened
+                opened=True; ts=now_ms()
+                with private_ws_lock:
+                    private_ws_runtime["connected"]=True
+                    private_ws_runtime["opens"]+=1
+                    if private_ws_runtime["opens"]>1: private_ws_runtime["reconnects"]+=1
+                    private_ws_runtime["last_open_ms"]=ts
+                    private_ws_runtime["last_pong_ms"]=ts
+                    private_ws_runtime["last_error"]=None
+                ws.send(json.dumps({"method":"SUBSCRIPTION","params":["spot@private.orders.v3.api.pb"]}))
+                with private_ws_lock: private_ws_runtime["subscribed"]=True
+                threading.Thread(target=maintenance,args=(ws,),daemon=True).start()
+                print(f"[Routes V{VERSION}] private order WS connected mode={LIVE_PRIVATE_WS_MODE}")
+
+            def on_message(ws,msg):
+                ts=now_ms()
+                with private_ws_lock:
+                    private_ws_runtime["messages"]+=1
+                    private_ws_runtime["last_message_ms"]=ts
+                if isinstance(msg,str):
+                    try:
+                        data=json.loads(msg)
+                        if str(data.get("msg","")).upper()=="PONG":
+                            with private_ws_lock:
+                                private_ws_runtime["pongs"]+=1
+                                private_ws_runtime["last_pong_ms"]=ts
+                    except Exception: pass
+                    return
+                try:
+                    event=decode_private_order(msg)
+                    if event: _private_ws_publish(event,ts)
+                except Exception as exc:
+                    with private_ws_lock:
+                        private_ws_runtime["decode_errors"]+=1
+                        private_ws_runtime["last_error"]=str(exc)[:500]
+                    logerr(f"decode private order WS: {exc}")
+
+            def on_error(ws,exc):
+                with private_ws_lock: private_ws_runtime["last_error"]=str(exc)[:500]
+
+            def on_close(ws,code,msg):
+                nonlocal opened
+                stop.set()
+                if opened:
+                    with private_ws_lock:
+                        private_ws_runtime["connected"]=False
+                        private_ws_runtime["subscribed"]=False
+                        private_ws_runtime["disconnects"]+=1
+                        private_ws_runtime["last_close_ms"]=now_ms()
+                    opened=False
+
+            url=WS+"?"+urlencode({"listenKey":listen_key})
+            socket=websocket.WebSocketApp(url,on_open=on_open,on_message=on_message,
+                on_error=on_error,on_close=on_close)
+            socket.run_forever(ping_interval=0)
+        except Exception as exc:
+            with private_ws_lock: private_ws_runtime["last_error"]=str(exc)[:500]
+            logerr(f"private order WS: {exc}")
+        finally:
+            stop.set()
+            if opened:
+                with private_ws_lock:
+                    private_ws_runtime["connected"]=False
+                    private_ws_runtime["subscribed"]=False
+                    private_ws_runtime["disconnects"]+=1
+                    private_ws_runtime["last_close_ms"]=now_ms()
+            if listen_key and live_user_stream_client is not None:
+                try: live_user_stream_client.close_listen_key(listen_key)
+                except Exception: pass
+        lived=time.monotonic()-started
+        retry_delay=2.0 if lived>=120 else min(30.0,max(2.0,retry_delay*1.5))
+        time.sleep(retry_delay+random.uniform(0.0,1.0))
 
 
 def initialize_live_journal():
@@ -1818,7 +2271,10 @@ def initialize_live_journal():
           prepared_ts_ms INTEGER NOT NULL, submitted_ts_ms INTEGER, final_ts_ms INTEGER,
           response_json TEXT, error TEXT, request_started_ts_ms INTEGER,
           response_received_ts_ms INTEGER, post_http_ms REAL,
-          http_queue_ms REAL, response_journal_ms REAL, settle_ms INTEGER, fallback_index INTEGER
+          http_queue_ms REAL, response_journal_ms REAL, settle_ms INTEGER, fallback_index INTEGER,
+          confirmation_source TEXT, rest_poll_count INTEGER,
+          ws_received_ts_ms INTEGER, ws_send_ts_ms INTEGER,
+          ws_post_ms REAL, ws_rest_delta_ms REAL
         );
         CREATE INDEX IF NOT EXISTS idx_live_orders_attempt ON live_orders_v240(attempt_id,leg);
         CREATE TABLE IF NOT EXISTS live_route_capabilities_v241(
@@ -1827,6 +2283,19 @@ def initialize_live_journal():
           leg2_json TEXT NOT NULL, unwind_json TEXT NOT NULL,
           last_decision_id TEXT NOT NULL, last_error TEXT
         );
+        CREATE TABLE IF NOT EXISTS private_order_ws_events_v245(
+          event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          received_ts_ms INTEGER NOT NULL, send_ts_ms INTEGER, create_ts_ms INTEGER,
+          channel TEXT NOT NULL, symbol TEXT, exchange_order_id TEXT,
+          client_order_id TEXT, status_code INTEGER, status TEXT,
+          executed_qty REAL, cumulative_quote_qty REAL,
+          post_started_ts_ms INTEGER, post_to_ws_ms REAL,
+          rest_confirmed_ts_ms INTEGER, ws_rest_delta_ms REAL,
+          matched_bot_order INTEGER NOT NULL DEFAULT 0, raw_json TEXT NOT NULL,
+          UNIQUE(client_order_id,send_ts_ms,status_code,executed_qty,cumulative_quote_qty)
+        );
+        CREATE INDEX IF NOT EXISTS idx_private_order_ws_v245_client
+          ON private_order_ws_events_v245(client_order_id,received_ts_ms);
         """)
         # Forward-compatible migration if LIVE_DB_PATH points at an earlier journal.
         existing={r[1] for r in con.execute("PRAGMA table_info(live_attempts_v240)")}
@@ -1840,7 +2309,10 @@ def initialize_live_journal():
         for name,decl in (("price","TEXT"),("request_started_ts_ms","INTEGER"),
             ("response_received_ts_ms","INTEGER"),("post_http_ms","REAL"),
             ("http_queue_ms","REAL"),("response_journal_ms","REAL"),("settle_ms","INTEGER"),
-            ("fallback_index","INTEGER")):
+            ("fallback_index","INTEGER"),("confirmation_source","TEXT"),
+            ("rest_poll_count","INTEGER"),("ws_received_ts_ms","INTEGER"),
+            ("ws_send_ts_ms","INTEGER"),("ws_post_ms","REAL"),
+            ("ws_rest_delta_ms","REAL")):
             if name not in order_existing: con.execute(f"ALTER TABLE live_orders_v240 ADD COLUMN {name} {decl}")
         con.commit()
         # Preserve still-valid route probes on the first V2.4.4 start.
@@ -2067,7 +2539,7 @@ def live_order_spec(symbol, frm, to, input_units, market, meta, client_order_id,
 def _live_client_id(attempt_id, purpose, variant=""):
     tag={"leg1":"L1","leg2":"L2","unwind":"UW"}.get(purpose,"OR")
     vt={"MARKET":"M","FILL_OR_KILL":"F","IMMEDIATE_OR_CANCEL":"I"}.get(str(variant).upper(),"")
-    return ("v244"+tag+vt+attempt_id.replace("-","")[-22:])[:32]
+    return ("v245"+tag+vt+attempt_id.replace("-","")[-22:])[:32]
 
 
 def _live_attempt_insert_values(q, requested_usd, x, attempt_id=None, status="prepared"):
@@ -2216,7 +2688,9 @@ def _route_capability(route_id):
 def _live_order_update(client_order_id, status, response=None, error=None, submitted=False, final=False,
                        exchange_order_id=None, executed_qty=None, cumulative_quote_qty=None, commissions=None,
                        request_started_ts_ms=None,response_received_ts_ms=None,post_http_ms=None,
-                       http_queue_ms=None,response_journal_ms=None,settle_ms=None,fallback_index=None):
+                       http_queue_ms=None,response_journal_ms=None,settle_ms=None,fallback_index=None,
+                       confirmation_source=None,rest_poll_count=None,ws_received_ts_ms=None,
+                       ws_send_ts_ms=None,ws_post_ms=None,ws_rest_delta_ms=None):
     live_db_execute("""UPDATE live_orders_v240 SET status=?,response_json=COALESCE(?,response_json),
         error=COALESCE(?,error),submitted_ts_ms=CASE WHEN ? THEN COALESCE(submitted_ts_ms,?) ELSE submitted_ts_ms END,
         final_ts_ms=CASE WHEN ? THEN ? ELSE final_ts_ms END,exchange_order_id=COALESCE(?,exchange_order_id),
@@ -2225,13 +2699,18 @@ def _live_order_update(client_order_id, status, response=None, error=None, submi
         request_started_ts_ms=COALESCE(?,request_started_ts_ms),
         response_received_ts_ms=COALESCE(?,response_received_ts_ms),post_http_ms=COALESCE(?,post_http_ms),
         http_queue_ms=COALESCE(?,http_queue_ms),response_journal_ms=COALESCE(?,response_journal_ms),
-        settle_ms=COALESCE(?,settle_ms),
-        fallback_index=COALESCE(?,fallback_index) WHERE client_order_id=?""",
+        settle_ms=COALESCE(?,settle_ms),fallback_index=COALESCE(?,fallback_index),
+        confirmation_source=COALESCE(?,confirmation_source),
+        rest_poll_count=COALESCE(?,rest_poll_count),
+        ws_received_ts_ms=COALESCE(?,ws_received_ts_ms),
+        ws_send_ts_ms=COALESCE(?,ws_send_ts_ms),ws_post_ms=COALESCE(?,ws_post_ms),
+        ws_rest_delta_ms=COALESCE(?,ws_rest_delta_ms) WHERE client_order_id=?""",
         (status,_live_json(response) if response is not None else None,str(error)[:1000] if error else None,
          1 if submitted else 0,now_ms(),1 if final else 0,now_ms(),str(exchange_order_id) if exchange_order_id is not None else None,
          executed_qty,cumulative_quote_qty,_live_json(commissions) if commissions is not None else None,
          request_started_ts_ms,response_received_ts_ms,post_http_ms,http_queue_ms,response_journal_ms,settle_ms,
-         fallback_index,client_order_id))
+         fallback_index,confirmation_source,rest_poll_count,ws_received_ts_ms,ws_send_ts_ms,
+         ws_post_ms,ws_rest_delta_ms,client_order_id))
 
 
 def _order_numbers(order):
@@ -2266,26 +2745,65 @@ def _order_effects(order, commissions, market, side, commission_known=True):
             "executed_qty":executed,"quote_qty":cum_quote}
 
 
-def _query_order_until_terminal(spec, first=None):
-    order=first if isinstance(first,dict) else None
-    deadline=time.monotonic()+LIVE_ORDER_SETTLE_TIMEOUT_MS/1000.0; last_error=None
-    terminal={"FILLED","CANCELED","PARTIALLY_CANCELED","REJECTED","EXPIRED"}
+def _is_terminal_order(order):
+    return bool(isinstance(order,dict) and
+        str(order.get("status","")).upper() in _TERMINAL_ORDER_STATUS)
+
+
+def _rest_confirmation_worker(spec, waiter, deadline):
+    client=live_order_status_client or live_client
+    last_error=None; polls=0
     while time.monotonic()<deadline:
-        if order and str(order.get("status","")).upper() in terminal: return order
-        # The documented POST response is only an acknowledgement. Query once
-        # immediately; the fixed poll sleep applies only if it is still open.
-        try: order=live_client.order(spec["symbol"],spec["client_order_id"])
-        except Exception as exc: last_error=exc
-        if order and str(order.get("status","")).upper() in terminal: return order
-        time.sleep(LIVE_ORDER_POLL_MS/1000.0)
-    raise MexcOrderUncertain(f"Statut final introuvable pour {spec['client_order_id']} ({last_error})")
+        try:
+            order=client.order(spec["symbol"],spec["client_order_id"]); polls+=1
+            if _is_terminal_order(order):
+                _private_ws_note_rest(waiter,order,now_ms(),polls,source="rest")
+                return
+        except Exception as exc:
+            last_error=exc; polls+=1
+        remaining=deadline-time.monotonic()
+        if remaining<=0: break
+        time.sleep(min(LIVE_ORDER_POLL_MS/1000.0,remaining))
+    with private_ws_lock:
+        waiter["rest_poll_count"]=polls
+        waiter["rest_error"]=str(last_error)[:500] if last_error else "terminal REST timeout"
+        waiter["rest_event"].set(); waiter["terminal_event"].set()
+
+
+def _query_order_until_terminal(spec, first=None, waiter=None):
+    """Return (order, authority, REST polls); OBSERVE always remains REST-authoritative."""
+    if waiter is None:
+        waiter=_private_ws_register(spec,"query-only",0,"query")
+    if _is_terminal_order(first):
+        _private_ws_note_rest(waiter,first,now_ms(),0,source="post")
+        return first,"post",0
+    deadline=time.monotonic()+LIVE_ORDER_SETTLE_TIMEOUT_MS/1000.0
+    threading.Thread(target=_rest_confirmation_worker,args=(spec,waiter,deadline),daemon=True).start()
+    while time.monotonic()<deadline:
+        waiter["terminal_event"].wait(max(0.0,min(0.05,deadline-time.monotonic())))
+        with private_ws_lock:
+            ws_order=waiter.get("ws_order"); rest_order=waiter.get("rest_order")
+            rest_error=waiter.get("rest_error"); polls=int(waiter.get("rest_poll_count") or 0)
+            # OBSERVE is deliberately incapable of advancing a real route. It
+            # measures whether the stream could win while REST stays authoritative.
+            ws_first=(waiter.get("rest_confirmed_ts_ms") is None or
+                int(waiter.get("ws_received_ts_ms") or 0)<=int(waiter.get("rest_confirmed_ts_ms") or 0))
+            if (LIVE_PRIVATE_WS_MODE=="hybrid" and _is_terminal_order(ws_order) and
+                    (not _is_terminal_order(rest_order) or ws_first)):
+                private_ws_runtime["confirmations_ws"]+=1
+                return dict(ws_order),"private_ws",polls
+            if _is_terminal_order(rest_order): return dict(rest_order),"rest",polls
+            waiter["terminal_event"].clear()
+            if rest_error and waiter["rest_event"].is_set(): break
+    raise MexcOrderUncertain(
+        f"Statut final introuvable pour {spec['client_order_id']} ({waiter.get('rest_error')})")
 
 
 def _reconcile_unknown_order(spec):
     """Query by our durable client id; never submit the POST a second time."""
     deadline=time.monotonic()+LIVE_ORDER_SETTLE_TIMEOUT_MS/1000.0; last_error=None
     while time.monotonic()<deadline:
-        try: return live_client.order(spec["symbol"],spec["client_order_id"])
+        try: return (live_order_status_client or live_client).order(spec["symbol"],spec["client_order_id"])
         except Exception as exc: last_error=exc
         time.sleep(LIVE_ORDER_POLL_MS/1000.0)
     raise MexcOrderUncertain(f"Ordre inconnu après réconciliation: {spec['client_order_id']} ({last_error})")
@@ -2323,54 +2841,82 @@ def _submit_live_order(attempt_id, leg, purpose, spec, test, prepared=False,
         except Exception as exc:
             _live_order_update(spec["client_order_id"],"test_rejected",error=exc,submitted=True,final=True)
             raise
+    waiter=_private_ws_register(spec,attempt_id,leg,purpose)
+    source=None
     try:
-        first,http=live_client.new_order(spec["symbol"],spec["side"],spec["order_type"],spec["client_order_id"],
-            spec.get("quantity"),spec.get("quote_order_qty"),spec.get("price"),test=False,with_timing=True)
-        journal_started=time.perf_counter_ns()
-        _live_order_update(spec["client_order_id"],"submitted",response=first,submitted=True,
-                           exchange_order_id=first.get("orderId") if isinstance(first,dict) else None,
-                           request_started_ts_ms=http["request_started_ts_ms"],
-                           response_received_ts_ms=http["response_received_ts_ms"],post_http_ms=http["http_ms"],
-                           http_queue_ms=http["http_queue_ms"],
-                           fallback_index=spec.get("fallback_index",0))
-        response_journal_ms=(time.perf_counter_ns()-journal_started)/1_000_000.0
-        live_response_journal_ms.append(response_journal_ms)
-    except MexcOrderUncertain as exc:
-        http=None; response_journal_ms=None
-        _live_order_update(spec["client_order_id"],"submit_unknown",error=exc,submitted=True)
-        try: first=_reconcile_unknown_order(spec)
-        except Exception as query_exc:
-            live_trip("order_status_unknown",f"{exc}; reconciliation: {query_exc}")
-            raise MexcOrderUncertain(f"Ordre inconnu et non réconcilié: {spec['client_order_id']}") from query_exc
-    except Exception as exc:
-        _live_order_update(spec["client_order_id"],"rejected",error=exc,submitted=True,final=True)
-        raise
-    order=_query_order_until_terminal(spec,first)
-    confirmed=now_ms()
-    confirm_origin=int(http["request_started_ts_ms"]) if http else started
-    confirm_ms=max(0,confirmed-confirm_origin)
-    order_id=order.get("orderId"); fills=order.get("fills") if isinstance(order,dict) else None
-    commissions=_order_commissions(fills); commission_known=bool(isinstance(fills,list) and fills)
-    executed,quote=_order_numbers(order)
-    if query_commissions and order_id is not None and executed>0 and not commission_known:
         try:
-            trades=live_client.trades(spec["symbol"],order_id)
-            commissions=_order_commissions(trades); commission_known=isinstance(trades,list) and bool(trades)
-        except Exception as exc: logerr(f"commission query {spec['symbol']} {order_id}: {exc}")
-    if executed>0 and not commission_known and query_commissions:
-        logerr(f"commission inconnue {spec['symbol']} {order_id}: haircut sécurité appliqué")
-    _live_order_update(spec["client_order_id"],str(order.get("status") or "final"),response=order,final=True,
-        exchange_order_id=order_id,executed_qty=executed,cumulative_quote_qty=quote,commissions=commissions,
-        response_journal_ms=response_journal_ms,settle_ms=confirm_ms)
-    return {"test":False,"latency_ms":(time.perf_counter_ns()-total_started_ns)/1_000_000.0,
-            "http_ms":http["http_ms"] if http else None,
-            "http_queue_ms":http["http_queue_ms"] if http else None,
-            "response_journal_ms":response_journal_ms,
-            "confirm_ms":confirm_ms,"prepare_journal_ms":prepare_journal_ms,
-            "request_started_ts_ms":http["request_started_ts_ms"] if http else None,
-            "confirmed_ts_ms":confirmed,
-            "order":order,"commissions":commissions,
-            "commission_known":commission_known}
+            first,http=live_client.new_order(spec["symbol"],spec["side"],spec["order_type"],spec["client_order_id"],
+                spec.get("quantity"),spec.get("quote_order_qty"),spec.get("price"),test=False,with_timing=True,
+                on_start=lambda ts:_private_ws_link_submission(waiter,ts))
+            order_id_first=first.get("orderId") if isinstance(first,dict) else None
+            _private_ws_link_submission(waiter,http["request_started_ts_ms"],order_id_first)
+            journal_started=time.perf_counter_ns()
+            _live_order_update(spec["client_order_id"],"submitted",response=first,submitted=True,
+                               exchange_order_id=order_id_first,
+                               request_started_ts_ms=http["request_started_ts_ms"],
+                               response_received_ts_ms=http["response_received_ts_ms"],post_http_ms=http["http_ms"],
+                               http_queue_ms=http["http_queue_ms"],
+                               fallback_index=spec.get("fallback_index",0))
+            response_journal_ms=(time.perf_counter_ns()-journal_started)/1_000_000.0
+            live_response_journal_ms.append(response_journal_ms)
+        except MexcOrderUncertain as exc:
+            http=None; response_journal_ms=None
+            _live_order_update(spec["client_order_id"],"submit_unknown",error=exc,submitted=True)
+            try:
+                first=_reconcile_unknown_order(spec)
+                _private_ws_link_submission(waiter,waiter.get("post_started_ts_ms") or started,
+                    first.get("orderId") if isinstance(first,dict) else None)
+            except Exception as query_exc:
+                live_trip("order_status_unknown",f"{exc}; reconciliation: {query_exc}")
+                raise MexcOrderUncertain(f"Ordre inconnu et non réconcilié: {spec['client_order_id']}") from query_exc
+        except Exception as exc:
+            _live_order_update(spec["client_order_id"],"rejected",error=exc,submitted=True,final=True)
+            raise
+
+        order,source,rest_polls=_query_order_until_terminal(spec,first,waiter)
+        with private_ws_lock:
+            ws_received=waiter.get("ws_received_ts_ms")
+            ws_send=waiter.get("ws_send_ts_ms")
+            post_started=waiter.get("post_started_ts_ms")
+            rest_confirmed=waiter.get("rest_confirmed_ts_ms")
+            ws_rest_delta=(float(ws_received-rest_confirmed)
+                if ws_received is not None and rest_confirmed is not None else None)
+        confirmed=(ws_received if source=="private_ws" and ws_received is not None
+            else rest_confirmed if rest_confirmed is not None else now_ms())
+        confirm_origin=int(post_started or (http["request_started_ts_ms"] if http else started))
+        confirm_ms=max(0,confirmed-confirm_origin)
+        ws_post_ms=float(ws_received-confirm_origin) if ws_received is not None else None
+        order_id=order.get("orderId"); fills=order.get("fills") if isinstance(order,dict) else None
+        if order_id is not None: _private_ws_link_submission(waiter,confirm_origin,order_id)
+        commissions=_order_commissions(fills); commission_known=bool(isinstance(fills,list) and fills)
+        executed,quote=_order_numbers(order)
+        if query_commissions and order_id is not None and executed>0 and not commission_known:
+            try:
+                trades=live_client.trades(spec["symbol"],order_id)
+                commissions=_order_commissions(trades); commission_known=isinstance(trades,list) and bool(trades)
+            except Exception as exc: logerr(f"commission query {spec['symbol']} {order_id}: {exc}")
+        if executed>0 and not commission_known and query_commissions:
+            logerr(f"commission inconnue {spec['symbol']} {order_id}: haircut sécurité appliqué")
+        _live_order_update(spec["client_order_id"],str(order.get("status") or "final"),response=order,final=True,
+            exchange_order_id=order_id,executed_qty=executed,cumulative_quote_qty=quote,commissions=commissions,
+            response_journal_ms=response_journal_ms,settle_ms=confirm_ms,
+            confirmation_source=source,rest_poll_count=rest_polls,
+            ws_received_ts_ms=ws_received,ws_send_ts_ms=ws_send,ws_post_ms=ws_post_ms,
+            ws_rest_delta_ms=ws_rest_delta)
+        return {"test":False,"latency_ms":(time.perf_counter_ns()-total_started_ns)/1_000_000.0,
+                "http_ms":http["http_ms"] if http else None,
+                "http_queue_ms":http["http_queue_ms"] if http else None,
+                "response_journal_ms":response_journal_ms,
+                "confirm_ms":confirm_ms,"prepare_journal_ms":prepare_journal_ms,
+                "request_started_ts_ms":http["request_started_ts_ms"] if http else post_started,
+                "confirmed_ts_ms":confirmed,"confirmation_source":source,
+                "rest_poll_count":rest_polls,"ws_received_ts_ms":ws_received,
+                "ws_send_ts_ms":ws_send,"ws_post_ms":ws_post_ms,
+                "ws_rest_delta_ms":ws_rest_delta,
+                "order":order,"commissions":commissions,
+                "commission_known":commission_known}
+    finally:
+        _private_ws_release(waiter,keep_rest_probe=(source=="private_ws"))
 
 
 def _reconcile_order_commissions(result, spec):
@@ -2566,7 +3112,7 @@ def _prevalidation_test_best(route_id, leg, purpose, symbol, frm, to, input_unit
         raise MexcAPIError("Client de prévalidation indisponible")
     nonce=uuid.uuid4().hex
     candidates=live_order_candidates(symbol,frm,to,input_units,market,meta,
-        lambda order_type:("v244PV"+str(leg)+order_type[:1]+nonce[-22:])[:32],
+        lambda order_type:("v245PV"+str(leg)+order_type[:1]+nonce[-22:])[:32],
         age_limit_ms=LIVE_PREVALIDATE_DEPTH_AGE_MS)
     errors=[]
     for fallback_index,spec in enumerate(candidates):
@@ -3082,30 +3628,33 @@ def live_account_worker():
 
 
 def live_http_keepalive_worker():
-    """Keep only the dedicated order pool warm, without touching account I/O."""
+    """Keep the independent order and order-status pools warm."""
     while True:
         time.sleep(1.0)
         if TRADING_MODE=="shadow" or live_client is None: continue
         with live_lock: busy=bool(live_runtime.get("busy"))
         if busy: continue
-        try:
-            rtt=live_client.keepalive_if_idle(int(LIVE_HTTP_KEEPALIVE_SEC*1000),
-                LIVE_HTTP_KEEPALIVE_TIMEOUT_SEC,
-                abort_if=lambda: bool(live_runtime.get("busy")))
-            if rtt is None: continue
-            with live_lock:
-                live_runtime["last_keepalive_rtt_ms"]=rtt
-                live_runtime["last_keepalive_ts_ms"]=now_ms()
-                live_runtime["keepalive_ok"]+=1
-                live_runtime["last_keepalive_error"]=None
-        except Exception as exc:
-            with live_lock:
-                live_runtime["keepalive_errors"]+=1
-                live_runtime["last_keepalive_error"]=str(exc)[:400]
+        for client,key in ((live_client,"last_keepalive_rtt_ms"),
+                           (live_order_status_client,"last_status_keepalive_rtt_ms")):
+            if client is None: continue
+            try:
+                rtt=client.keepalive_if_idle(int(LIVE_HTTP_KEEPALIVE_SEC*1000),
+                    LIVE_HTTP_KEEPALIVE_TIMEOUT_SEC,
+                    abort_if=lambda: bool(live_runtime.get("busy")))
+                if rtt is None: continue
+                with live_lock:
+                    live_runtime[key]=rtt
+                    live_runtime["last_keepalive_ts_ms"]=now_ms()
+                    live_runtime["keepalive_ok"]+=1
+                    live_runtime["last_keepalive_error"]=None
+            except Exception as exc:
+                with live_lock:
+                    live_runtime["keepalive_errors"]+=1
+                    live_runtime["last_keepalive_error"]=str(exc)[:400]
 
 
 def initialize_live_gateway():
-    global live_client,live_account_client,live_prevalidation_client
+    global live_client,live_order_status_client,live_account_client,live_prevalidation_client,live_user_stream_client
     initialize_live_journal()
     load_live_state()
     _load_route_capabilities()
@@ -3124,11 +3673,13 @@ def initialize_live_gateway():
         with live_lock: live_runtime["last_error"]="MEXC_API_KEY/MEXC_API_SECRET absentes"
         persist_live_state(); return
     live_client=MexcPrivateClient(MEXC_API_KEY,MEXC_API_SECRET,role="orders")
+    live_order_status_client=MexcPrivateClient(MEXC_API_KEY,MEXC_API_SECRET,role="order_status")
     live_account_client=MexcPrivateClient(MEXC_API_KEY,MEXC_API_SECRET,role="account")
+    live_user_stream_client=MexcPrivateClient(MEXC_API_KEY,MEXC_API_SECRET,role="user_stream")
     if TRADING_MODE=="test" and LIVE_PREVALIDATE_ENABLED:
         live_prevalidation_client=MexcPrivateClient(MEXC_API_KEY,MEXC_API_SECRET,role="prevalidation")
     try:
-        live_client.sync_time(); live_account_client.sync_time()
+        live_client.sync_time(); live_order_status_client.sync_time(); live_account_client.sync_time()
         if live_prevalidation_client is not None: live_prevalidation_client.sync_time()
         _refresh_live_account(); persist_live_state()
     except Exception as exc:
@@ -3137,6 +3688,9 @@ def initialize_live_gateway():
     threading.Thread(target=live_gateway_worker,daemon=True).start()
     threading.Thread(target=live_account_worker,daemon=True).start()
     threading.Thread(target=live_http_keepalive_worker,daemon=True).start()
+    threading.Thread(target=private_ws_journal_worker,daemon=True).start()
+    if LIVE_PRIVATE_WS_MODE!="off":
+        threading.Thread(target=private_order_ws_worker,daemon=True).start()
     threading.Thread(target=bot_shadow_schedule_worker,daemon=True).start()
     if live_prevalidation_client is not None:
         threading.Thread(target=live_prevalidation_worker,daemon=True).start()
@@ -3157,6 +3711,15 @@ def live_status():
         validated_routes=sum(int(v.get("expires_ts_ms") or 0)>=now_ms() for v in live_route_capabilities.values())
         account_ts=live_runtime.get("account_ts_ms")
         prevalidation=dict(prevalidation_runtime)
+    with private_ws_lock:
+        private_stream=dict(private_ws_runtime)
+        private_stream["pending_orders"]=sum(1 for w in private_ws_waiters.values() if not w.get("released"))
+    private_stream["message_age_ms"]=(max(0,now_ms()-int(private_stream["last_message_ms"]))
+        if private_stream.get("last_message_ms") else None)
+    private_stream["pong_age_ms"]=(max(0,now_ms()-int(private_stream["last_pong_ms"]))
+        if private_stream.get("last_pong_ms") else None)
+    private_stream["post_to_event"]=_runtime_series_stats(private_ws_post_to_event_ms)
+    private_stream["ws_rest_delta"]=_runtime_series_stats(private_ws_rest_delta_ms)
     retry_window=LIVE_EXEC_RETRY_WINDOW_MS if TRADING_MODE=="live" else LIVE_RETRY_WINDOW_MS
     retry_interval=LIVE_EXEC_RETRY_INTERVAL_MS if TRADING_MODE=="live" else LIVE_RETRY_INTERVAL_MS
     retry_max=LIVE_EXEC_RETRY_MAX if TRADING_MODE=="live" else LIVE_RETRY_MAX
@@ -3196,7 +3759,10 @@ def live_status():
         "leg2_confirmation":_runtime_series_stats(live_leg2_confirm_ms),
         "prepare_journal":_runtime_series_stats(live_prepare_journal_ms),
         "response_journal":_runtime_series_stats(live_response_journal_ms),
-        "bot_shadow_schedule_lag":_runtime_series_stats(bot_shadow_schedule_lag_ms)})
+        "bot_shadow_schedule_lag":_runtime_series_stats(bot_shadow_schedule_lag_ms),
+        "private_order_stream":private_stream,
+        "private_order_stream_mode":LIVE_PRIVATE_WS_MODE,
+        "private_order_stream_authoritative":LIVE_PRIVATE_WS_MODE=="hybrid"})
     return out
 
 # ---------- Paper engine ----------
@@ -4459,12 +5025,13 @@ def api_status():
                  "v235_capture":cached.get("v235_capture",{})})
     return jsonify(base)
 
-HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MEXC 2-Leg V2.4.4</title>
+HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MEXC 2-Leg V2.4.5</title>
 <style>body{background:#090d14;color:#e8edf5;font-family:system-ui;margin:0;padding:16px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.c,.panel{background:#111827;border:1px solid #273248;border-radius:10px;padding:12px}.v{font-weight:800;font-size:20px}.big{font-size:28px}.muted{color:#9aa7bd;font-size:12px}.good{color:#22d38a}.bad{color:#ff6677}.panel{margin-top:12px;overflow:auto}.latency{display:grid;grid-template-columns:repeat(3,minmax(250px,1fr));gap:10px}.latbox{background:#0c1421;border:1px solid #2a3850;border-radius:10px;padding:12px}.balance{margin-top:8px;line-height:1.7}.metricgrid{display:grid;grid-template-columns:repeat(2,minmax(95px,1fr));gap:7px;margin-top:10px}.metric{background:#111b2b;border-radius:8px;padding:8px}.tag{display:inline-block;border:1px solid #334155;border-radius:999px;padding:3px 7px;font-size:11px;color:#bac6d8}table{border-collapse:collapse;width:100%;font-size:12px}th,td{padding:8px;border-bottom:1px solid #263044;text-align:right}th:first-child,td:first-child{text-align:left}@media(max-width:900px){.latency{grid-template-columns:1fr}}</style></head><body>
-<h2>MEXC — Scanner + micro-bot Spot 2-leg V2.4.4</h2><div class=cards id=cards></div>
+<h2>MEXC — Scanner + micro-bot Spot 2-leg V2.4.5</h2><div class=cards id=cards></div>
 <div class=panel id=health></div>
 <div class=panel id=coverage></div>
 <div class=panel id=live></div>
+<div class=panel id=privatews></div>
 <div class=panel id=livefunnel></div>
 <div class=panel id=botlatencies></div>
 <div class=panel id=latencies></div>
@@ -4473,14 +5040,15 @@ HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" 
 <div class=panel><h3>Décisions récentes — Depth Quality à T0</h3><table><thead><tr><th>Heure</th><th>Route</th><th>Edge T0</th><th>Classe</th><th>Taille retenue</th><th>Edge −50% BBO</th><th>Edge sans L1</th><th>Réserve L1–L3</th><th>Calcul</th></tr></thead><tbody id=recent></tbody></table></div>
 <div class=panel id=capture></div><div class=panel id=diag></div>
 <script>
-async function refresh(){let d=await fetch('/api/status').then(r=>r.json()),g=d.diag,p=d.v235_policy||{},cap=d.v235_capture||{},ql=d.quality||{},ad=d.admissions||{},sk=d.shadow_skips||{},he=d.health||{},lv=d.live||{},lf=d.live_funnel||{},la=lv.arm||{},cv=d.coverage||{},rc=cv.route_counts||{},tc=cv.tick_counts||{},pv=lv.prevalidation||{};
+async function refresh(){let d=await fetch('/api/status').then(r=>r.json()),g=d.diag,p=d.v235_policy||{},cap=d.v235_capture||{},ql=d.quality||{},ad=d.admissions||{},sk=d.shadow_skips||{},he=d.health||{},lv=d.live||{},lf=d.live_funnel||{},la=lv.arm||{},cv=d.coverage||{},rc=cv.route_counts||{},tc=cv.tick_counts||{},pv=lv.prevalidation||{},pw=lv.private_order_stream||{};
+document.getElementById('privatews').innerHTML=`<div class=tag>ORDRES WEBSOCKET PRIVÉ V2.4.5</div><h3 class='${pw.connected?'good':((lv.configured_mode||'shadow')==='shadow'?'':'bad')}'>Mode ${(pw.mode||'off').toUpperCase()} · ${pw.connected?'connecté':'déconnecté'}${pw.subscribed?' · abonné':''}</h3><div class=cards><div><div class=v>${pw.opens||0} / ${pw.disconnects||0}</div><div class=muted>ouvertures / chutes privées</div></div><div><div class=v>${pw.messages||0} / ${pw.order_events||0}</div><div class=muted>messages / événements ordre</div></div><div><div class=v>${pw.terminal_events||0}</div><div class=muted>événements terminaux</div></div><div><div class=v>${pw.matched_events||0} / ${pw.unmatched_events||0}</div><div class=muted>liés au bot / non liés</div></div><div><div class=v>${pw.ws_before_rest||0} / ${pw.rest_before_ws||0} / ${pw.same_ms||0}</div><div class=muted>WS avant REST / après / égal</div></div><div><div class=v>${pw.post_to_event?.p95_ms==null?'-':Number(pw.post_to_event.p95_ms).toFixed(1)+' ms'}</div><div class=muted>POST → événement privé p95</div></div><div><div class=v>${pw.ws_rest_delta?.p95_ms==null?'-':Number(pw.ws_rest_delta.p95_ms).toFixed(1)+' ms'}</div><div class=muted>delta WS − REST p95</div></div><div><div class=v>${pw.confirmations_ws||0} / ${pw.confirmations_rest||0} / ${pw.confirmations_post||0}</div><div class=muted>autorité WS / REST / POST</div></div><div><div class=v>${pw.pings||0} / ${pw.pongs||0}</div><div class=muted>PING / PONG privés</div></div><div><div class=v>${pw.listenkey_keepalive_ok||0} / ${pw.listenkey_keepalive_errors||0}</div><div class=muted>listenKey OK / erreurs</div></div><div><div class='v ${(pw.decode_errors||0)===0?'good':'bad'}'>${pw.decode_errors||0}</div><div class=muted>erreurs de décodage</div></div><div><div class=v>${pw.pending_orders||0}</div><div class=muted>ordres suivis</div></div></div><div class=muted style='margin-top:10px'>OBSERVE : le flux privé est mesuré mais REST reste seul décisionnaire pour la jambe suivante. HYBRID n'est activable que volontairement par variable d'environnement après validation sur des ordres LIVE. Le flux privé, le statut REST et les ordres utilisent des connexions séparées ; sa journalisation attend la fin de la route critique.</div>`;
 document.getElementById('cards').innerHTML=`<div class=c><div class=v>${d.symbols}</div><div class=muted>marchés WS</div></div><div class=c><div class=v>${d.routes}</div><div class=muted>routes 2-leg</div></div><div class=c><div class=v>${d.ws}/${d.ws_expected}</div><div class=muted>WebSockets</div></div><div class=c><div class=v>${d.age_ms??'-'} ms</div><div class=muted>dernier BBO reçu</div></div><div class=c><div class=v>${d.depth_ready||0}/${d.symbols}</div><div class=muted>carnets Depth prêts</div></div><div class=c><div class=v>${d.v22?.decisions||0}</div><div class=muted>décisions replay ≥${(p.replay_min_edge_pct??0.30).toFixed(2)}%</div></div><div class=c><div class=v>${d.v22?.trace_points||0}</div><div class=muted>points trajectoire</div></div>`;
 let wsok=(he.ws_connected===he.ws_expected)&&(he.stale_workers||0)===0&&(he.workers_without_pong||0)===0&&(d.depth_ready===d.symbols)&&(he.resync_pending||0)===0;document.getElementById('health').innerHTML=`<div class=tag>SANTÉ TEMPS RÉEL</div><h3 class='${wsok?'good':'bad'}'>WebSockets ${he.ws_connected||0}/${he.ws_expected||0} · ${he.stale_workers||0} silencieux &gt;30 s</h3><div class=cards><div><div class=v>${he.ws_disconnects||0}</div><div class=muted>chutes WS</div></div><div><div class=v>${he.ws_reconnects||0}</div><div class=muted>reconnexions WS</div></div><div><div class=v>${he.ws_app_pings||0} / ${he.ws_app_pongs||0}</div><div class=muted>PING / PONG MEXC</div></div><div><div class=v>${he.max_pong_age_ms==null?'-':he.max_pong_age_ms+' ms'}</div><div class=muted>âge maximal PONG</div></div><div><div class=v>${he.workers_without_pong||0} / ${he.ws_ping_errors||0}</div><div class=muted>PONG en retard / erreurs ping</div></div><div><div class=v>${he.max_worker_message_age_ms==null?'-':he.max_worker_message_age_ms+' ms'}</div><div class=muted>silence maximal worker WS</div></div><div><div class=v>${he.depth_book_age_p95_ms==null?'-':he.depth_book_age_p95_ms+' ms'}</div><div class=muted>âge Depth p95</div></div><div><div class=v>${he.depth_book_age_max_ms==null?'-':he.depth_book_age_max_ms+' ms'}</div><div class=muted>âge Depth maximum prêt</div></div><div><div class=v>${he.depth_gap_events||0}</div><div class=muted>gaps Depth hors bootstrap</div></div><div><div class=v>${he.depth_resync_failures||0}</div><div class=muted>échecs resync</div></div><div><div class=v>${he.resync_queue||0}/${he.resync_pending||0}</div><div class=muted>file/pending resync</div></div><div><div class=v>${he.scan_queue||0}/${he.scan_queue_capacity||0}</div><div class=muted>file scan</div></div><div><div class=v>${he.scan_queue_drops||0}</div><div class=muted>abandons file scan</div></div><div><div class=v>${he.scan_coalesced||0}</div><div class=muted>updates fusionnées</div></div><div><div class=v>${he.db_queue||0}/${he.db_queue_capacity||0}</div><div class=muted>file DB</div></div><div><div class=v>${he.db_queue_drops||0}</div><div class=muted>abandons DB</div></div><div><div class=v>${((he.db_size_bytes||0)/1048576).toFixed(0)} / ${((he.db_wal_size_bytes||0)/1048576).toFixed(0)} MB</div><div class=muted>base / WAL</div></div><div><div class=v>${he.research_pending||0} / ${he.depth_capture_pending||0}</div><div class=muted>matrice live / captures pending</div></div><div><div class='v ${(he.shadow_overdue||0)===0?'good':'bad'}'>${he.shadow_pending||0} / ${he.shadow_overdue||0}</div><div class=muted>pending Shadow / en retard</div></div><div><div class=v>${he.shadow_execution_lag?.p95_ms==null?'-':he.shadow_execution_lag.p95_ms+' ms'}</div><div class=muted>retard worker Shadow p95</div></div><div><div class=v>${he.dashboard_cache_age_ms==null?'-':Math.round(he.dashboard_cache_age_ms/1000)+' s'}</div><div class=muted>âge statistiques page</div></div><div><div class=v>${he.dashboard_refresh_ms==null?'-':he.dashboard_refresh_ms+' ms'}</div><div class=muted>durée calcul statistiques</div></div></div>`;
 document.getElementById('coverage').innerHTML=`<div class=tag>AUDIT COMPLET DES ${cv.total_routes||d.routes} ROUTES</div><h3>Couverture reçue → qualité → exécution BOT</h3><div class=cards><div><div class=v>${rc.evaluations||0}/${cv.total_routes||0}</div><div class=muted>routes évaluées aujourd'hui</div></div><div><div class=v>${rc.calculable||0}</div><div class=muted>routes avec deux carnets calculables</div></div><div><div class=v>${rc.research_fresh||0}</div><div class=muted>routes Depth frais ≤${d.primary_age_ms||150} ms</div></div><div><div class=v>${rc.live_fresh||0}</div><div class=muted>routes fraîches passerelle ≤${lv.bbo_age_ms||50} ms</div></div><div><div class=v>${rc.edge_ge_030||0}</div><div class=muted>routes ayant atteint 0,30%</div></div><div><div class=v>${rc.edge_ge_035||0}</div><div class=muted>routes ayant atteint 0,35%</div></div><div><div class=v good>${rc.quality_eligible||0}</div><div class=muted>routes classées A/B+</div></div><div><div class=v>${cv.validated_now||0}</div><div class=muted>routes /order/test valides</div></div><div><div class=v good>${rc.bot_admitted||0}</div><div class=muted>routes arrivées en Shadow BOT</div></div></div><div class=muted style='margin-top:10px'>Observations agrégées : ≥0,30% ${tc.edge_ge_030||0} · ≥0,35% ${tc.edge_ge_035||0} · A/B+ ${tc.quality_eligible||0} (A ${tc.quality_a||0} · B+ ${tc.quality_bplus||0}). Écriture fixe : ${cv.storage_rows_per_day||0} lignes/jour, mise à jour toutes les ${cv.flush_sec||60} s — aucune ligne par tick.</div>`;
-let lb=Object.entries(lv.balances||{}).filter(([a])=>(lv.allowed_start_assets||[]).includes(a)).map(([a,v])=>`${a} <b>${Number(v.free||0).toFixed(4)}</b>`).join(' · '),liveok=la.effective&&!lv.circuit_open,mode=(lv.configured_mode||'shadow').toUpperCase();document.getElementById('live').innerHTML=`<div class=tag>PASSERELLE PRIVÉE V2.4.4</div><h3 class='${liveok?'good':(mode==='SHADOW'?'':'bad')}'>Mode ${mode} · ${la.reason||'-'}</h3><div class=cards><div><div class=v>${lv.api_ok?'OK':'NON'}</div><div class=muted>API privée / canTrade</div></div><div><div class=v>${Number(lv.cap_usd||0).toFixed(0)} $</div><div class=muted>cap par ordre initial</div></div><div><div class=v>${Number(lv.capital_limit_usd||0).toFixed(0)} $</div><div class=muted>capital dédié maximal</div></div><div><div class=v>${Number(lv.daily_loss_limit_usd||0).toFixed(0)} $</div><div class=muted>coupe-circuit perte journalière</div></div><div><div class=v>${lv.validated_routes||0}</div><div class=muted>routes directionnelles valides</div></div><div><div class=v>${lv.test_validations||0}</div><div class=muted>validations opportunité /order/test</div></div><div><div class=v>${lv.capability_reuses||0}</div><div class=muted>validations réutilisées</div></div><div><div class=v>${lv.completed||0}</div><div class=muted>trades réels terminés</div></div><div><div class=v>${lv.wins||0} / ${lv.losses||0}</div><div class=muted>gagnés / perdus réels</div></div><div><div class='v ${(lv.realized_pnl||0)>=0?'good':'bad'}'>${(lv.realized_pnl||0)>=0?'+':''}${Number(lv.realized_pnl||0).toFixed(4)} $</div><div class=muted>PnL réel journalisé</div></div><div><div class=v>${lv.busy?'1':'0'} / ${lv.queued||0}</div><div class=muted>actif / en file</div></div><div><div class=v>${lv.first_check_latency?.p95_ms==null?'-':lv.first_check_latency.p95_ms+' ms'}</div><div class=muted>T0 → premier contrôle p95</div></div><div><div class=v>${lv.gateway_admit_latency?.p95_ms==null?'-':lv.gateway_admit_latency.p95_ms+' ms'}</div><div class=muted>T0 → admission fraîche p95</div></div><div><div class=v>${lv.admission_to_post?.p95_ms==null?'-':lv.admission_to_post.p95_ms+' ms'}</div><div class=muted>admission → POST jambe 1 p95</div></div><div><div class=v>${lv.leg1_post_http?.p95_ms==null?'-':Number(lv.leg1_post_http.p95_ms).toFixed(1)+' ms'}</div><div class=muted>HTTP POST jambe 1 p95</div></div><div><div class=v>${lv.leg2_post_http?.p95_ms==null?'-':Number(lv.leg2_post_http.p95_ms).toFixed(1)+' ms'}</div><div class=muted>HTTP POST jambe 2 p95</div></div><div><div class=v>${lv.leg1_confirmation?.p95_ms==null?'-':lv.leg1_confirmation.p95_ms+' ms'}</div><div class=muted>POST → confirmation jambe 1 p95 LIVE</div></div><div><div class=v>${lv.leg2_confirmation?.p95_ms==null?'-':lv.leg2_confirmation.p95_ms+' ms'}</div><div class=muted>POST → confirmation jambe 2 p95 LIVE</div></div><div><div class=v>${lv.prepare_journal?.p95_ms==null?'-':Number(lv.prepare_journal.p95_ms).toFixed(1)+' ms'}</div><div class=muted>journal avant ordre p95</div></div><div><div class=v>${lv.response_journal?.p95_ms==null?'-':Number(lv.response_journal.p95_ms).toFixed(1)+' ms'}</div><div class=muted>journal réponse p95</div></div><div><div class=v>${lv.gateway_check_compute?.p95_us==null?'-':Number(lv.gateway_check_compute.p95_us).toFixed(1)+' µs'}</div><div class=muted>contrôle gateway p95</div></div><div><div class=v>${lv.bot_shadow_schedule_lag?.p95_ms==null?'-':lv.bot_shadow_schedule_lag.p95_ms+' ms'}</div><div class=muted>copie Shadow hors chemin p95</div></div><div><div class=v>${lv.last_keepalive_rtt_ms==null?'-':Number(lv.last_keepalive_rtt_ms).toFixed(1)+' ms'}</div><div class=muted>dernier keep-alive HTTP</div></div><div><div class=v>${lv.keepalive_ok||0} / ${lv.keepalive_errors||0}</div><div class=muted>keep-alive OK / erreurs</div></div><div><div class=v>${lv.account_cache_age_ms==null?'-':lv.account_cache_age_ms+' ms'}</div><div class=muted>âge cache compte</div></div></div><div class=muted style='margin-top:10px'>Soldes libres dédiés : ${lb||'-'} · Protection autres actifs ${lv.protected_bags?'active':'inactive'} · Rééquilibrage réel désactivé ; Shadows BOT ${lv.bot_shadow_rebalancing?'30 min / 4 h':'désactivé'} · Haircut unique ${Number(lv.fee_safety_pct||0).toFixed(2)}% · jambe 2 seulement si edge conservateur ≥${Number(lv.leg2_min_edge_pct||0).toFixed(2)}% · Commission jambe 1 différée ${lv.defer_leg1_commission?'oui':'non'} · Circuit ${lv.circuit_open?'OUVERT: '+(lv.circuit_reason||'-'):'fermé'} · journal critique séparé : ${lv.live_journal_path||'-'} · HTTP ordres gardé chaud toutes les ${lv.http_keepalive_sec||'-'} s · route testée dans les ${Number(lv.test_max_age_hours||0).toFixed(0)} h requise : ${lv.require_tested_route?'oui':'non'}. ${mode==='TEST'?'Les requêtes sont envoyées à /api/v3/order/test : aucune entrée dans le carnet et aucun fonds déplacé.':(mode==='LIVE'?'Les ordres réels exigent les trois verrous locaux.':'Passerelle inactive.')}</div>`;
+let lb=Object.entries(lv.balances||{}).filter(([a])=>(lv.allowed_start_assets||[]).includes(a)).map(([a,v])=>`${a} <b>${Number(v.free||0).toFixed(4)}</b>`).join(' · '),liveok=la.effective&&!lv.circuit_open,mode=(lv.configured_mode||'shadow').toUpperCase();document.getElementById('live').innerHTML=`<div class=tag>PASSERELLE PRIVÉE V2.4.5</div><h3 class='${liveok?'good':((lv.configured_mode||'shadow')==='shadow'?'':'bad')}'>Mode ${mode} · ${la.reason||'-'}</h3><div class=cards><div><div class=v>${lv.api_ok?'OK':'NON'}</div><div class=muted>API privée / canTrade</div></div><div><div class=v>${Number(lv.cap_usd||0).toFixed(0)} $</div><div class=muted>cap par ordre initial</div></div><div><div class=v>${Number(lv.capital_limit_usd||0).toFixed(0)} $</div><div class=muted>capital dédié maximal</div></div><div><div class=v>${Number(lv.daily_loss_limit_usd||0).toFixed(0)} $</div><div class=muted>coupe-circuit perte journalière</div></div><div><div class=v>${lv.validated_routes||0}</div><div class=muted>routes directionnelles valides</div></div><div><div class=v>${lv.test_validations||0}</div><div class=muted>validations opportunité /order/test</div></div><div><div class=v>${lv.capability_reuses||0}</div><div class=muted>validations réutilisées</div></div><div><div class=v>${lv.completed||0}</div><div class=muted>trades réels terminés</div></div><div><div class=v>${lv.wins||0} / ${lv.losses||0}</div><div class=muted>gagnés / perdus réels</div></div><div><div class='v ${(lv.realized_pnl||0)>=0?'good':'bad'}'>${(lv.realized_pnl||0)>=0?'+':''}${Number(lv.realized_pnl||0).toFixed(4)} $</div><div class=muted>PnL réel journalisé</div></div><div><div class=v>${lv.busy?'1':'0'} / ${lv.queued||0}</div><div class=muted>actif / en file</div></div><div><div class=v>${lv.first_check_latency?.p95_ms==null?'-':lv.first_check_latency.p95_ms+' ms'}</div><div class=muted>T0 → premier contrôle p95</div></div><div><div class=v>${lv.gateway_admit_latency?.p95_ms==null?'-':lv.gateway_admit_latency.p95_ms+' ms'}</div><div class=muted>T0 → admission fraîche p95</div></div><div><div class=v>${lv.admission_to_post?.p95_ms==null?'-':lv.admission_to_post.p95_ms+' ms'}</div><div class=muted>admission → POST jambe 1 p95</div></div><div><div class=v>${lv.leg1_post_http?.p95_ms==null?'-':Number(lv.leg1_post_http.p95_ms).toFixed(1)+' ms'}</div><div class=muted>HTTP POST jambe 1 p95</div></div><div><div class=v>${lv.leg2_post_http?.p95_ms==null?'-':Number(lv.leg2_post_http.p95_ms).toFixed(1)+' ms'}</div><div class=muted>HTTP POST jambe 2 p95</div></div><div><div class=v>${lv.leg1_confirmation?.p95_ms==null?'-':lv.leg1_confirmation.p95_ms+' ms'}</div><div class=muted>POST → confirmation jambe 1 p95 LIVE</div></div><div><div class=v>${lv.leg2_confirmation?.p95_ms==null?'-':lv.leg2_confirmation.p95_ms+' ms'}</div><div class=muted>POST → confirmation jambe 2 p95 LIVE</div></div><div><div class=v>${lv.prepare_journal?.p95_ms==null?'-':Number(lv.prepare_journal.p95_ms).toFixed(1)+' ms'}</div><div class=muted>journal avant ordre p95</div></div><div><div class=v>${lv.response_journal?.p95_ms==null?'-':Number(lv.response_journal.p95_ms).toFixed(1)+' ms'}</div><div class=muted>journal réponse p95</div></div><div><div class=v>${lv.gateway_check_compute?.p95_us==null?'-':Number(lv.gateway_check_compute.p95_us).toFixed(1)+' µs'}</div><div class=muted>contrôle gateway p95</div></div><div><div class=v>${lv.bot_shadow_schedule_lag?.p95_ms==null?'-':lv.bot_shadow_schedule_lag.p95_ms+' ms'}</div><div class=muted>copie Shadow hors chemin p95</div></div><div><div class=v>${lv.last_keepalive_rtt_ms==null?'-':Number(lv.last_keepalive_rtt_ms).toFixed(1)+' ms'}</div><div class=muted>dernier keep-alive HTTP</div></div><div><div class=v>${lv.keepalive_ok||0} / ${lv.keepalive_errors||0}</div><div class=muted>keep-alive OK / erreurs</div></div><div><div class=v>${lv.account_cache_age_ms==null?'-':lv.account_cache_age_ms+' ms'}</div><div class=muted>âge cache compte</div></div></div><div class=muted style='margin-top:10px'>Soldes libres dédiés : ${lb||'-'} · Protection autres actifs ${lv.protected_bags?'active':'inactive'} · Rééquilibrage réel désactivé ; Shadows BOT ${lv.bot_shadow_rebalancing?'30 min / 4 h':'désactivé'} · Haircut unique ${Number(lv.fee_safety_pct||0).toFixed(2)}% · jambe 2 seulement si edge conservateur ≥${Number(lv.leg2_min_edge_pct||0).toFixed(2)}% · Commission jambe 1 différée ${lv.defer_leg1_commission?'oui':'non'} · Circuit ${lv.circuit_open?'OUVERT: '+(lv.circuit_reason||'-'):'fermé'} · journal critique séparé : ${lv.live_journal_path||'-'} · HTTP ordres gardé chaud toutes les ${lv.http_keepalive_sec||'-'} s · route testée dans les ${Number(lv.test_max_age_hours||0).toFixed(0)} h requise : ${lv.require_tested_route?'oui':'non'}. ${mode==='TEST'?'Les requêtes sont envoyées à /api/v3/order/test : aucune entrée dans le carnet et aucun fonds déplacé.':(mode==='LIVE'?'Les ordres réels exigent les trois verrous locaux.':'Passerelle inactive.')}</div>`;
 document.getElementById('live').insertAdjacentHTML('beforeend',`<div class=cards style='margin-top:10px'><div><div class=v>${lv.leg1_http_queue?.p95_ms==null?'-':Number(lv.leg1_http_queue.p95_ms).toFixed(1)+' ms'}</div><div class=muted>attente verrou HTTP jambe 1 p95</div></div><div><div class=v>${lv.leg2_http_queue?.p95_ms==null?'-':Number(lv.leg2_http_queue.p95_ms).toFixed(1)+' ms'}</div><div class=muted>attente verrou HTTP jambe 2 p95</div></div><div><div class=v>${Number(lv.http_keepalive_timeout_sec||0).toFixed(2)} s</div><div class=muted>timeout keep-alive HTTP</div></div></div>`);
 document.getElementById('live').insertAdjacentHTML('beforeend',`<div class=cards style='margin-top:10px'><div><div class=v>${pv.running?'ACTIVE':'OFF'}</div><div class=muted>prévalidation de fond TEST</div></div><div><div class=v>${pv.checked||0}/${cv.total_routes||0}</div><div class=muted>progression cycle courant</div></div><div><div class=v good>${pv.validated||0}</div><div class=muted>routes prévalidées depuis démarrage</div></div><div><div class=v>${pv.skipped_depth||0}/${pv.skipped_size||0}</div><div class=muted>reportées Depth / taille</div></div><div><div class='v ${(pv.errors||0)===0?'good':'bad'}'>${pv.errors||0}</div><div class=muted>erreurs de prévalidation</div></div></div><div class=muted style='margin-top:8px'>Session HTTP dédiée, une route toutes les ${Number(lv.prevalidation_interval_sec||0).toFixed(0)} s ; suspendue automatiquement en LIVE. Le carnet éventuellement ancien sert uniquement à construire la requête syntaxique /order/test : aucune admission BOT ne contourne la fraîcheur stricte de ${lv.bbo_age_ms||50} ms. Dernier état : ${pv.last_route||'-'} · ${pv.last_status||'-'}${pv.last_error?' · '+pv.last_error:''}.</div>`);
-let fc={};for(let r of (lf.rows||[])){let k=r.disposition+(r.reason?': '+r.reason:'');fc[k]=(fc[k]||0)+r.n}let fr=(lf.recent||[]).map(x=>`<tr><td>${new Date(x.decision_ts_ms).toLocaleTimeString()}</td><td>${x.route_id}</td><td>${x.grade} → ${x.fresh_grade||'-'}</td><td>${Number(x.selected_usd||0).toFixed(2)} $ → ${x.fresh_selected_usd==null?'-':Number(x.fresh_selected_usd).toFixed(2)+' $'}</td><td>${x.requested_usd==null?'-':Number(x.requested_usd).toFixed(2)+' $'}</td><td>${x.disposition}</td><td>${x.reason||'-'}</td><td>${x.retry_count||0}</td><td>${x.first_check_delay_ms==null?'-':x.first_check_delay_ms+' ms'} / ${x.gateway_delay_ms==null?'-':x.gateway_delay_ms+' ms'}</td><td>${x.route_depth_age_ms==null?'-':x.route_depth_age_ms+' ms'} / ${x.route_depth_skew_ms==null?'-':x.route_depth_skew_ms+' ms'}</td></tr>`).join('');document.getElementById('livefunnel').innerHTML=`<div class=tag>ENTONNOIR BOT V2.4.4</div><h3>Classe initiale → classe fraîche réellement admise</h3><div class=cards><div><div class=v>${lv.validated_routes||0}</div><div class=muted>routes directionnelles valides</div></div><div><div class=v>${lv.bot_shadow_admissions||0}</div><div class=muted>signaux simulation BOT admis</div></div><div><div class=v>${he.ws_disconnects_5m||0} / ${he.ws_disconnects_15m||0} / ${he.ws_disconnects_60m||0}</div><div class=muted>chutes WS sur 5 / 15 / 60 min</div></div><div><div class=v>${lv.last_t0_to_leg1_submit_ms==null?'-':lv.last_t0_to_leg1_submit_ms+' ms'}</div><div class=muted>T0 → POST jambe 1</div></div><div><div class=v>${lv.last_leg1_done_to_leg2_submit_ms==null?'-':lv.last_leg1_done_to_leg2_submit_ms+' ms'}</div><div class=muted>confirmation jambe 1 → POST jambe 2</div></div><div><div class=v>${lv.last_t0_to_done_ms==null?'-':lv.last_t0_to_done_ms+' ms'}</div><div class=muted>T0 → route terminée</div></div></div><div class=muted style='margin-top:10px'>Mode TEST : jusqu'à ${lv.test_retry_max||0} relances / ${lv.test_retry_window_ms||0} ms pour découvrir une route. Mode LIVE : au plus ${lv.live_retry_max||0} relances / ${lv.live_retry_window_ms||0} ms, abandon avant tout POST si T0 dépasse ${lv.max_t0_to_leg1_post_ms||0} ms. Les capacités sont prévalidées en arrière-plan en TEST puis réutilisées pendant ${Number(lv.test_max_age_hours||0).toFixed(0)} h. Cooldown ${Number(lv.hard_cooldown_ms||0)/1000||5} s par crypto intermédiaire ; une autre crypto reste libre. Les six Shadows BOT sont planifiés hors du chemin critique.</div><table><thead><tr><th>Heure</th><th>Route</th><th>Classe T0 → fraîche</th><th>Taille T0 → fraîche</th><th>Demande bot</th><th>Disposition</th><th>Raison</th><th>Retries</th><th>1er contrôle / admission</th><th>Âge / skew Depth</th></tr></thead><tbody>${fr}</tbody></table>`;
+let fc={};for(let r of (lf.rows||[])){let k=r.disposition+(r.reason?': '+r.reason:'');fc[k]=(fc[k]||0)+r.n}let fr=(lf.recent||[]).map(x=>`<tr><td>${new Date(x.decision_ts_ms).toLocaleTimeString()}</td><td>${x.route_id}</td><td>${x.grade} → ${x.fresh_grade||'-'}</td><td>${Number(x.selected_usd||0).toFixed(2)} $ → ${x.fresh_selected_usd==null?'-':Number(x.fresh_selected_usd).toFixed(2)+' $'}</td><td>${x.requested_usd==null?'-':Number(x.requested_usd).toFixed(2)+' $'}</td><td>${x.disposition}</td><td>${x.reason||'-'}</td><td>${x.retry_count||0}</td><td>${x.first_check_delay_ms==null?'-':x.first_check_delay_ms+' ms'} / ${x.gateway_delay_ms==null?'-':x.gateway_delay_ms+' ms'}</td><td>${x.route_depth_age_ms==null?'-':x.route_depth_age_ms+' ms'} / ${x.route_depth_skew_ms==null?'-':x.route_depth_skew_ms+' ms'}</td></tr>`).join('');document.getElementById('livefunnel').innerHTML=`<div class=tag>ENTONNOIR BOT V2.4.5</div><h3>Classe initiale → classe fraîche réellement admise</h3><div class=cards><div><div class=v>${lv.validated_routes||0}</div><div class=muted>routes directionnelles valides</div></div><div><div class=v>${lv.bot_shadow_admissions||0}</div><div class=muted>signaux simulation BOT admis</div></div><div><div class=v>${he.ws_disconnects_5m||0} / ${he.ws_disconnects_15m||0} / ${he.ws_disconnects_60m||0}</div><div class=muted>chutes WS sur 5 / 15 / 60 min</div></div><div><div class=v>${lv.last_t0_to_leg1_submit_ms==null?'-':lv.last_t0_to_leg1_submit_ms+' ms'}</div><div class=muted>T0 → POST jambe 1</div></div><div><div class=v>${lv.last_leg1_done_to_leg2_submit_ms==null?'-':lv.last_leg1_done_to_leg2_submit_ms+' ms'}</div><div class=muted>confirmation jambe 1 → POST jambe 2</div></div><div><div class=v>${lv.last_t0_to_done_ms==null?'-':lv.last_t0_to_done_ms+' ms'}</div><div class=muted>T0 → route terminée</div></div></div><div class=muted style='margin-top:10px'>Mode TEST : jusqu'à ${lv.test_retry_max||0} relances / ${lv.test_retry_window_ms||0} ms pour découvrir une route. Mode LIVE : au plus ${lv.live_retry_max||0} relances / ${lv.live_retry_window_ms||0} ms, abandon avant tout POST si T0 dépasse ${lv.max_t0_to_leg1_post_ms||0} ms. Les capacités sont prévalidées en arrière-plan en TEST puis réutilisées pendant ${Number(lv.test_max_age_hours||0).toFixed(0)} h. Cooldown ${Number(lv.hard_cooldown_ms||0)/1000||5} s par crypto intermédiaire ; une autre crypto reste libre. Les six Shadows BOT sont planifiés hors du chemin critique.</div><table><thead><tr><th>Heure</th><th>Route</th><th>Classe T0 → fraîche</th><th>Taille T0 → fraîche</th><th>Demande bot</th><th>Disposition</th><th>Raison</th><th>Retries</th><th>1er contrôle / admission</th><th>Âge / skew Depth</th></tr></thead><tbody>${fr}</tbody></table>`;
 let sh=d.shadows||{},bf=sh.BOT_FAST||{},bn=['BOT_FAST','BOT_TARGET','BOT_DEGRADED','BOT_100_200','BOT_150_300','BOT_200_400'],bh=`<div class=tag>SIMULATION CONFIG BOT — CAP ${Number(lv.cap_usd||10).toFixed(0)} $</div><h3>6 profils de latence — ${(bf.capital||0).toFixed(0)} $ indépendants, routes validées uniquement</h3><div class=latency>`;for(let n of bn){let x=sh[n];if(!x)continue;let label=n.replace('BOT_','').split('_').join(' / '),bal=Object.entries(x.balances||{}).map(([a,v])=>`${a} <b>${v.toFixed(2)}</b>`).join(' · ');bh+=`<div class=latbox><div class=muted>${label} · Leg1 +${x.leg1_ms} ms · Leg2 +${x.leg2_ms} ms depuis l'admission</div><div class='v big ${x.profit>=0?'good':'bad'}'>${x.profit>=0?'+':''}${x.profit.toFixed(2)} $</div><div class=muted>NAV ${x.nav.toFixed(2)} $</div><div class=metricgrid><div class=metric><div class=v>${x.trades}</div><div class=muted>trades</div></div><div class=metric><div class=v>${x.wins} / ${x.losses}</div><div class=muted>gagnés / perdus</div></div></div><div class='balance muted'>Balance : ${bal}<br>cap ${Number(lv.cap_usd||10).toFixed(0)} $ · aucun rebalance · refus balance ${x.skipped_balance} · jambe 1 annulée ${x.skipped_flash}</div></div>`}bh+=`</div><div class=muted style='margin-top:10px'>Chaque délai virtuel est ajouté après l'admission fraîche du gateway. Les Shadows n'ajoutent aucune attente au bot : leur réservation et leur exécution sont hors du chemin critique. Ils utilisent le même capital ${Number(lv.capital_limit_usd||200).toFixed(0)} $, le même cap, la fraîcheur ${lv.bbo_age_ms||50} ms, le contrôle après jambe 1 et uniquement des routes dont jambe 1 / jambe 2 / unwind ont été acceptées par MEXC.</div>`;document.getElementById('botlatencies').innerHTML=bh;
 if(lv.bot_shadow_rebalancing){document.getElementById('botlatencies').innerHTML=document.getElementById('botlatencies').innerHTML.replaceAll('aucun rebalance','rebalance 30 min / 4 h actif')}
 document.querySelectorAll('#botlatencies .latbox').forEach((box,i)=>{let x=sh[bn[i]];if(x)box.insertAdjacentHTML('beforeend',`<div class=muted style='margin-top:5px'>Rééquilibrages ${x.rebalances||0} · coût ${Number(x.rebalance_cost||0).toFixed(3)} $</div>`)});
@@ -4529,6 +5097,7 @@ def bootstrap():
           f"test_retry={LIVE_RETRY_MAX}/{LIVE_RETRY_WINDOW_MS}ms live_retry={LIVE_EXEC_RETRY_MAX}/{LIVE_EXEC_RETRY_WINDOW_MS}ms "
           f"cooldown=crypto:{LIVE_HARD_COOLDOWN_MS}ms http_keepalive={LIVE_HTTP_KEEPALIVE_SEC:g}s "
           f"leg2_guard>={LIVE_LEG2_MIN_EDGE*100:.2f}% haircut={LIVE_FEE_SAFETY*100:.2f}% "
+          f"private_order_ws={LIVE_PRIVATE_WS_MODE} "
           f"prevalidate={'on' if LIVE_PREVALIDATE_ENABLED and TRADING_MODE=='test' else 'off'} "
           f"coverage_flush={ROUTE_COVERAGE_FLUSH_SEC:g}s")
     put_db(("meta",("version",VERSION))); put_db(("meta",("paper_rearm_neutral_ms",str(PAPER_REARM_NEUTRAL_MS)))); put_db(("meta",("paper_hard_cooldown_ms",str(PAPER_HARD_COOLDOWN_MS)))); put_db(("meta",("paper_failed_leg_policy","reverse_leg1_then_persist_open_exposure_until_liquidated"))); put_db(("meta",("ws_depth_interval","10ms"))); put_db(("meta",("ws_latency_sample_ms",str(WS_LATENCY_SAMPLE_MS)))); put_db(("meta",("route_snapshot_interval_sec",str(SNAPSHOT_INTERVAL_SEC)))); put_db(("meta",("route_snapshot_top_n",str(SNAPSHOT_TOP_N)))); put_db(("meta",("depth_snapshot_levels","100"))); put_db(("meta",("trace_window_ms",str(TRACE_WINDOW_MS)))); put_db(("meta",("market_source",state["market_source"])))
@@ -4548,7 +5117,7 @@ def bootstrap():
         "rebalance_check_sec":SHADOW_REBALANCE_CHECK_SEC,"rebalance_max_sec":SHADOW_REBALANCE_MAX_SEC,
         "early_dev":SHADOW_REBALANCE_EARLY_DEV,"post_resync_grace_ms":POST_RESYNC_GRACE_MS,
         "depth_capture_offsets_ms":DEPTH_CAPTURE_OFFSETS_MS,"depth_capture_levels":DEPTH_CAPTURE_LEVELS},sort_keys=True))))
-    put_db(("meta",("v244_private_gateway",json.dumps({"mode":TRADING_MODE,"live_cap_usd":LIVE_CAP_USD,
+    put_db(("meta",("v245_private_gateway",json.dumps({"mode":TRADING_MODE,"live_cap_usd":LIVE_CAP_USD,
         "capital_limit_usd":LIVE_CAPITAL_LIMIT_USD,"daily_loss_limit_usd":LIVE_DAILY_LOSS_LIMIT_USD,
         "max_concurrent":LIVE_MAX_CONCURRENT,"live_bbo_age_ms":LIVE_BBO_AGE_MS,"live_max_skew_ms":LIVE_MAX_SKEW_MS,
         "defer_leg1_commission":LIVE_DEFER_LEG1_COMMISSION,
@@ -4563,7 +5132,7 @@ def bootstrap():
         "cooldown_ms":LIVE_HARD_COOLDOWN_MS,"cooldown_scope":"intermediate_crypto",
         "account_refresh_sec":LIVE_ACCOUNT_REFRESH_SEC,"account_cache_max_age_ms":LIVE_ACCOUNT_CACHE_MAX_AGE_MS,
         "live_journal_path":LIVE_DB_PATH,"live_journal_sync":"FULL","research_db_path":DB_PATH,
-        "http_sessions":"dedicated_orders_and_account","http_keepalive_sec":LIVE_HTTP_KEEPALIVE_SEC,
+        "http_sessions":"dedicated_orders_status_account_prevalidation_user_stream","http_keepalive_sec":LIVE_HTTP_KEEPALIVE_SEC,
         "http_keepalive_timeout_sec":LIVE_HTTP_KEEPALIVE_TIMEOUT_SEC,
         "capability_reuse_hours":LIVE_TEST_MAX_AGE_HOURS,
         "background_prevalidation":LIVE_PREVALIDATE_ENABLED,
@@ -4576,6 +5145,11 @@ def bootstrap():
         "bot_shadow_admission":"fresh_gateway_A_or_Bplus_off_critical_path",
         "order_fallback":["MARKET","FILL_OR_KILL","IMMEDIATE_OR_CANCEL"],
         "bot_shadow_profiles":BOT_SHADOW_PROFILES,
+        "private_order_stream":{"mode":LIVE_PRIVATE_WS_MODE,"channel":"spot@private.orders.v3.api.pb",
+            "listenkey_keepalive_sec":LIVE_PRIVATE_WS_KEEPALIVE_SEC,
+            "ping_sec":LIVE_PRIVATE_WS_PING_SEC,"pong_timeout_sec":LIVE_PRIVATE_WS_PONG_TIMEOUT_SEC,
+            "connection_recycle_sec":LIVE_PRIVATE_WS_MAX_CONNECTION_SEC,
+            "observe_rest_authoritative":LIVE_PRIVATE_WS_MODE=="observe"},
         "real_order_gates":["TRADING_MODE=live","LIVE_ARMED=1","exact local arm file"]},sort_keys=True))))
     initialize_live_gateway()
     for _ in range(6): threading.Thread(target=scan_worker,daemon=True).start()
