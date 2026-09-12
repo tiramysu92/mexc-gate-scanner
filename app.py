@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, render_template_string
 import websocket
 
-VERSION = "2.4.5-private-order-ws"
+VERSION = "2.4.5a-private-order-ws-signed"
 HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", "8081"))
 DB_PATH = os.getenv("DB_PATH", "mexc_routes_v245.db")
@@ -1893,16 +1893,21 @@ class MexcPrivateClient:
         raise MexcAPIError(f"MEXC user stream HTTP {response.status_code}: {msg}",response.status_code,payload)
 
     def create_listen_key(self):
-        payload=self.api_key_request("POST","/api/v3/userDataStream")
+        # MEXC's published listen-key table still lists no request parameters,
+        # but the production endpoint currently enforces the same SIGNED
+        # authentication as the other private REST endpoints.  Reuse the
+        # already time-synchronised HMAC path so timestamp, recvWindow and
+        # signature are sent in the query string.
+        payload=self.signed("POST","/api/v3/userDataStream")
         key=payload.get("listenKey") if isinstance(payload,dict) else None
         if not key: raise MexcAPIError(f"listenKey absent: {payload}")
         return str(key)
 
     def keepalive_listen_key(self, listen_key):
-        return self.api_key_request("PUT","/api/v3/userDataStream",{"listenKey":listen_key})
+        return self.signed("PUT","/api/v3/userDataStream",{"listenKey":listen_key},retry_timestamp=True)
 
     def close_listen_key(self, listen_key):
-        return self.api_key_request("DELETE","/api/v3/userDataStream",{"listenKey":listen_key})
+        return self.signed("DELETE","/api/v3/userDataStream",{"listenKey":listen_key},retry_timestamp=True)
 
     def keepalive_if_idle(self, idle_ms, timeout_sec, abort_if=None):
         """Warm this exact pool without ever queueing behind an order."""
@@ -3680,6 +3685,7 @@ def initialize_live_gateway():
         live_prevalidation_client=MexcPrivateClient(MEXC_API_KEY,MEXC_API_SECRET,role="prevalidation")
     try:
         live_client.sync_time(); live_order_status_client.sync_time(); live_account_client.sync_time()
+        live_user_stream_client.sync_time()
         if live_prevalidation_client is not None: live_prevalidation_client.sync_time()
         _refresh_live_account(); persist_live_state()
     except Exception as exc:
