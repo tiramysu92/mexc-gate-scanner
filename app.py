@@ -9,12 +9,30 @@ from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, render_template_string
 import websocket
 
-VERSION = "2.4.6b-exchange-freshness"
+VERSION = "2.4.7-sized-fresh-execution"
+# Release candidate for TEST; no orders were placed during offline validation.
+# Baseline SHA256: d4038460cdf499ac9b0b02da487680a2af37fc09e7985a13156cbc02642d2919
+# Main changes: independent version-triggered admission; affordable-size A/B+;
+# continuous Depth versions/timestamps; midpoint HTTP clock; cached sorted books;
+# catch-up scan scheduling; FOK entry/exit (new TEST certificates required);
+# no unwind after an uncertain order; fee/accounting reconciliation; per-stage
+# book evidence and minute diagnostics. $20/$200/$5 and freshness limits retained.
+# TEST journal: mexc_live_v247_test.db. Research: mexc_routes_v247.db.
+# LIVE retains mexc_live_v246.db by default, including historical losses/causes,
+# and imports only newer compatible certificates from the V247 TEST journal.
+# No automatic reset/arming or LIVE rebalance. The versioned arm phrase below
+# deliberately rejects V246 arm files. Do not run two scanner processes together.
+# FOK price protection is not atomic across both legs: entry can fill and exit
+# can cancel. Emergency MARKET unwind can slip; $5 is a stop trigger, not a
+# guaranteed maximum loss. TEST acceptance and Shadow PnL do not prove fills.
+# Fee assumption remains TAKER_FEE (default .05%/leg), not a queried account fee.
+# Unresolved commissions pause entry; the .20% reserve is not realized expense.
+# Protocol reference: https://mexcdevelop.github.io/apidocs/spot_v3_en/
 HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", "8081"))
-DB_PATH = os.getenv("DB_PATH", "mexc_routes_v246.db")
+DB_PATH = os.getenv("DB_PATH", "mexc_routes_v247.db")
 LIVE_DB_PATH = os.getenv("LIVE_DB_PATH", "mexc_live_v246.db")
-LIVE_IMPORT_CAPABILITIES_DB = os.getenv("LIVE_IMPORT_CAPABILITIES_DB", "mexc_live_v245.db")
+LIVE_IMPORT_CAPABILITIES_DB = os.getenv("LIVE_IMPORT_CAPABILITIES_DB", "mexc_live_v246.db")
 MARKET_CACHE = os.getenv("MARKET_CACHE", "mexc_markets_cache.json")
 TZ_NAME = os.getenv("TZ_NAME", "Europe/Paris")
 TZ = ZoneInfo(TZ_NAME)
@@ -170,7 +188,7 @@ LIVE_PRIVATE_WS_PONG_TIMEOUT_SEC = max(LIVE_PRIVATE_WS_PING_SEC+5.0, float(os.ge
     "LIVE_PRIVATE_WS_PONG_TIMEOUT_SEC", "45")))
 LIVE_PRIVATE_WS_MAX_CONNECTION_SEC = max(3600.0, min(23.75*3600.0, float(os.getenv(
     "LIVE_PRIVATE_WS_MAX_CONNECTION_SEC", str(23*3600)))))
-LIVE_RESET_CIRCUIT = os.getenv("LIVE_RESET_CIRCUIT", "0") == "1"
+LIVE_RESET_CIRCUIT = False  # Never silently acknowledge historical LIVE causes on upgrade.
 PROTECT_EXISTING_BAGS = os.getenv("PROTECT_EXISTING_BAGS", "1") == "1"
 MEXC_ALLOWED_START_ASSETS = tuple(x.strip().upper() for x in os.getenv(
     "MEXC_ALLOWED_START_ASSETS", "USDT,USDC,USD1").split(",") if x.strip())
@@ -178,12 +196,24 @@ MEXC_API_KEY = os.getenv("MEXC_API_KEY", "").strip()
 MEXC_API_SECRET = os.getenv("MEXC_API_SECRET", "").strip()
 LIVE_ARM_FILE = os.getenv("LIVE_ARM_FILE", "/home/ubuntu/.config/mexc-bot/LIVE_ARMED")
 LIVE_STOP_FILE = os.getenv("LIVE_STOP_FILE", "/home/ubuntu/.config/mexc-bot/LIVE_STOP")
-LIVE_ARM_PHRASE = f"ENABLE MEXC LIVE {LIVE_CAP_USD:g} USD"
+LIVE_ARM_PHRASE = f"ENABLE MEXC V247 LIVE {LIVE_CAP_USD:g} USD"
+# TEST cannot contaminate the historical LIVE loss budget or reconciliation.
+if TRADING_MODE != "live":
+    LIVE_DB_PATH = os.getenv("LIVE_TEST_DB_PATH", "mexc_live_v247_test.db")
+elif "LIVE_IMPORT_CAPABILITIES_DB" not in os.environ:
+    LIVE_IMPORT_CAPABILITIES_DB = "mexc_live_v247_test.db"
+# Market data freshness remains strict. Price protection is a separate control,
+# not a reason to make old exchange timestamps appear fresh.
+LIVE_PRICE_PROTECTED = os.getenv("LIVE_PRICE_PROTECTED", "1") == "1"
+LIVE_FUTURE_TOLERANCE_MS = 25
+LIVE_RECHECK_INTERVAL_MS = 10
+LIVE_SIZE_SEARCH_STEPS = 6
+LIVE_PREVALIDATE_ERROR_BACKOFF_MS = 900000
 
 # Coverage accounting is updated in RAM on the scan path and persisted as only
 # 800 aggregate rows at this cadence. It never writes one row per market tick.
 ROUTE_COVERAGE_FLUSH_SEC = max(30.0, float(os.getenv("ROUTE_COVERAGE_FLUSH_SEC", "60")))
-BOT_SHADOW_REBALANCE_ENABLED = os.getenv("BOT_SHADOW_REBALANCE_ENABLED", "1") == "1"
+BOT_SHADOW_REBALANCE_ENABLED = os.getenv("BOT_SHADOW_REBALANCE_ENABLED", "0") == "1"
 
 # Independent Shadow portfolios mirror the private gateway: the three historic
 # clocks plus deliberately slower stress profiles, only on test-validated
@@ -207,7 +237,7 @@ DEPTH_CAPTURE_LEVELS = int(os.getenv("DEPTH_CAPTURE_LEVELS", "25"))
 STABLE_DEPTH_INTERVAL_SEC = float(os.getenv("STABLE_DEPTH_INTERVAL_SEC", "10"))
 DB_COMMIT_BATCH = max(1, int(os.getenv("DB_COMMIT_BATCH", "250")))
 DB_COMMIT_MAX_MS = max(5, int(os.getenv("DB_COMMIT_MAX_MS", "50")))
-DASHBOARD_CACHE_SEC = max(5.0, float(os.getenv("DASHBOARD_CACHE_SEC", "15")))
+DASHBOARD_CACHE_SEC = max(5.0, float(os.getenv("DASHBOARD_CACHE_SEC", "30")))
 
 # Historical research data
 # Broad market snapshots are descriptive only; the decision-linked Depth
@@ -240,6 +270,7 @@ active_events = {}
 dbq = queue.Queue(maxsize=50000)
 scanq = queue.Queue(maxsize=30000)
 queued_symbols = set()
+scan_generations = defaultdict(int)
 queued_lock = threading.Lock()
 paper = {}
 paper_reserved = defaultdict(float)
@@ -298,6 +329,10 @@ live_consumed_events = set()
 # Cooldown is scoped to the intermediate crypto, so opposite routes for the
 # same token cannot churn while an unrelated crypto remains immediately free.
 live_asset_last_attempt_ms = defaultdict(int)
+live_candidate_versions = {}
+live_v247_counts = defaultdict(int)
+live_v247_lock = threading.Lock()
+prevalidation_retry_after = {}
 bot_shadow_schedule_q = queue.Queue(maxsize=1000)
 live_runtime = {
     "mode": TRADING_MODE, "api_ok": False, "account_ts_ms": None, "balances": {},
@@ -633,6 +668,10 @@ def db_writer():
       leg1_send_ts_ms INTEGER, leg1_recv_ts_ms INTEGER, leg2_send_ts_ms INTEGER, leg2_recv_ts_ms INTEGER
     );
     CREATE INDEX IF NOT EXISTS idx_dec_v22_day ON decisions_v22(day,ts_ms);
+    CREATE INDEX IF NOT EXISTS idx_dec_v247_ts ON decisions_v22(ts_ms);
+    CREATE TABLE IF NOT EXISTS diagnostics_v247(
+      ts_ms INTEGER PRIMARY KEY, started_ms INTEGER NOT NULL, payload_json TEXT NOT NULL
+    );
 
     CREATE TABLE IF NOT EXISTS decision_trace_v22(
       id INTEGER PRIMARY KEY AUTOINCREMENT, decision_id TEXT NOT NULL, route_id TEXT NOT NULL,
@@ -863,6 +902,8 @@ def db_writer():
                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", payload)
             elif typ == "meta":
                 con.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", payload)
+            elif typ == "diagnostics_v247":
+                con.execute("INSERT OR REPLACE INTO diagnostics_v247 VALUES(?,?,?)",payload)
             elif typ == "paper_trade":
                 con.execute("""INSERT INTO paper_trades(day,ts_ms,route_id,start_asset,end_asset,input_units,input_usd,
                     output_units,output_usd,net_pct,profit_usd,event_start_ts_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", payload)
@@ -1091,6 +1132,21 @@ def route_coverage_flush_worker():
         try:
             rows=_route_coverage_rows()
             if rows: put_db(("route_coverage_many_v244",rows))
+            with live_v247_lock: counts=dict(live_v247_counts)
+            # One diagnostic checkpoint/minute, never a row for each WS tick.
+            put_db(("meta",("v247_diagnostics",json.dumps({"ts_ms":now_ms(),"counts":counts,
+                "version":VERSION,"price_protected":LIVE_PRICE_PROTECTED},sort_keys=True))))
+            with state_lock:
+                symbols=list(state["symbols"]); started_ms=state["started_ms"]
+                transport={"scan_updates":state["scan_updates"],"scan_drops":state["scan_queue_drops"],
+                    "db_drops":state["db_queue_drops"],"disconnects":state["ws_disconnects"]}
+            with depth_lock:
+                freshness={sym:{"ready":ob.get("ready"),"version":ob.get("version"),
+                    "received_ts_ms":ob.get("ts"),"send_ts_ms":ob.get("send_ts")}
+                    for sym in symbols if (ob:=state["depth"].get(sym))}
+            put_db(("diagnostics_v247",(now_ms(),started_ms,json.dumps({"version":VERSION,
+                "counts":counts,"transport":transport,"books":freshness,
+                "scan_queue":scanq.qsize(),"db_queue":dbq.qsize()},sort_keys=True))))
             _,_,today=local_day_bounds_ms(0)
             if route_coverage_day!=today:
                 with state_lock: routes=list(state.get("routes") or [])
@@ -1353,7 +1409,8 @@ def decode_depth(payload):
         elif w==2 and f==5:
             try: tv=int(v.decode())
             except: pass
-    return {"symbol":symbol,"send":int(send or now_ms()),"asks":asks,"bids":bids,"from":fv,"to":tv}
+    return {"symbol":symbol,"send":int(send or 0),"received_ts":now_ms(),
+            "asks":asks,"bids":bids,"from":fv,"to":tv}
 
 
 _PRIVATE_ORDER_STATUS = {
@@ -1414,19 +1471,50 @@ def decode_private_order(payload):
         "origQty":texts.get(4,"0"), "executedQty":texts.get(13,"0"),
         "cummulativeQuoteQty":texts.get(14,"0"), "status":status,
         "type":str(ints.get(7,"")), "side":str(ints.get(8,"")),
-        "transactTime":event["create_ts_ms"],
+        "time":event["create_ts_ms"],
+        # Envelope emission time is not the matching-engine fill time.
+        "_terminal_event_send_ms":send_ts if event["terminal"] else None,
     }
     return event
 
-def _publish_depth_bbo(sym, send_ts):
+def _depth_rows(ob):
+    cached=ob.get("_rows")
+    if cached is None:
+        cached=(tuple(sorted(ob["bids"].items(),reverse=True)),tuple(sorted(ob["asks"].items())))
+        ob["_rows"]=cached
+    return cached
+
+
+def _valid_depth_delta(x):
+    fv=x.get("from"); tv=x.get("to")
+    return (isinstance(fv,int) and isinstance(tv,int) and 0<=fv<=tv and
+        all(math.isfinite(p) and math.isfinite(q) and p>0 and q>=0
+            for side in ("bids","asks") for p,q in x.get(side,())))
+
+
+def _merge_depth_delta(ob,x):
+    for side in ("asks","bids"):
+        for price,qty in x[side]:
+            if qty==0: ob[side].pop(price,None)
+            else: ob[side][price]=qty
+    ob.update(version=x["to"],send_ts=int(x.get("send") or 0),
+              ts=int(x.get("received_ts") or now_ms()))
+    ob.pop("_rows",None)
+    return bool(ob["bids"] and ob["asks"] and max(ob["bids"])<min(ob["asks"]))
+
+
+def _publish_depth_bbo(sym, send_ts=None):
     with depth_lock:
         ob=state["depth"].get(sym)
         if not ob or not ob.get("ready") or not ob["bids"] or not ob["asks"]: return
         bp=max(ob["bids"]); ap=min(ob["asks"]); bq=ob["bids"][bp]; aq=ob["asks"][ap]
-    ts=now_ms()
-    with state_lock:
-        state["bbo"][sym]={"bid":bp,"bidq":bq,"ask":ap,"askq":aq,"ts":ts,"send_ts":send_ts,"lat":max(0,mexc_now_ms()-send_ts)}
-        state["last_ws_ms"]=ts
+        if bp>=ap: return
+        ts=int(ob.get("ts") or 0); send_ts=int(ob.get("send_ts") or 0)
+        with state_lock:
+            state["bbo"][sym]={"bid":bp,"bidq":bq,"ask":ap,"askq":aq,"ts":ts,
+                "send_ts":send_ts,"version":ob.get("version"),
+                "lat":mexc_now_ms()-send_ts if send_ts else None}
+            state["last_ws_ms"]=now_ms()
     enqueue_scan(sym)
 
 def queue_depth_resync(sym, reason="gap"):
@@ -1451,6 +1539,7 @@ def queue_depth_resync(sym, reason="gap"):
 
 def apply_depth_update(x):
     sym=x["symbol"]
+    x.setdefault("received_ts",now_ms())
     need_resync=False
     with depth_lock:
         ob=state["depth"].get(sym)
@@ -1460,20 +1549,19 @@ def apply_depth_update(x):
             return False
         prev=ob.get("version")
         fv=x.get("from"); tv=x.get("to")
-        if tv is not None and prev is not None and tv<=prev: return False
-        if fv is not None and prev is not None and fv>prev+1:
+        if not _valid_depth_delta(x) or prev is None:
+            ob["ready"]=False; need_resync=True
+        elif tv<=prev: return False
+        elif fv>prev+1 or (x.get("send",0)>0 and ob.get("send_ts",0)>x["send"]):
             ob["ready"]=False; depth_buffers[sym].append(x); need_resync=True
             state["depth_ready"]=sum(1 for z in state["depth"].values() if z.get("ready"))
         else:
-            for side in ("asks","bids"):
-                book=ob[side]
-                for price,qty in x[side]:
-                    if qty<=0: book.pop(price,None)
-                    else: book[price]=qty
-            if tv is not None: ob["version"]=tv
-            ob["send_ts"]=x["send"]; ob["ts"]=now_ms()
+            if not _merge_depth_delta(ob,x):
+                ob["ready"]=False; need_resync=True
+        if need_resync:
+            state["depth_ready"]=sum(1 for z in state["depth"].values() if z.get("ready"))
     if need_resync:
-        queue_depth_resync(sym,"version_gap")
+        queue_depth_resync(sym,"version_or_book_invalid")
         return False
     _publish_depth_bbo(sym,x["send"]); return True
 
@@ -1483,31 +1571,37 @@ def init_depth_symbol(sym):
     try:
         r=requests.get(REST+"/api/v3/depth",params={"symbol":sym,"limit":100},timeout=8); r.raise_for_status(); j=r.json()
         bids={float(a):float(b) for a,b in j.get("bids",[]) if float(b)>0}; asks={float(a):float(b) for a,b in j.get("asks",[]) if float(b)>0}
-        ver=int(j.get("lastUpdateId",0)); send=now_ms(); ready=True
+        ver=int(j.get("lastUpdateId",0)); received=now_ms(); ready=True
+        if (ver<=0 or not bids or not asks or max(bids)>=min(asks) or
+            not all(math.isfinite(p) and math.isfinite(q) and p>0 and q>0
+                    for book in (bids,asks) for p,q in book.items())):
+            return False
         with depth_lock:
-            ob={"bids":bids,"asks":asks,"version":ver,"ready":True,"ts":send,"send_ts":send}
+            # REST snapshot has a version, but no certified exchange emission
+            # timestamp. It becomes LIVE-eligible only after a contiguous WS delta.
+            ob={"bids":bids,"asks":asks,"version":ver,"ready":True,"ts":received,
+                "send_ts":0,"snapshot_received_ts":received}
             state["depth"][sym]=ob
             buf=list(depth_buffers.pop(sym,[]))
             for x in buf:
+                if not _valid_depth_delta(x):
+                    ob["ready"]=False; ready=False; continue
                 tv=x.get("to")
-                if tv is not None and tv<=ob["version"]: continue
+                if tv<=ob["version"]: continue
                 fv=x.get("from")
-                if fv is not None and fv>ob["version"]+1:
+                if (fv>ob["version"]+1 or
+                    (x.get("send",0)>0 and ob.get("send_ts",0)>x["send"])):
                     ob["ready"]=False; ready=False
                     # Keep the offending delta and later deltas for the next snapshot attempt.
                     depth_buffers[sym].append(x)
                     continue
                 if not ready:
                     depth_buffers[sym].append(x); continue
-                for side in ("asks","bids"):
-                    for price,qty in x[side]:
-                        if qty<=0: ob[side].pop(price,None)
-                        else: ob[side][price]=qty
-                if tv is not None: ob["version"]=tv
-                send=x["send"]
+                if not _merge_depth_delta(ob,x):
+                    ob["ready"]=False; ready=False
             state["depth_ready"]=sum(1 for z in state["depth"].values() if z.get("ready"))
         if ready:
-            _publish_depth_bbo(sym,send)
+            _publish_depth_bbo(sym)
         return ready
     except Exception as e:
         logerr(f"depth snapshot {sym}: {e}")
@@ -1517,7 +1611,7 @@ def init_depth_symbol(sym):
 def depth_resync_worker():
     """Single rate-limited REST worker with retry/backoff; prevents 429 resync storms."""
     while True:
-        sym=depth_resync_q.get(); attempt=0
+        sym=depth_resync_q.get(); attempt=0; requeue=False
         try:
             while True:
                 attempt+=1
@@ -1538,10 +1632,15 @@ def depth_resync_worker():
                 put_db(("depth_sync",(now_ms(),sym,"RETRY",depth_resync_diag[sym].get("last_reason",""),None,attempt)))
                 # 0.5, 1, 2, 4, 8s; capped. One worker means no REST burst.
                 time.sleep(min(8.0,0.5*(2**min(attempt-1,4))))
+                if attempt>=2:
+                    requeue=True
+                    break
             # Keep successful snapshot requests under ~4/s even during a queue backlog.
             time.sleep(0.25)
         finally:
-            with depth_resync_lock: depth_resync_pending.discard(sym)
+            with depth_resync_lock:
+                if requeue: depth_resync_q.put(sym)
+                else: depth_resync_pending.discard(sym)
             depth_resync_q.task_done()
 
 
@@ -1559,8 +1658,7 @@ def depth_walk(symbol, frm, to, input_units, meta, age_limit_ms=PRIMARY_BBO_AGE_
     with depth_lock:
         ob=state["depth"].get(symbol)
         if not ob or not ob.get("ready"): return None
-        bids=sorted(ob["bids"].items(), reverse=True)
-        asks=sorted(ob["asks"].items())
+        bids,asks=_depth_rows(ob)
         book_ts=ob.get("ts",0); send_ts=ob.get("send_ts",book_ts)
     if now_ms()-book_ts > age_limit_ms: return None
     remain=float(input_units); out=0.0; used=0.0; notional=0.0; levels_used=0; gross_out=0.0; side=None; worst_price=None
@@ -1597,10 +1695,12 @@ def _quality_books(route):
             ob=state["depth"].get(sym)
             if not ob or not ob.get("ready") or ts-ob.get("ts",0)>SHADOW_BBO_AGE_MS:
                 return None
+            bids,asks=_depth_rows(ob)
             out[sym]={
-                "bids":sorted(ob.get("bids",{}).items(),reverse=True)[:DEPTH_QUALITY_LEVELS],
-                "asks":sorted(ob.get("asks",{}).items())[:DEPTH_QUALITY_LEVELS],
+                "bids":bids[:DEPTH_QUALITY_LEVELS],
+                "asks":asks[:DEPTH_QUALITY_LEVELS],
                 "book_ts":ob.get("ts",0),
+                "send_ts":ob.get("send_ts",0),"version":ob.get("version"),
             }
     if len(out)!=len(route["symbols"]): return None
     if max(x["book_ts"] for x in out.values())-min(x["book_ts"] for x in out.values())>SHADOW_MAX_SKEW_MS:
@@ -1631,7 +1731,8 @@ def _quality_walk(book, market, frm, to, input_units, stress="normal"):
         used+=take; remain-=take; levels_used+=1
         if remain<=max(1e-12,input_units*1e-10): break
     if used<=0: return None
-    return {"input_used":used,"output":gross_out*(1.0-FEE),"fill_ratio":min(1.0,used/input_units),"levels_used":levels_used}
+    return {"input_used":used,"output":gross_out*(1.0-FEE),"gross_output":gross_out,
+            "fill_ratio":min(1.0,used/input_units),"levels_used":levels_used}
 
 
 def _quality_roundtrip(route, books, meta, input_usd, start_mark, end_mark, stress="normal"):
@@ -1786,7 +1887,7 @@ def stable_mark_usdt(asset,books,meta):
             return mid if m["base"]==asset else 1.0/mid
     return 1.0
 
-def route_calc(route,books,meta, age_limit_ms=None):
+def route_calc(route,books,meta, age_limit_ms=None, allow_small_capacity=False):
     start,end=route["path"][0],route["path"][-1]
     sv=stable_mark_usdt(start,books,meta); ev=stable_mark_usdt(end,books,meta)
     if sv<=0 or ev<=0: return None
@@ -1818,7 +1919,7 @@ def route_calc(route,books,meta, age_limit_ms=None):
         max_start=min(max_start,cap_in/multiplier); multiplier*=rate
     if not math.isfinite(max_start) or max_start<=0: return None
     executable_usd=max_start*sv
-    if executable_usd<MIN_EXEC_USD: return None
+    if executable_usd<MIN_EXEC_USD and not allow_small_capacity: return None
     net=multiplier*ev/sv-1.0
     return {"net":net,"size":executable_usd,"profit":executable_usd*net,"out_ratio":multiplier,
             "start_mark":sv,"end_mark":ev,"max_age":int(max_age), "exchange_max_age":int(max_exchange_age),
@@ -1882,8 +1983,7 @@ class MexcPrivateClient:
         with self.http_lock:
             started_wall=now_ms(); started_ns=time.perf_counter_ns()
             if on_start is not None:
-                try: on_start(started_wall)
-                except Exception as exc: logerr(f"HTTP start hook {self.role}: {exc}")
+                on_start(started_wall)  # A failed final guard must prevent the POST.
             r=self.session.request(method,url,params=params,headers=headers,
                                    timeout=timeout or LIVE_API_TIMEOUT_SEC)
             received_wall=now_ms(); received_ns=time.perf_counter_ns(); self.last_activity_ms=received_wall
@@ -1921,11 +2021,15 @@ class MexcPrivateClient:
         code=payload.get("code") if isinstance(payload,dict) else None
         try: code_num=int(code) if code is not None else None
         except (TypeError,ValueError): code_num=code
-        if response.ok and code_num in (None,0,200): return (payload,timing) if with_timing else payload
+        real_post=method.upper()=="POST" and path=="/api/v3/order"
+        if response.ok and code_num in (None,0,200):
+            if real_post and (not isinstance(payload,dict) or not payload.get("orderId")):
+                raise MexcOrderUncertain("Réponse POST sans orderId: réconciliation requise")
+            return (payload,timing) if with_timing else payload
         if retry_timestamp and method.upper()!="POST" and code_num in (-1021,700003):
             self.sync_time(); return self.signed(method,path,{k:v for k,v in params.items() if k not in ("timestamp","recvWindow","signature")},False,with_timing,on_start)
         msg=payload.get("msg") if isinstance(payload,dict) else None
-        if method.upper()=="POST" and path=="/api/v3/order" and response.status_code>=500:
+        if real_post and (response.status_code>=500 or code_num in (-1006,-1007)):
             raise MexcOrderUncertain(f"Ordre potentiellement accepté, HTTP {response.status_code}: {msg or payload}",response.status_code,payload)
         raise MexcAPIError(f"MEXC HTTP {response.status_code}: {msg or payload}",response.status_code,payload)
 
@@ -1990,14 +2094,14 @@ class MexcPrivateClient:
             # again after owning the HTTP lock so a keep-alive cannot knowingly
             # start while an order is waiting for this same warm connection.
             if abort_if is not None and abort_if(): return None
-            started=time.perf_counter_ns()
+            started_wall=now_ms(); started=time.perf_counter_ns()
             r=self.session.get(REST+"/api/v3/time",timeout=timeout_sec)
             elapsed=(time.perf_counter_ns()-started)/1_000_000.0
             self.last_activity_ms=now_ms()
             payload=self._payload(r)
             if not r.ok or not isinstance(payload,dict) or payload.get("serverTime") is None:
                 raise MexcAPIError("Keep-alive MEXC invalide",r.status_code,payload)
-            self.time_offset_ms=int(payload["serverTime"])-now_ms()
+            self.time_offset_ms=int(payload["serverTime"])-(started_wall+self.last_activity_ms)//2
             return elapsed
         finally:
             self.http_lock.release()
@@ -2086,6 +2190,19 @@ def _private_ws_note_rest(waiter, order=None, confirmed_ts_ms=None, poll_count=0
         # reconciliation arriving after WS must not masquerade as REST-first.
         if source=="post": private_ws_runtime["confirmations_post"]+=1
         _private_ws_comparison_locked(waiter)
+        mismatch=_private_ws_terminal_mismatch(waiter)
+    if mismatch:
+        live_trip("private_ws_rest_mismatch",str(waiter.get("client_order_id")),waiter.get("attempt_id"))
+
+
+def _private_ws_terminal_mismatch(waiter):
+    ws_order=waiter.get("ws_order"); rest_order=waiter.get("rest_order")
+    if not (_is_terminal_order(ws_order) and _is_terminal_order(rest_order)): return False
+    try:
+        return (str(ws_order.get("status"))!=str(rest_order.get("status")) or
+                any(not math.isclose(w,r,rel_tol=1e-8,abs_tol=1e-10)
+                    for w,r in zip(_order_numbers(ws_order),_order_numbers(rest_order))))
+    except (TypeError,ValueError): return True
 
 
 def _private_ws_release(waiter, keep_rest_probe=False):
@@ -2100,6 +2217,7 @@ def _private_ws_publish(event, received_ts_ms=None):
     received=int(received_ts_ms or now_ms())
     client_id=str(event.get("client_order_id") or "")
     order_id=event.get("exchange_order_id")
+    mismatch=False
     with private_ws_lock:
         private_ws_runtime["order_events"]+=1
         private_ws_runtime["last_order_event_ms"]=received
@@ -2108,7 +2226,7 @@ def _private_ws_publish(event, received_ts_ms=None):
             client_id=private_ws_order_aliases.get(str(order_id),"")
         waiter=private_ws_waiters.get(client_id) if client_id else None
         meta=private_ws_submission_meta.get(client_id) if client_id else None
-        matched=bool(waiter or meta or client_id.startswith(("v244","v245","v246")))
+        matched=bool(waiter or meta or client_id.startswith(("v244","v245","v246","v247")))
         private_ws_runtime["matched_events" if matched else "unmatched_events"]+=1
         post_started=(waiter or {}).get("post_started_ts_ms") or (meta or {}).get("post_started_ts_ms")
         post_to_ws=float(received-post_started) if post_started is not None else None
@@ -2119,13 +2237,16 @@ def _private_ws_publish(event, received_ts_ms=None):
         if waiter and event.get("terminal"):
             ws_order=dict(event.get("order") or {})
             ws_order["clientOrderId"]=client_id
-            ws_order["symbol"]=event.get("symbol") or waiter.get("symbol") or ws_order.get("symbol")
+            # Do not invent a symbol from the pending order: an incomplete
+            # event must not pass the exact-identity authority check.
+            ws_order["symbol"]=event.get("symbol") or ws_order.get("symbol") or ""
             waiter["ws_order"]=ws_order
             waiter["ws_received_ts_ms"]=received
             waiter["ws_send_ts_ms"]=event.get("send_ts_ms")
             waiter["ws_event"].set()
             waiter["terminal_event"].set()
             _private_ws_comparison_locked(waiter)
+            mismatch=_private_ws_terminal_mismatch(waiter)
         payload=(received,event.get("send_ts_ms"),event.get("create_ts_ms"),
             event.get("channel") or "spot@private.orders.v3.api.pb",event.get("symbol"),
             str(order_id) if order_id is not None else None,client_id or None,
@@ -2134,6 +2255,8 @@ def _private_ws_publish(event, received_ts_ms=None):
             (waiter or {}).get("rest_confirmed_ts_ms"),
             (float(received-waiter["rest_confirmed_ts_ms"]) if waiter and waiter.get("rest_confirmed_ts_ms") is not None else None),
             1 if matched else 0,json.dumps(event,separators=(",",":"),ensure_ascii=False,default=str))
+    if mismatch:
+        live_trip("private_ws_rest_mismatch",client_id,waiter.get("attempt_id"))
     _private_ws_queue({"kind":"event","payload":payload})
 
 
@@ -2319,6 +2442,11 @@ def initialize_live_journal():
         con.execute("PRAGMA busy_timeout=30000")
         con.execute("PRAGMA wal_autocheckpoint=100")
         con.executescript("""
+        CREATE TABLE IF NOT EXISTS live_observations_v247(
+          attempt_id TEXT NOT NULL, stage TEXT NOT NULL, ts_ms INTEGER NOT NULL,
+          version TEXT NOT NULL, payload_json TEXT NOT NULL,
+          PRIMARY KEY(attempt_id,stage)
+        );
         CREATE TABLE IF NOT EXISTS live_state_v240(
           singleton INTEGER PRIMARY KEY CHECK(singleton=1), updated_ts_ms INTEGER NOT NULL,
           mode TEXT NOT NULL, api_ok INTEGER NOT NULL, balances_json TEXT NOT NULL,
@@ -2795,7 +2923,7 @@ def live_emergency_market_spec(symbol, frm, to, input_units, market, client_orde
 def _live_client_id(attempt_id, purpose, variant=""):
     tag={"leg1":"L1","leg2":"L2","unwind":"UW"}.get(purpose,"OR")
     vt={"MARKET":"M","FILL_OR_KILL":"F","IMMEDIATE_OR_CANCEL":"I"}.get(str(variant).upper(),"")
-    return ("v246"+tag+vt+attempt_id.replace("-","")[-22:])[:32]
+    return ("v247"+tag+vt+attempt_id.replace("-","")[-22:])[:32]
 
 
 def _live_attempt_insert_values(q, requested_usd, x, attempt_id=None, status="prepared"):
@@ -2895,6 +3023,8 @@ def _live_prepare_initial_order(q, requested_usd, x, attempt_id, spec, t0, admit
     order_sql,order_params=_live_prepare_order_values(attempt_id,1,"leg1",spec)
     post_ts=now_ms(); started=time.perf_counter_ns()
     live_db_transaction([
+        _observation_sql(attempt_id,"entry",q["route"]["symbols"],
+                         {"signal":x,"quality":q.get("quality"),"requested_usd":requested_usd}),
         (attempt_sql,attempt_params),
         ("""UPDATE live_attempts_v240 SET leg1_client_id=?,leg1_order_type=?,
             t0_to_leg1_submit_ms=?,admission_to_leg1_post_ms=?,updated_ts_ms=? WHERE attempt_id=?""",
@@ -2915,10 +3045,27 @@ def _live_prepare_followup_order(attempt_id, leg, purpose, spec, **attempt_value
     update_params=tuple(values[k] for k in columns)+(attempt_id,)
     order_sql,order_params=_live_prepare_order_values(attempt_id,leg,purpose,spec)
     started=time.perf_counter_ns()
-    live_db_transaction([(update_sql,update_params),(order_sql,order_params)])
+    live_db_transaction([(update_sql,update_params),(order_sql,order_params),
+        _observation_sql(attempt_id,purpose,[spec["symbol"]],attempt_values)])
     elapsed=(time.perf_counter_ns()-started)/1_000_000.0
     live_prepare_journal_ms.append(elapsed)
     return elapsed
+
+
+def _observation_sql(attempt_id,stage,symbols,detail):
+    ts=now_ms(); books={}
+    with depth_lock:
+        for sym in symbols:
+            ob=state["depth"].get(sym)
+            if not ob: continue
+            bids,asks=_depth_rows(ob)
+            books[sym]={"ready":ob.get("ready"),"version":ob.get("version"),
+                "received_ts_ms":ob.get("ts"),"send_ts_ms":ob.get("send_ts"),
+                "bids":bids[:DEPTH_CAPTURE_LEVELS],"asks":asks[:DEPTH_CAPTURE_LEVELS]}
+    payload={"books":books,"detail":detail,"mexc_now_ms":mexc_now_ms(),
+        "fee_assumed":FEE,"haircut":LIVE_FEE_SAFETY,"price_protected":LIVE_PRICE_PROTECTED}
+    return ("INSERT OR REPLACE INTO live_observations_v247 VALUES(?,?,?,?,?)",
+            (attempt_id,stage,ts,VERSION,_live_json(payload)))
 
 
 def _live_admission_upsert(q, disposition, reason=None, requested_usd=None, attempt_id=None,
@@ -2962,6 +3109,32 @@ def _save_route_capability(route_id, decision_id, leg1, leg2, unwind):
 
 def _load_route_capabilities():
     try:
+        # Merge NEWER compatible TEST certificates even if the historical
+        # LIVE journal already holds MARKET certificates. Do not copy TEST
+        # balances/PnL/circuits and do not renew the original test timestamp.
+        legacy=LIVE_IMPORT_CAPABILITIES_DB
+        if (legacy and os.path.isfile(legacy) and
+            os.path.abspath(legacy)!=os.path.abspath(LIVE_DB_PATH)):
+            source=sqlite3.connect("file:"+os.path.abspath(legacy)+"?mode=ro",uri=True)
+            source.row_factory=sqlite3.Row
+            try:
+                certificates=source.execute("SELECT * FROM live_route_capabilities_v241 WHERE expires_ts_ms>=?",(now_ms(),)).fetchall()
+            finally: source.close()
+            operations=[]
+            for row in certificates:
+                try:
+                    item={leg:json.loads(row[leg+"_json"]) for leg in ("leg1","leg2","unwind")}
+                    if not _capability_matches_policy(item): continue
+                except (ValueError,TypeError): continue
+                operations.append(("""INSERT INTO live_route_capabilities_v241 VALUES(?,?,?,?,?,?,?,?)
+                    ON CONFLICT(route_id) DO UPDATE SET validated_ts_ms=excluded.validated_ts_ms,
+                    expires_ts_ms=excluded.expires_ts_ms,leg1_json=excluded.leg1_json,
+                    leg2_json=excluded.leg2_json,unwind_json=excluded.unwind_json,
+                    last_decision_id=excluded.last_decision_id,last_error=NULL
+                    WHERE excluded.validated_ts_ms>live_route_capabilities_v241.validated_ts_ms""",
+                    (row["route_id"],row["validated_ts_ms"],row["expires_ts_ms"],row["leg1_json"],
+                     row["leg2_json"],row["unwind_json"],row["last_decision_id"],None)))
+            if operations: live_db_transaction(operations)
         rows=live_db_execute("SELECT * FROM live_route_capabilities_v241 WHERE expires_ts_ms>=?",(now_ms(),),many=True)
         loaded={}
         for row in rows or []:
@@ -2980,6 +3153,18 @@ def _route_capability(route_id):
     with live_lock: item=live_route_capabilities.get(route_id)
     if not item or int(item.get("expires_ts_ms") or 0)<now_ms(): return None
     return item
+
+
+def _capability_matches_policy(item):
+    if not _capability_has_emergency_market_unwind(item): return False
+    return (not LIVE_PRICE_PROTECTED or
+        all((item.get(leg) or {}).get("order_type")=="FILL_OR_KILL" for leg in ("leg1","leg2")))
+
+
+def _policy_candidates(candidates,market_only=False):
+    if market_only: return [s for s in candidates if s["order_type"]=="MARKET"]
+    if LIVE_PRICE_PROTECTED: return [s for s in candidates if s["order_type"]=="FILL_OR_KILL"]
+    return candidates
 
 
 def _capability_has_emergency_market_unwind(item):
@@ -3025,7 +3210,9 @@ def _order_numbers(order):
 def _order_exchange_ts_ms(order):
     """Best available MEXC-side order/fill timestamp from WS or REST."""
     if not isinstance(order,dict): return None
-    for key in ("transactTime","updateTime","time"):
+    # Creation/acceptance time is not a fill timestamp. WS send time is an
+    # explicitly labelled terminal-event proxy, not exact matching latency.
+    for key in ("_terminal_event_send_ms","updateTime"):
         try: value=int(order.get(key) or 0)
         except (TypeError,ValueError): value=0
         if value>0: return value
@@ -3068,9 +3255,12 @@ def _private_ws_order_is_authoritative(spec, order):
     if not _is_terminal_order(order): return False
     if str(order.get("clientOrderId") or "")!=str(spec.get("client_order_id") or ""): return False
     if str(order.get("symbol") or "")!=str(spec.get("symbol") or ""): return False
-    if str(order.get("status") or "").upper()=="FILLED":
-        executed,quote=_order_numbers(order)
-        if executed<=0 or quote<=0: return False
+    try: executed,quote=_order_numbers(order)
+    except (ValueError,TypeError): return False
+    if not all(math.isfinite(v) and v>=0 for v in (executed,quote)): return False
+    if executed>0 and quote<=0: return False
+    if str(order.get("status") or "").upper()=="FILLED" and (executed<=0 or quote<=0): return False
+    if spec.get("quantity") and executed>float(spec["quantity"])*(1+1e-8): return False
     return True
 
 
@@ -3080,7 +3270,7 @@ def _rest_confirmation_worker(spec, waiter, deadline):
     while time.monotonic()<deadline:
         try:
             order=client.order(spec["symbol"],spec["client_order_id"]); polls+=1
-            if _is_terminal_order(order):
+            if _private_ws_order_is_authoritative(spec,order):
                 _private_ws_note_rest(waiter,order,now_ms(),polls,source="rest")
                 return
         except Exception as exc:
@@ -3098,7 +3288,7 @@ def _query_order_until_terminal(spec, first=None, waiter=None):
     """Return the first trusted terminal result; REST keeps reconciling WS-first."""
     if waiter is None:
         waiter=_private_ws_register(spec,"query-only",0,"query")
-    if _is_terminal_order(first):
+    if _private_ws_order_is_authoritative(spec,first):
         _private_ws_note_rest(waiter,first,now_ms(),0,source="post")
         return first,"post",0
     deadline=time.monotonic()+LIVE_ORDER_SETTLE_TIMEOUT_MS/1000.0
@@ -3116,7 +3306,7 @@ def _query_order_until_terminal(spec, first=None, waiter=None):
                     (not _is_terminal_order(rest_order) or ws_first)):
                 private_ws_runtime["confirmations_ws"]+=1
                 return dict(ws_order),"private_ws",polls
-            if _is_terminal_order(rest_order):
+            if _private_ws_order_is_authoritative(spec,rest_order):
                 private_ws_runtime["confirmations_rest"]+=1
                 return dict(rest_order),"rest",polls
             waiter["terminal_event"].clear()
@@ -3169,11 +3359,15 @@ def _submit_live_order(attempt_id, leg, purpose, spec, test, prepared=False,
             raise
     waiter=_private_ws_register(spec,attempt_id,leg,purpose)
     source=None
+    def before_post(ts):
+        guard=spec.get("_post_guard")
+        if guard is not None: guard(ts)
+        _private_ws_link_submission(waiter,ts)
     try:
         try:
             first,http=live_client.new_order(spec["symbol"],spec["side"],spec["order_type"],spec["client_order_id"],
                 spec.get("quantity"),spec.get("quote_order_qty"),spec.get("price"),test=False,with_timing=True,
-                on_start=lambda ts:_private_ws_link_submission(waiter,ts))
+                on_start=before_post)
             order_id_first=first.get("orderId") if isinstance(first,dict) else None
             _private_ws_link_submission(waiter,http["request_started_ts_ms"],order_id_first)
             journal_started=time.perf_counter_ns()
@@ -3195,9 +3389,14 @@ def _submit_live_order(attempt_id, leg, purpose, spec, test, prepared=False,
             except Exception as query_exc:
                 live_trip("order_status_unknown",f"{exc}; reconciliation: {query_exc}",attempt_id)
                 raise MexcOrderUncertain(f"Ordre inconnu et non réconcilié: {spec['client_order_id']}") from query_exc
-        except Exception as exc:
+        except MexcSignalExpired as exc:
+            _live_order_update(spec["client_order_id"],"expired_before_submit",error=exc,final=True)
+            raise
+        except MexcAPIError as exc:
             _live_order_update(spec["client_order_id"],"rejected",error=exc,submitted=True,final=True)
             raise
+        except Exception as exc:
+            raise MexcOrderUncertain("Erreur après début du POST; réconcilier avant tout autre ordre") from exc
 
         order,source,rest_polls=_query_order_until_terminal(spec,first,waiter)
         with private_ws_lock:
@@ -3241,6 +3440,12 @@ def _submit_live_order(attempt_id, leg, purpose, spec, test, prepared=False,
                 "ws_rest_delta_ms":ws_rest_delta,
                 "order":order,"commissions":commissions,
                 "commission_known":commission_known}
+    except MexcAPIError:
+        raise
+    except Exception as exc:
+        # Includes a failed final journal commit: the exchange may already
+        # have filled the order even when local bookkeeping failed.
+        raise MexcOrderUncertain("Résultat/journal ordre non confirmé localement") from exc
     finally:
         _private_ws_release(waiter,keep_rest_probe=(source=="private_ws"))
 
@@ -3269,7 +3474,7 @@ def _reconcile_order_commissions(result, spec):
 def _fresh_live_signal(route):
     ts=now_ms()
     with state_lock: books=dict(state["bbo"]); meta=state["market_meta"]
-    x=route_calc(route,books,meta,age_limit_ms=LIVE_BBO_AGE_MS)
+    x=route_calc(route,books,meta,age_limit_ms=LIVE_BBO_AGE_MS,allow_small_capacity=True)
     if not x or x.get("net",-1)<SHADOW_MIN_EDGE: return None,None,"edge_or_book"
     if x.get("bbo_skew",999999)>LIVE_MAX_SKEW_MS: return x,None,"book_skew"
     if not x.get("exchange_ts_complete"): return x,None,"route_exchange_timestamp_missing"
@@ -3278,9 +3483,106 @@ def _fresh_live_signal(route):
     if x.get("exchange_skew",999999)>LIVE_MAX_EXCHANGE_SKEW_MS:
         return x,None,"route_exchange_depth_skew"
     if not symbols_post_resync_safe(route,ts): return x,None,"post_resync_grace"
-    quality=depth_quality_decision(route,x)
+    balances,account_reason=_cached_live_account()
+    if account_reason: return x,None,account_reason
+    free=float(balances.get(route["path"][0],{}).get("free",0.0))
+    # Reserve input-side fees as well, without double charging the edge model.
+    budget=min(LIVE_CAP_USD,LIVE_CAPITAL_LIMIT_USD,free*x["start_mark"])/(1.0+LIVE_FEE_SAFETY)
+    quality=live_sized_quality(route,x,budget)
     if not quality.get("eligible"): return None,quality,quality.get("reason","quality_rejected")
     return x,quality,None
+
+
+def _v247_count(reason):
+    with live_v247_lock: live_v247_counts[str(reason)]+=1
+
+
+def _snapshot_freshness(books, local_limit, exchange_limit, skew_limit=None):
+    local_now=now_ms(); exchange_now=mexc_now_ms(); sends=[]; receives=[]
+    for book in books.values():
+        received=int(book.get("book_ts",book.get("ts",0)) or 0)
+        sent=int(book.get("send_ts") or 0)
+        if not sent: return "route_exchange_timestamp_missing"
+        if sent-exchange_now>LIVE_FUTURE_TOLERANCE_MS or received>local_now:
+            return "route_clock_inconsistent"
+        if local_now-received>local_limit: return "route_depth_stale"
+        if exchange_now-sent>exchange_limit: return "route_exchange_depth_stale"
+        sends.append(sent); receives.append(received)
+    if not sends: return "depth_unavailable"
+    if skew_limit is not None and max(sends)-min(sends)>skew_limit:
+        return "route_exchange_depth_skew"
+    if skew_limit is not None and max(receives)-min(receives)>LIVE_MAX_SKEW_MS:
+        return "route_depth_skew"
+    return None
+
+
+def live_sized_quality(route,x,budget):
+    """Independent LIVE A/B+ at affordable size, using one immutable Depth pair.
+
+    Keep research grades unchanged. Seek the largest passing size (bounded
+    bisection, not a backtest optimizer). Never reduce below the user's $10
+    minimum or enlarge the $20 cap. Include the .20% inventory reserve once.
+    """
+    started=time.perf_counter_ns()
+    out={"grade":"D","eligible":False,"reason":"depth_unavailable",
+         "selected_usd":0.0,"capacity_usd":x.get("size",0.0),"size_fraction":0.0}
+    books=_quality_books(route)
+    if not books: return out
+    reason=_snapshot_freshness(books,LIVE_BBO_AGE_MS,LIVE_EXCHANGE_AGE_MS,LIVE_MAX_EXCHANGE_SKEW_MS)
+    if reason: out["reason"]=reason; return out
+    with state_lock: meta=state["market_meta"]
+    sm=x["start_mark"]; em=x["end_mark"]
+    first_market=meta[route["symbols"][0]]
+    second_market=meta[route["symbols"][1]]
+    if (first_market.get("quote")!=route["path"][0] or first_market.get("base")!=route["path"][1] or
+        second_market.get("base")!=route["path"][1] or second_market.get("quote")!=route["path"][2]):
+        out["reason"]="unsupported_live_orientation"; return out
+    step=_precision_step(first_market,"quoteAssetPrecision")
+    def evaluate(usd):
+        rounded=_floor_amount(usd/max(sm,1e-12),step)
+        usd=float(rounded or 0)*sm
+        result=dict(out,selected_usd=usd,size_fraction=usd/max(x.get("size",0),1e-12),
+                    reason="below_min_trade",grade="D",eligible=False)
+        if usd<MIN_EXEC_USD-1e-8: return result
+        trials={s:_quality_roundtrip(route,books,meta,usd,sm,em,s)
+                for s in ("normal","half_bbo","drop_l1")}
+        normal=trials["normal"]; half=trials["half_bbo"]; drop=trials["drop_l1"]
+        coverage=_quality_coverage3(route,books,meta,usd,sm)
+        result.update(normal_edge=normal["edge"] if normal else None,
+            half_bbo_edge=half["edge"] if half else None,drop_l1_edge=drop["edge"] if drop else None,
+            coverage3=coverage,reason="sized_quality_rejected")
+        if not normal: return result
+        first=normal["fills"][0]
+        reserve_mid=first["gross_output"]*(1.0-LIVE_FEE_SAFETY)
+        mid_step=_precision_step(meta[route["symbols"][1]],"baseAssetPrecision")
+        reserve_mid=float(_floor_amount(reserve_mid,mid_step) or 0.0)
+        second=_quality_walk(books[route["symbols"][1]],meta[route["symbols"][1]],
+                             route["path"][1],route["path"][2],reserve_mid)
+        guard=(second["output"]*em/usd-1 if second and second["fill_ratio"]>=.999999 else -1)
+        result["projected_leg2_edge"]=guard
+        if guard<LIVE_LEG2_MIN_EDGE:
+            result["reason"]="projected_leg2_edge"; return result
+        a=bool(drop and drop["edge"]>=SHADOW_MIN_EDGE)
+        b=bool(half and drop and half["edge"]>=DEPTH_QUALITY_BPLUS_HALF_EDGE and
+               drop["edge"]>=DEPTH_QUALITY_BPLUS_DROP_FLOOR and coverage>=DEPTH_QUALITY_COVERAGE3_MIN)
+        result.update(grade="A" if a else "B+" if b else "B-",eligible=a or b,
+                      reason="eligible_sized_A" if a else "eligible_sized_B+" if b else "sized_quality_rejected")
+        return result
+    high=max(0.0,min(float(budget),LIVE_CAP_USD,LIVE_CAPITAL_LIMIT_USD))
+    out=evaluate(high)
+    if not out["eligible"] and high>MIN_EXEC_USD:
+        low=MIN_EXEC_USD+float(step)*sm
+        best=evaluate(low)
+        if best["eligible"]:
+            for _ in range(LIVE_SIZE_SEARCH_STEPS):
+                mid=(low+high)/2; candidate=evaluate(mid)
+                if candidate["eligible"]: low=mid; best=candidate
+                else: high=mid
+            out=best
+    out["compute_us"]=(time.perf_counter_ns()-started)/1000.0
+    out["sizing_scope"]="live_affordable_size"
+    out["book_versions"]={s:books[s]["version"] for s in route["symbols"]}
+    return out
 
 
 def _live_health_status(route):
@@ -3313,6 +3615,8 @@ def _live_health_status(route):
             try: send_ts=int(ob.get("send_ts") or 0)
             except (TypeError,ValueError): send_ts=0
             if send_ts<=0: return "route_exchange_timestamp_missing",None,None,None,None
+            if send_ts-exchange_ts>LIVE_FUTURE_TOLERANCE_MS or book_ts>ts:
+                return "route_clock_inconsistent",None,None,None,None
             send_times.append(send_ts); exchange_ages.append(max(0,exchange_ts-send_ts))
     max_age=max(ages) if ages else None
     skew=max(times)-min(times) if times else None
@@ -3409,8 +3713,8 @@ def _protected_bag_reason(balances):
 
 
 def _route_has_recent_test(route_id):
-    if not LIVE_REQUIRE_TESTED_ROUTE: return True
-    return _capability_has_emergency_market_unwind(_route_capability(route_id))
+    # FOK is a different order shape: an old MARKET test cannot certify it.
+    return _capability_matches_policy(_route_capability(route_id))
 
 
 def _test_best_order_spec(attempt_id, leg, purpose, symbol, frm, to, input_units, market, meta,
@@ -3419,7 +3723,7 @@ def _test_best_order_spec(attempt_id, leg, purpose, symbol, frm, to, input_units
     candidates=live_order_candidates(symbol,frm,to,input_units,market,meta,
         lambda order_type:_live_client_id(attempt_id,purpose,order_type),
         age_limit_ms=LIVE_TEST_PROBE_DEPTH_AGE_MS)
-    if market_only: candidates=[spec for spec in candidates if spec["order_type"]=="MARKET"]
+    candidates=_policy_candidates(candidates,market_only)
     if not candidates: raise MexcAPIError(f"Unwind MARKET impossible à construire pour {symbol}")
     for fallback_index,spec in enumerate(candidates):
         spec["fallback_index"]=fallback_index
@@ -3476,9 +3780,9 @@ def _prevalidation_test_best(route_id, leg, purpose, symbol, frm, to, input_unit
         raise MexcAPIError("Client de prévalidation indisponible")
     nonce=uuid.uuid4().hex
     candidates=live_order_candidates(symbol,frm,to,input_units,market,meta,
-        lambda order_type:("v246PV"+str(leg)+order_type[:1]+nonce[-22:])[:32],
+        lambda order_type:("v247PV"+str(leg)+order_type[:1]+nonce[-22:])[:32],
         age_limit_ms=LIVE_PREVALIDATE_DEPTH_AGE_MS)
-    if market_only: candidates=[spec for spec in candidates if spec["order_type"]=="MARKET"]
+    candidates=_policy_candidates(candidates,market_only)
     if not candidates: raise MexcAPIError(f"Prévalidation unwind MARKET impossible pour {symbol}")
     errors=[]
     for fallback_index,spec in enumerate(candidates):
@@ -3496,8 +3800,9 @@ def _prevalidation_test_best(route_id, leg, purpose, symbol, frm, to, input_unit
 
 def _route_needs_prevalidation(route_id, ts=None):
     ts=int(ts or now_ms())
+    if ts<prevalidation_retry_after.get(route_id,0): return False
     with live_lock: item=live_route_capabilities.get(route_id)
-    if not item or not _capability_has_emergency_market_unwind(item): return True
+    if not item or not _capability_matches_policy(item): return True
     return ts-int(item.get("validated_ts_ms") or 0)>=int(LIVE_PREVALIDATE_REFRESH_HOURS*3600000)
 
 
@@ -3561,6 +3866,7 @@ def live_prevalidation_worker():
                     api_calls+=3
                     time.sleep(LIVE_PREVALIDATE_INTERVAL_SEC)
             except Exception as exc:
+                prevalidation_retry_after[route["id"]]=now_ms()+LIVE_PREVALIDATE_ERROR_BACKOFF_MS
                 with live_lock:
                     prevalidation_runtime["errors"]+=1
                     prevalidation_runtime["last_route"]=route["id"]
@@ -3574,12 +3880,53 @@ def live_prevalidation_worker():
         time.sleep(30.0 if api_calls else 10.0)
 
 
+def _entry_price_guard(route,spec,t0,requested_usd):
+    if now_ms()-t0>LIVE_MAX_T0_TO_LEG1_POST_MS:
+        raise MexcSignalExpired("signal_too_old_before_post")
+    arm=live_arm_status()
+    if not arm["effective"]: raise MexcSignalExpired("gate_"+arm["reason"])
+    reason,*_= _live_health_status(route)
+    if reason: raise MexcSignalExpired(reason)
+    with state_lock: meta=state["market_meta"]; books=dict(state["bbo"])
+    if spec["order_type"]=="FILL_OR_KILL":
+        # At the frozen entry price, including quantity/price rounding, the
+        # subsequent exit must still clear the guard at its worst used bid.
+        cost=float(spec["quantity"])*float(spec["price"])
+        sm=stable_mark_usdt(route["path"][0],books,meta)
+        if cost*sm>requested_usd+1e-8: raise MexcSignalExpired("rounded_entry_over_budget")
+        mid=float(spec["quantity"])*(1.0-LIVE_FEE_SAFETY)
+        sell_qty=float(_floor_amount(mid,_precision_step(meta[route["symbols"][1]],"baseAssetPrecision")) or 0)
+        fill=depth_walk(route["symbols"][1],route["path"][1],route["path"][2],sell_qty,meta,
+                        age_limit_ms=LIVE_BBO_AGE_MS)
+        em=stable_mark_usdt(route["path"][2],books,meta)
+        worst=fill.get("worst_price") if fill else None
+        if not worst or fill["fill_ratio"]<.999999:
+            raise MexcSignalExpired("sized_exit_depth_unavailable")
+        worst=float(_floor_amount(worst,_precision_step(meta[route["symbols"][1]],"quotePrecision")) or 0)
+        edge=sell_qty*worst*(1-FEE)*em/max(cost*sm,1e-12)-1
+        if edge<LIVE_LEG2_MIN_EDGE: raise MexcSignalExpired("rounded_price_edge_below_guard")
+
+
+def _leg2_post_guard(route,spec,fill_ts,input_usd):
+    sym=route["symbols"][1]
+    with depth_lock: ob=dict(state["depth"].get(sym) or {})
+    reason=_snapshot_freshness({sym:ob},LIVE_LEG2_BBO_AGE_MS,LIVE_LEG2_EXCHANGE_AGE_MS)
+    if not ob.get("ready"): reason="route_depth_not_ready"
+    if fill_ts and fill_ts-int(ob.get("send_ts") or 0)>LIVE_LEG2_MAX_EXCHANGE_SKEW_MS:
+        reason="leg2_event_skew"
+    if reason: raise MexcSignalExpired(reason)
+    if spec["order_type"]=="FILL_OR_KILL":
+        with state_lock: books=dict(state["bbo"]); meta=state["market_meta"]
+        edge=float(spec["quantity"])*float(spec["price"])*(1-FEE)*stable_mark_usdt(route["path"][2],books,meta)/max(input_usd,1e-12)-1
+        if edge<LIVE_LEG2_MIN_EDGE: raise MexcSignalExpired("rounded_leg2_price_edge")
+
+
 def _live_real_attempt(q, attempt_id, x, quality, requested_usd, balances, meta):
     route=q["route"]; start,mid,end=route["path"]; sm=x["start_mark"]
     capability=_route_capability(route["id"])
     if not capability: raise MexcAPIError("Route sans capacité /order/test récente")
-    if not _capability_has_emergency_market_unwind(capability):
-        raise MexcAPIError("Route sans unwind MARKET prévalidé")
+    if not _capability_matches_policy(capability):
+        raise MexcAPIError("Route sans prévalidation correspondant à la politique de prix")
     t0=int(q.get("decision_ts_ms") or now_ms()); admitted_ts=int(q.get("gateway_admit_ts_ms") or now_ms())
     if now_ms()-t0>LIVE_MAX_T0_TO_LEG1_POST_MS:
         raise MexcSignalExpired("Signal trop ancien avant préparation de la jambe 1")
@@ -3587,6 +3934,8 @@ def _live_real_attempt(q, attempt_id, x, quality, requested_usd, balances, meta)
     spec1=live_order_spec(route["symbols"][0],start,mid,requested_units,
         meta[route["symbols"][0]],meta,l1id,capability["leg1"],
         exchange_age_limit_ms=LIVE_EXCHANGE_AGE_MS)
+    _entry_price_guard(route,spec1,t0,requested_usd)
+    spec1["_post_guard"]=lambda ts:_entry_price_guard(route,spec1,t0,requested_usd)
     prep1=_live_prepare_initial_order(q,requested_usd,x,attempt_id,spec1,t0,admitted_ts)
     q["attempt_durable"]=True
     spec1["_prepare_journal_ms"]=prep1
@@ -3604,7 +3953,14 @@ def _live_real_attempt(q, attempt_id, x, quality, requested_usd, balances, meta)
                           query_commissions=not LIVE_DEFER_LEG1_COMMISSION)
     l1_done=int(r1.get("confirmed_ts_ms") or now_ms())
     e1=_order_effects(r1["order"],r1["commissions"],meta[route["symbols"][0]],spec1["side"],r1["commission_known"])
-    if e1["output"]<=0: raise MexcAPIError("Jambe 1 sans quantité acquise")
+    if e1["output"]<=0:
+        _live_finalize_attempt(attempt_id,"entry_canceled",input_units=0.0,mid_acquired=0.0,
+            realized_pnl=0.0,cash_output_usd=0.0,
+            leg1_latency_ms=r1["latency_ms"],leg1_post_http_ms=r1.get("http_ms"),
+            leg1_confirm_ms=r1.get("confirm_ms"),
+            t0_to_leg1_submit_ms=max(0,int(r1.get("request_started_ts_ms") or t0)-t0),
+            t0_to_done_ms=max(0,now_ms()-t0))
+        return "entry_canceled",r1["latency_ms"],None,0.0
     mid_acquired=e1["output"]; l2id=_live_client_id(attempt_id,"leg2")
     mid_used=0.0; end_out=0.0; r2=None; leg2_error=None; guard_edge=None
     leg2_exchange_age=None; leg2_exchange_skew=None
@@ -3657,6 +4013,7 @@ def _live_real_attempt(q, attempt_id, x, quality, requested_usd, balances, meta)
             meta[route["symbols"][1]],meta,l2id,capability["leg2"],
             age_limit_ms=LIVE_LEG2_BBO_AGE_MS,
             exchange_age_limit_ms=LIVE_LEG2_EXCHANGE_AGE_MS)
+        spec2["_post_guard"]=lambda ts:_leg2_post_guard(route,spec2,leg1_exchange_ts,input_usd_guard)
         prep2=_live_prepare_followup_order(attempt_id,2,"leg2",spec2,status="leg2_submitting",
             input_units=e1["input"],mid_acquired=mid_acquired,leg1_client_id=l1id,leg2_client_id=l2id,
             leg1_order_type=spec1["order_type"],leg2_order_type=spec2["order_type"],
@@ -3669,9 +4026,16 @@ def _live_real_attempt(q, attempt_id, x, quality, requested_usd, balances, meta)
             leg2_exchange_age_ms=leg2_exchange_age,
             leg2_exchange_skew_ms=leg2_exchange_skew)
         spec2["_prepare_journal_ms"]=prep2
-        r2=_submit_live_order(attempt_id,2,"leg2",spec2,False,prepared=True)
+        r2=_submit_live_order(attempt_id,2,"leg2",spec2,False,prepared=True,query_commissions=False)
         e2=_order_effects(r2["order"],r2["commissions"],meta[route["symbols"][1]],spec2["side"],r2["commission_known"])
         mid_used=min(mid_acquired,e2["input"]); end_out=e2["output"]
+    except MexcOrderUncertain:
+        # L2 might already have sold the acquired asset. Never fire a second
+        # SELL against that uncertain balance (nor against protected bags).
+        _live_attempt_update(attempt_id,status="reconciliation_required",
+            input_units=e1["input"],mid_acquired=mid_acquired,
+            realized_pnl=None,error="Statut jambe 2 inconnu: aucun unwind automatique")
+        raise
     except Exception as exc:
         leg2_error=exc
     remaining=max(0.0,mid_acquired-mid_used)
@@ -3683,7 +4047,7 @@ def _live_real_attempt(q, attempt_id, x, quality, requested_usd, balances, meta)
     remaining_value_est=(remaining*remaining_mark if remaining_mark is not None else
         requested_usd*remaining/max(mid_acquired,1e-18))
     unwind_required=bool(remaining>0 and remaining_value_est>LIVE_DUST_USD)
-    unwind_used=0.0; unwind_out=0.0; uwid=None; unwind_error=None
+    unwind_used=0.0; unwind_out=0.0; uwid=None; unwind_error=None; uw=None; uwspec=None
     if unwind_required:
         uwid=_live_client_id(attempt_id,"unwind")
         try:
@@ -3697,6 +4061,10 @@ def _live_real_attempt(q, attempt_id, x, quality, requested_usd, balances, meta)
             uw=_submit_live_order(attempt_id,3,"unwind",uwspec,False,prepared=True)
             uwe=_order_effects(uw["order"],uw["commissions"],meta[route["symbols"][0]],uwspec["side"],uw["commission_known"])
             unwind_used=min(remaining,uwe["input"]); unwind_out=uwe["output"]
+        except MexcOrderUncertain:
+            _live_attempt_update(attempt_id,status="reconciliation_required",realized_pnl=None,
+                                 error="Statut unwind inconnu: réconciliation obligatoire")
+            raise
         except Exception as exc:
             unwind_error=exc
     # Once the market-risk phase is over, replace the conservative leg-1 fee
@@ -3704,13 +4072,29 @@ def _live_real_attempt(q, attempt_id, x, quality, requested_usd, balances, meta)
     # leg 2 or the emergency unwind.
     if LIVE_DEFER_LEG1_COMMISSION:
         _reconcile_order_commissions(r1,spec1)
+    if r2:
+        _reconcile_order_commissions(r2,spec2)
+        e2=_order_effects(r2["order"],r2["commissions"],meta[route["symbols"][1]],spec2["side"],True)
+        mid_used=e2["input"]; end_out=e2["output"]
+    fee_results=[(r1,spec1)]+([(r2,spec2)] if r2 else [])+([(uw,uwspec)] if uw else [])
+    fees_known=all(r.get("commission_known") or _order_numbers(r["order"])[0]<=0 for r,_ in fee_results)
     e1=_order_effects(r1["order"],r1["commissions"],meta[route["symbols"][0]],
-                      spec1["side"],r1["commission_known"])
+                      spec1["side"],True)
     mid_acquired=e1["output"]
     residual=max(0.0,mid_acquired-mid_used-unwind_used)
     with state_lock: books=dict(state["bbo"])
     input_usd=e1["input"]*stable_mark_usdt(start,books,meta)
     output_usd=end_out*stable_mark_usdt(end,books,meta)+unwind_out*stable_mark_usdt(start,books,meta)
+    # Fees paid in a third asset (e.g. MX) also belong to the realized result.
+    extra_fees=0.0
+    for result,spec in fee_results:
+        market=meta[spec["symbol"]]
+        for asset,amount in result.get("commissions",{}).items():
+            if asset in (market["base"],market["quote"]): continue
+            mark=_asset_mark_usd(asset,books,meta)
+            if mark is None: fees_known=False
+            else: extra_fees+=amount*mark
+    output_usd-=extra_fees
     disposed_units=max(0.0,min(mid_acquired,mid_used+unwind_used))
     residual_mark=_asset_mark_usd(mid,books,meta)
     pnl_parts=_live_pnl_breakdown(input_usd,output_usd,mid_acquired,disposed_units,
@@ -3724,6 +4108,10 @@ def _live_real_attempt(q, attempt_id, x, quality, requested_usd, balances, meta)
     material_residual=bool(residual>0 and (residual_mark is None or residual_usd>LIVE_DUST_USD))
     status=("open_exposure" if material_residual else
             ("forced_unwind" if unwind_required else "completed"))
+    if not fees_known:
+        # A haircut is a reserve, not an actual fee or a realized loss.
+        realized_pnl=None; economic_pnl=None; unrealized_pnl=None
+        if status!="open_exposure": status="accounting_pending"
     _,_,day=local_day_bounds_ms(0)
     exposure=({"day":day,"route_id":route["id"],"symbol":route["symbols"][0],
         "asset":mid,"start_asset":start,"units":residual,"input_usd":input_usd,
@@ -3757,6 +4145,7 @@ def _live_real_attempt(q, attempt_id, x, quality, requested_usd, balances, meta)
     # Preserve every causal safety event after the inventory/accounting row is
     # durable. An exposure can no longer be mistaken for a completed loss.
     if unwind_error is not None: live_trip("unwind_failed",unwind_error,attempt_id)
+    if not fees_known: live_trip("fee_reconciliation_required",attempt_id=attempt_id)
     if status=="open_exposure":
         live_trip("residual_intermediate_asset",f"{residual} {mid}",attempt_id)
     return status,r1["latency_ms"],r2["latency_ms"] if r2 else None,realized_pnl
@@ -3838,6 +4227,7 @@ def process_live_candidate(q):
         q["gateway_check_us"]=(time.perf_counter_ns()-check_started)/1000.0
         live_gateway_check_us.append(q["gateway_check_us"])
     def skipped(reason):
+        _v247_count("gateway:"+reason)
         reasons=q.setdefault("retry_reasons",{})
         reasons[reason]=int(reasons.get(reason,0))+1
         record_check()
@@ -3952,6 +4342,10 @@ def process_live_candidate(q):
                 if TRADING_MODE=="live" and timing["leg1_confirm_ms"] is not None: live_leg1_confirm_ms.append(timing["leg1_confirm_ms"])
                 if TRADING_MODE=="live" and timing["leg2_confirm_ms"] is not None: live_leg2_confirm_ms.append(timing["leg2_confirm_ms"])
             if status=="test_validated": live_runtime["test_validations"]+=1
+            elif status=="entry_canceled":
+                # No fill and no inventory: a later new version can try again
+                # after the ordinary crypto cooldown, without a blind POST retry.
+                live_consumed_events.discard(event_key)
             elif status in ("completed","forced_unwind"):
                 if status=="forced_unwind":
                     live_runtime["forced_unwinds"]+=1; live_runtime["consecutive_unwinds"]+=1
@@ -3971,8 +4365,17 @@ def process_live_candidate(q):
                 live_trip("consecutive_unwind_limit",attempt_id=attempt_id)
         _live_admission_upsert(q,status,requested_usd=requested,attempt_id=attempt_id,
                                retry_count=retry_count,route_tested=_route_has_recent_test(q["route"]["id"]))
-        if TRADING_MODE=="live": live_account_refresh_event.set()
+        if TRADING_MODE=="live":
+            with live_lock: live_runtime["account_ts_ms"]=None
+            live_account_refresh_event.set()
         persist_live_state(); return result
+    except MexcOrderUncertain as exc:
+        _live_attempt_update(attempt_id,status="reconciliation_required",realized_pnl=None,error=str(exc)[:1000])
+        _live_admission_upsert(q,"reconciliation_required",reason=str(exc),attempt_id=attempt_id,
+                               requested_usd=requested,retry_count=retry_count,route_tested=tested)
+        live_trip("order_status_unknown",exc,attempt_id)
+        with live_lock: live_runtime["last_status"]="reconciliation_required"
+        return "reconciliation_required",None,None,None
     except MexcSignalExpired as exc:
         expired_detail=str(exc)[:500] or "signal_too_old_before_post"
         if not q.get("attempt_durable"):
@@ -3986,6 +4389,10 @@ def process_live_candidate(q):
             requested_usd=requested,attempt_id=attempt_id,retry_count=retry_count,
             route_tested=_route_has_recent_test(q["route"]["id"]))
         with live_lock:
+            # No POST was sent: a genuinely newer book may be evaluated later.
+            live_consumed_events.discard(event_key)
+            if live_asset_last_attempt_ms.get(cooldown_asset)==admitted_ts:
+                live_asset_last_attempt_ms.pop(cooldown_asset,None)
             live_runtime["last_status"]="skipped_signal_too_old_before_post"
             live_runtime["last_skip_reason"]=expired_detail
         return "skipped_signal_too_old_before_post",None,None,None
@@ -4002,6 +4409,36 @@ def process_live_candidate(q):
         if TRADING_MODE=="live": live_trip("live_attempt_failed",exc,attempt_id)
         else: persist_live_state()
         return "failed",None,None,None
+
+
+def maybe_live_candidate(route,x,ts,event_start_ts):
+    """A new book version is a new observation, not a replay of an old order.
+
+    A rejected research T0 must not consume the later executable window. No
+    order is retried here; the consumed event and crypto cooldown still apply.
+    """
+    if TRADING_MODE=="shadow" or not x or x.get("net",-1)<SHADOW_MIN_EDGE: return False
+    key=(route["id"],int(event_start_ts))
+    versions=tuple(b.get("version") for b in x.get("leg_books",()))
+    with live_lock:
+        if key in live_consumed_events: return False
+        if live_runtime.get("busy"): _v247_count("candidate:busy"); return False
+        if ts-live_asset_last_attempt_ms[route["path"][1]]<LIVE_HARD_COOLDOWN_MS:
+            _v247_count("candidate:crypto_cooldown"); return False
+        old=live_candidate_versions.get(route["id"])
+        if old and (old[0]==versions or ts-old[1]<LIVE_RECHECK_INTERVAL_MS): return False
+        live_candidate_versions[route["id"]]=(versions,ts)
+    reason=_snapshot_freshness({s:b for s,b in zip(route["symbols"],x["leg_books"])},
+        LIVE_BBO_AGE_MS,LIVE_EXCHANGE_AGE_MS,LIVE_MAX_EXCHANGE_SKEW_MS)
+    if reason: _v247_count("candidate:"+reason); return False
+    _v247_count("candidate:fresh")
+    # This is a separate, explicitly labelled admission identity. The research
+    # T0 table is neither rewritten nor silently promoted from B- to A.
+    initial={"grade":"pending","eligible":False,"selected_usd":0,
+             "capacity_usd":x["size"],"sizing_scope":"live_affordable_size"}
+    return enqueue_live_candidate(route,initial,f"{route['id']}@{ts}:v247",event_start_ts,
+        decision_ts_ms=ts,edge_t0=x["net"],exchange_age_t0_ms=x.get("exchange_max_age"),
+        exchange_skew_t0_ms=x.get("exchange_skew"))
 
 
 def enqueue_live_candidate(route, quality, decision_id, event_start_ts, decision_ts_ms=None, edge_t0=None,
@@ -4143,7 +4580,8 @@ def initialize_live_gateway():
         unresolved=live_db_execute("""SELECT COUNT(*) AS n FROM live_orders_v240
             WHERE status IN ('prepared','submitted','submit_unknown')""",one=True)
         unfinished=live_db_execute("""SELECT COUNT(*) AS n FROM live_attempts_v240
-            WHERE mode='live' AND status IN ('prepared','leg1_submitting','leg2_submitting','unwind_submitting')""",one=True)
+            WHERE mode='live' AND status IN ('prepared','leg1_submitting','leg2_submitting','unwind_submitting',
+                'reconciliation_required','accounting_pending')""",one=True)
         exposures=live_db_execute("""SELECT COUNT(*) AS n FROM live_open_exposures_v246
             WHERE status='open' AND units>0""",one=True)
         if int(unresolved["n"] if unresolved else 0) or int(unfinished["n"] if unfinished else 0):
@@ -4194,7 +4632,7 @@ def live_status():
     with live_lock:
         out={k:v for k,v in live_runtime.items() if k!="balances"}; out["balances"]={k:dict(v) for k,v in live_runtime.get("balances",{}).items()}
         validated_routes=sum(int(v.get("expires_ts_ms") or 0)>=now_ms() and
-            _capability_has_emergency_market_unwind(v) for v in live_route_capabilities.values())
+        _capability_matches_policy(v) for v in live_route_capabilities.values())
         account_ts=live_runtime.get("account_ts_ms")
         prevalidation=dict(prevalidation_runtime)
     exposure=live_open_exposure_snapshot()
@@ -4215,7 +4653,14 @@ def live_status():
     retry_window=LIVE_EXEC_RETRY_WINDOW_MS if TRADING_MODE=="live" else LIVE_RETRY_WINDOW_MS
     retry_interval=LIVE_EXEC_RETRY_INTERVAL_MS if TRADING_MODE=="live" else LIVE_RETRY_INTERVAL_MS
     retry_max=LIVE_EXEC_RETRY_MAX if TRADING_MODE=="live" else LIVE_RETRY_MAX
+    with live_v247_lock: v247_counts=dict(live_v247_counts)
     out.update({"configured_mode":TRADING_MODE,"arm":arm,"cap_usd":LIVE_CAP_USD,
+        "v247_counts":v247_counts,"price_protected":LIVE_PRICE_PROTECTED,
+        "entry_order_policy":"FILL_OR_KILL" if LIVE_PRICE_PROTECTED else "capability",
+        "sizing_scope":"live_affordable_size","research_grades_unchanged":True,
+        "shadow_model":"counterfactual_not_a_fill_guarantee",
+        "fees_assumed_per_leg":FEE,"fees_are_account_specific":False,
+        "legacy_capabilities_stored":len(live_route_capabilities),
         "capital_limit_usd":LIVE_CAPITAL_LIMIT_USD,"daily_loss_limit_usd":LIVE_DAILY_LOSS_LIMIT_USD,
         "max_concurrent":LIVE_MAX_CONCURRENT,"bbo_age_ms":LIVE_BBO_AGE_MS,
         "leg2_bbo_age_ms":LIVE_LEG2_BBO_AGE_MS,"max_skew_ms":LIVE_MAX_SKEW_MS,
@@ -4579,9 +5024,15 @@ def shadow_leg1(q):
     age_limit=LIVE_BBO_AGE_MS if is_bot_shadow_profile(q["profile"]) else PRIMARY_BBO_AGE_MS
     if book_age>age_limit:
         q["skip_detail"]={"reason":"depth_stale","book_age_ms":book_age,"executable_usd":None}; return False
+    if is_bot_shadow_profile(q["profile"]):
+        reason,*_=_live_health_status(r)
+        if reason:
+            q["skip_detail"]={"reason":reason,"book_age_ms":book_age,"executable_usd":None}; return False
     fill=depth_walk(sym,frm,to,q["reserved_units"],meta,age_limit_ms=age_limit)
     if not fill:
         q["skip_detail"]={"reason":"no_liquidity","book_age_ms":book_age,"executable_usd":0.0}; return False
+    if is_bot_shadow_profile(q["profile"]) and fill["fill_ratio"]<.999999:
+        q["skip_detail"]={"reason":"fok_insufficient_depth","book_age_ms":book_age,"executable_usd":0}; return False
     fill_usd=fill["input_used"]*q["x0"]["start_mark"]
     if fill_usd<SIM_MIN_TRADE_USD:
         q["skip_detail"]={"reason":"below_min_fill","book_age_ms":book_age,"executable_usd":fill_usd}; return False
@@ -4593,9 +5044,12 @@ def settle_shadow_trade(q,exec_ts):
         st=ensure_shadow_day(profile); s,e=q["start_asset"],q["end_asset"]; reserved=q["reserved_units"]; r=q["route"]; mid=r["path"][1]; sym1,sym2=r["symbols"]
         with state_lock: meta=state["market_meta"]; books=dict(state["bbo"])
         leg1=q["leg1"]; mid_total=leg1["output"]; input_units=min(leg1["input_used"],st["balances"].get(s,0.0)); input_usd=input_units*q["x0"]["start_mark"]
-        age_limit=LIVE_BBO_AGE_MS if is_bot_shadow_profile(profile) else PRIMARY_BBO_AGE_MS
+        age_limit=LIVE_LEG2_BBO_AGE_MS if is_bot_shadow_profile(profile) else PRIMARY_BBO_AGE_MS
         fill2=depth_walk(sym2,mid,e,mid_total,meta,age_limit_ms=age_limit)
         if is_bot_shadow_profile(profile):
+            if fill2:
+                reason=_snapshot_freshness({sym2:fill2},LIVE_LEG2_BBO_AGE_MS,LIVE_LEG2_EXCHANGE_AGE_MS)
+                if reason or fill2["fill_ratio"]<.999999: fill2=None
             # Mirror the live guard without altering final Shadow accounting:
             # test one 0.20% total haircut on the modeled leg-1 gross output,
             # then allow leg 2 only while the conservative route keeps >=0.15%.
@@ -4604,6 +5058,9 @@ def settle_shadow_trade(q,exec_ts):
             guard_fill2=depth_walk(sym2,mid,e,guard_mid,meta,age_limit_ms=age_limit)
             predicted=(guard_fill2["output"]*stable_mark_usdt(e,books,meta)/max(input_usd,1e-12)-1.0) if guard_fill2 and guard_fill2.get("fill_ratio",0)>=0.999999 else -1.0
             if predicted<LIVE_LEG2_MIN_EDGE: fill2=None
+            # Modeled execution instant, not a measured matching-engine fill.
+            if fill2 and q.get("leg1_ts_ms",0)+int(getattr(live_client,"time_offset_ms",0) or 0)-int(fill2.get("send_ts") or 0)>LIVE_LEG2_MAX_EXCHANGE_SKEW_MS:
+                fill2=None
         leg2_used=fill2["input_used"] if fill2 else 0.0; end_out=fill2["output"] if fill2 else 0.0
         remaining=max(0.0,mid_total-leg2_used); unwind=depth_walk(sym1,mid,s,remaining,meta,age_limit_ms=age_limit) if remaining>1e-12 else None
         unwind_used=unwind["input_used"] if unwind else 0.0; start_back=unwind["output"] if unwind else 0.0; open_units=max(0.0,remaining-unwind_used)
@@ -4854,10 +5311,8 @@ def schedule_decision(route,x,ts,event_start_ts):
     # 50 ms validation before touching either /order/test or the real endpoint.
     # It is queued before research persistence/capture work so an 8 ms freshness
     # margin such as LIT's cannot be consumed by JSON serialization.
-    if quality["eligible"]:
-        enqueue_live_candidate(route,quality,did,event_start_ts,decision_ts_ms=ts,edge_t0=x.get("net"),
-                               exchange_age_t0_ms=x.get("exchange_max_age"),
-                               exchange_skew_t0_ms=x.get("exchange_skew"))
+    # V247: LIVE is driven by maybe_live_candidate, independently of this
+    # once-per-event research capture and its uncapped size classification.
     put_db(("decision_context_v234",(did,day,route["id"],int(event_start_ts),ts,">".join(route["path"]),route["path"][0],route["path"][-1],x["net"],x["size"],x.get("start_mark"),x.get("end_mark"),ready_ages[0] if len(ready_ages)>0 else None,ready_ages[1] if len(ready_ages)>1 else None,1 if quality["eligible"] else 0,_policy_reason)))
     put_db(("decision_quality_v235",(did,day,route["id"],ts,quality["grade"],1 if quality["eligible"] else 0,quality["reason"],
         quality["capacity_usd"],quality["size_fraction"],quality["selected_usd"],quality.get("normal_edge"),
@@ -4989,7 +5444,7 @@ def close_event(key,ev,end_ts=None):
 def process_route(route,ts):
     with state_lock:
         books=dict(state["bbo"]); meta=state["market_meta"]
-    x=route_calc(route,books,meta)
+    x=route_calc(route,books,meta,allow_small_capacity=True)
     _coverage_observe(route,x,ts)
     with state_lock:
         if x: state["latest_routes"][route["id"]]={"ts":ts,"net":x["net"],"size":x["size"],"type":route["type"],"max_age":x["max_age"]}
@@ -5035,6 +5490,7 @@ def process_route(route,ts):
                 ev["peak_net"]=max(ev["peak_net"],x["net"]); ev["max_size"]=max(ev["max_size"],x["size"]); ev["peak_profit"]=max(ev["peak_profit"],x["profit"])
 
             # Decision is immediate at T0. The simulation can enter once per event when its stricter BBO/skew rules are met.
+            maybe_live_candidate(route,x,now_ms(),ev["start_ts"])
             schedule_decision(route,x,ts,ev["start_ts"])
 
             # No confirmation gate. Event duration remains descriptive only.
@@ -5089,6 +5545,7 @@ def stable_quote_worker():
 # ---------- Scan queue ----------
 def enqueue_scan(symbol):
     with queued_lock:
+        scan_generations[symbol]+=1
         if symbol in queued_symbols:
             with state_lock: state["scan_coalesced"]+=1
             return
@@ -5101,6 +5558,7 @@ def enqueue_scan(symbol):
 def scan_worker():
     while True:
         sym=scanq.get()
+        with queued_lock: generation=scan_generations[sym]
         try:
             with state_lock: routes=list(state["routes_by_symbol"].get(sym,()))[:MAX_ROUTES_PER_SYMBOL_SCAN]
             ts=now_ms()
@@ -5108,7 +5566,15 @@ def scan_worker():
             with state_lock: state["scan_updates"]+=1
         except Exception as e: logerr(f"scan {sym}: {e}")
         finally:
-            with queued_lock: queued_symbols.discard(sym)
+            with queued_lock:
+                if scan_generations[sym]!=generation:
+                    # At least one delta arrived while processing. Keep the
+                    # symbol reserved and schedule exactly one catch-up pass.
+                    try: scanq.put_nowait(sym)
+                    except queue.Full:
+                        queued_symbols.discard(sym)
+                        with state_lock: state["scan_queue_drops"]+=1
+                else: queued_symbols.discard(sym)
             scanq.task_done()
 
 # ---------- WS ----------
@@ -5193,7 +5659,7 @@ def ws_worker(symbols,worker_id,group_volume_24h=0.0):
                             h=state["ws_workers"].get(worker_id)
                             if h is not None: h["last_message_ms"]=ts
                     last_lat=ws_latency_last_sample.get(x["symbol"],0)
-                    if ts-last_lat>=WS_LATENCY_SAMPLE_MS:
+                    if x.get("send",0)>0 and ts-last_lat>=WS_LATENCY_SAMPLE_MS:
                         ws_latency_last_sample[x["symbol"]]=ts
                         put_db(("ws_lat_v22",(ts,x["symbol"],x["send"],ts,max(0,mexc_now_ms()-x["send"]))))
                     apply_depth_update(x)
@@ -5386,7 +5852,7 @@ def v241_live_funnel_stats():
             WHERE decision_ts_ms>=? AND decision_ts_ms<? ORDER BY decision_ts_ms DESC LIMIT 30""",(start,end)).fetchall()
         with live_lock:
             caps=sum(int(v.get("expires_ts_ms") or 0)>=now_ms() and
-                _capability_has_emergency_market_unwind(v) for v in live_route_capabilities.values())
+                _capability_matches_policy(v) for v in live_route_capabilities.values())
         return {"rows":[dict(r) for r in rows],"recent":[dict(r) for r in recent],"validated_routes":caps or 0}
     finally: con.close()
 
@@ -5528,11 +5994,12 @@ def api_status():
                  "v235_capture":cached.get("v235_capture",{})})
     return jsonify(base)
 
-HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MEXC 2-Leg V2.4.6b</title>
+HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MEXC 2-Leg V2.4.7</title>
 <style>body{background:#090d14;color:#e8edf5;font-family:system-ui;margin:0;padding:16px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.c,.panel{background:#111827;border:1px solid #273248;border-radius:10px;padding:12px}.v{font-weight:800;font-size:20px}.big{font-size:28px}.muted{color:#9aa7bd;font-size:12px}.good{color:#22d38a}.bad{color:#ff6677}.panel{margin-top:12px;overflow:auto}.latency{display:grid;grid-template-columns:repeat(3,minmax(250px,1fr));gap:10px}.latbox{background:#0c1421;border:1px solid #2a3850;border-radius:10px;padding:12px}.balance{margin-top:8px;line-height:1.7}.metricgrid{display:grid;grid-template-columns:repeat(2,minmax(95px,1fr));gap:7px;margin-top:10px}.metric{background:#111b2b;border-radius:8px;padding:8px}.tag{display:inline-block;border:1px solid #334155;border-radius:999px;padding:3px 7px;font-size:11px;color:#bac6d8}table{border-collapse:collapse;width:100%;font-size:12px}th,td{padding:8px;border-bottom:1px solid #263044;text-align:right}th:first-child,td:first-child{text-align:left}@media(max-width:900px){.latency{grid-template-columns:1fr}}</style></head><body>
-<h2>MEXC — Scanner + micro-bot Spot 2-leg V2.4.6b</h2><div class=cards id=cards></div>
+<h2>MEXC — Scanner + micro-bot Spot 2-leg V2.4.7</h2><div class=cards id=cards></div>
 <div class=panel id=health></div>
 <div class=panel id=coverage></div>
+<div class=panel id=v247></div>
 <div class=panel id=live></div>
 <div class=panel id=privatews></div>
 <div class=panel id=livefunnel></div>
@@ -5544,7 +6011,8 @@ HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" 
 <div class=panel id=capture></div><div class=panel id=diag></div>
 <script>
 async function refresh(){let d=await fetch('/api/status').then(r=>r.json()),g=d.diag,p=d.v235_policy||{},cap=d.v235_capture||{},ql=d.quality||{},ad=d.admissions||{},sk=d.shadow_skips||{},he=d.health||{},lv=d.live||{},lf=d.live_funnel||{},la=lv.arm||{},cv=d.coverage||{},rc=cv.route_counts||{},tc=cv.tick_counts||{},pv=lv.prevalidation||{},pw=lv.private_order_stream||{};
-document.getElementById('privatews').innerHTML=`<div class=tag>ORDRES WEBSOCKET PRIVÉ V2.4.6b</div><h3 class='${pw.connected?'good':((lv.configured_mode||'shadow')==='shadow'?'':'bad')}'>Mode ${(pw.mode||'off').toUpperCase()} · ${pw.connected?'connecté':'déconnecté'}${pw.subscribed?' · abonné':''}</h3><div class=cards><div><div class=v>${pw.opens||0} / ${pw.disconnects||0}</div><div class=muted>ouvertures / chutes privées</div></div><div><div class=v>${pw.messages||0} / ${pw.order_events||0}</div><div class=muted>messages / événements ordre</div></div><div><div class=v>${pw.terminal_events||0}</div><div class=muted>événements terminaux</div></div><div><div class=v>${pw.matched_events||0} / ${pw.unmatched_events||0}</div><div class=muted>liés au bot / non liés</div></div><div><div class=v>${pw.ws_before_rest||0} / ${pw.rest_before_ws||0} / ${pw.same_ms||0}</div><div class=muted>WS avant REST / après / égal</div></div><div><div class=v>${pw.post_to_event?.p95_ms==null?'-':Number(pw.post_to_event.p95_ms).toFixed(1)+' ms'}</div><div class=muted>POST → événement privé p95</div></div><div><div class=v>${pw.ws_rest_delta?.p95_ms==null?'-':Number(pw.ws_rest_delta.p95_ms).toFixed(1)+' ms'}</div><div class=muted>delta WS − REST p95</div></div><div><div class=v>${pw.confirmations_ws||0} / ${pw.confirmations_rest||0} / ${pw.confirmations_post||0}</div><div class=muted>autorité WS / REST / POST</div></div><div><div class=v>${pw.pings||0} / ${pw.pongs||0}</div><div class=muted>PING / PONG privés</div></div><div><div class=v>${pw.listenkey_keepalive_ok||0} / ${pw.listenkey_keepalive_errors||0}</div><div class=muted>listenKey OK / erreurs</div></div><div><div class='v ${(pw.decode_errors||0)===0?'good':'bad'}'>${pw.decode_errors||0}</div><div class=muted>erreurs de décodage</div></div><div><div class=v>${pw.pending_orders||0}</div><div class=muted>ordres suivis</div></div></div><div class=muted style='margin-top:10px'>HYBRID : le premier résultat terminal correspondant exactement au clientOrderId et au symbole (WS privé ou REST) devient décisionnaire. Le contrôle REST indépendant continue après une confirmation WS afin de réconcilier et mesurer l'écart, sans retarder la jambe suivante. Une perte du WS bloque les nouvelles entrées ; le secours REST reste actif pour un ordre déjà envoyé.</div>`;
+document.getElementById('v247').innerHTML=`<div class=tag>V2.4.7 · ADMISSION À TAILLE RÉELLE</div><h3>${lv.entry_order_policy||'-'} · ${lv.validated_routes||0} routes compatibles / ${lv.legacy_capabilities_stored||0} capacités stockées</h3><p>Le LIVE réévalue les nouvelles versions du carnet, indépendamment du premier classement replay. A/B+ LIVE est calculé à la taille abordable, cap 20 $, frais et réserve inclus. Les anciennes validations MARKET ne valident pas les ordres FOK.</p><p>Compteurs cumulés depuis ce démarrage (observations, pas trades) :</p><table>${Object.entries(lv.v247_counts||{}).sort((a,b)=>b[1]-a[1]).slice(0,12).map(([k,n])=>`<tr><td>${k}</td><td>${n}</td></tr>`).join('')}</table><p class=muted>Les Shadows restent des scénarios de carnet : absence de preuve de remplissage FOK, commissions supposées et absence de modèle de concurrence au matching. Leurs profits ne sont pas une prédiction du LIVE. Un snapshot REST sans timestamp MEXC reste exclu du LIVE jusqu'à un delta WS cohérent. Journaux et pertes historiques sont conservés.</p>`;
+document.getElementById('privatews').innerHTML=`<div class=tag>ORDRES WEBSOCKET PRIVÉ V2.4.7</div><h3 class='${pw.connected?'good':((lv.configured_mode||'shadow')==='shadow'?'':'bad')}'>Mode ${(pw.mode||'off').toUpperCase()} · ${pw.connected?'connecté':'déconnecté'}${pw.subscribed?' · abonné':''}</h3><div class=cards><div><div class=v>${pw.opens||0} / ${pw.disconnects||0}</div><div class=muted>ouvertures / chutes privées</div></div><div><div class=v>${pw.messages||0} / ${pw.order_events||0}</div><div class=muted>messages / événements ordre</div></div><div><div class=v>${pw.terminal_events||0}</div><div class=muted>événements terminaux</div></div><div><div class=v>${pw.matched_events||0} / ${pw.unmatched_events||0}</div><div class=muted>liés au bot / non liés</div></div><div><div class=v>${pw.ws_before_rest||0} / ${pw.rest_before_ws||0} / ${pw.same_ms||0}</div><div class=muted>WS avant REST / après / égal</div></div><div><div class=v>${pw.post_to_event?.p95_ms==null?'-':Number(pw.post_to_event.p95_ms).toFixed(1)+' ms'}</div><div class=muted>POST → événement privé p95</div></div><div><div class=v>${pw.ws_rest_delta?.p95_ms==null?'-':Number(pw.ws_rest_delta.p95_ms).toFixed(1)+' ms'}</div><div class=muted>delta WS − REST p95</div></div><div><div class=v>${pw.confirmations_ws||0} / ${pw.confirmations_rest||0} / ${pw.confirmations_post||0}</div><div class=muted>autorité WS / REST / POST</div></div><div><div class=v>${pw.pings||0} / ${pw.pongs||0}</div><div class=muted>PING / PONG privés</div></div><div><div class=v>${pw.listenkey_keepalive_ok||0} / ${pw.listenkey_keepalive_errors||0}</div><div class=muted>listenKey OK / erreurs</div></div><div><div class='v ${(pw.decode_errors||0)===0?'good':'bad'}'>${pw.decode_errors||0}</div><div class=muted>erreurs de décodage</div></div><div><div class=v>${pw.pending_orders||0}</div><div class=muted>ordres suivis</div></div></div><div class=muted style='margin-top:10px'>HYBRID : le premier résultat terminal correspondant exactement au clientOrderId et au symbole (WS privé ou REST) devient décisionnaire. Le contrôle REST indépendant continue après une confirmation WS afin de réconcilier et mesurer l'écart, sans retarder la jambe suivante. Une perte du WS bloque les nouvelles entrées ; le secours REST reste actif pour un ordre déjà envoyé.</div>`;
 document.getElementById('cards').innerHTML=`<div class=c><div class=v>${d.symbols}</div><div class=muted>marchés WS</div></div><div class=c><div class=v>${d.routes}</div><div class=muted>routes 2-leg</div></div><div class=c><div class=v>${d.ws}/${d.ws_expected}</div><div class=muted>WebSockets</div></div><div class=c><div class=v>${d.age_ms??'-'} ms</div><div class=muted>dernier BBO reçu</div></div><div class=c><div class=v>${d.depth_ready||0}/${d.symbols}</div><div class=muted>carnets Depth prêts</div></div><div class=c><div class=v>${d.v22?.decisions||0}</div><div class=muted>décisions replay ≥${(p.replay_min_edge_pct??0.30).toFixed(2)}%</div></div><div class=c><div class=v>${d.v22?.trace_points||0}</div><div class=muted>points trajectoire</div></div>`;
 let wsok=(he.ws_connected===he.ws_expected)&&(he.stale_workers||0)===0&&(he.workers_without_pong||0)===0&&(d.depth_ready===d.symbols)&&(he.resync_pending||0)===0;document.getElementById('health').innerHTML=`<div class=tag>SANTÉ TEMPS RÉEL</div><h3 class='${wsok?'good':'bad'}'>WebSockets ${he.ws_connected||0}/${he.ws_expected||0} · ${he.stale_workers||0} silencieux &gt;30 s</h3><div class=cards><div><div class=v>${he.ws_disconnects||0}</div><div class=muted>chutes WS</div></div><div><div class=v>${he.ws_reconnects||0}</div><div class=muted>reconnexions WS</div></div><div><div class=v>${he.ws_app_pings||0} / ${he.ws_app_pongs||0}</div><div class=muted>PING / PONG MEXC</div></div><div><div class=v>${he.max_pong_age_ms==null?'-':he.max_pong_age_ms+' ms'}</div><div class=muted>âge maximal PONG</div></div><div><div class=v>${he.workers_without_pong||0} / ${he.ws_ping_errors||0}</div><div class=muted>PONG en retard / erreurs ping</div></div><div><div class=v>${he.max_worker_message_age_ms==null?'-':he.max_worker_message_age_ms+' ms'}</div><div class=muted>silence maximal worker WS</div></div><div><div class=v>${he.depth_book_age_p95_ms==null?'-':he.depth_book_age_p95_ms+' ms'}</div><div class=muted>âge Depth p95</div></div><div><div class=v>${he.depth_book_age_max_ms==null?'-':he.depth_book_age_max_ms+' ms'}</div><div class=muted>âge Depth maximum prêt</div></div><div><div class=v>${he.depth_gap_events||0}</div><div class=muted>gaps Depth hors bootstrap</div></div><div><div class=v>${he.depth_resync_failures||0}</div><div class=muted>échecs resync</div></div><div><div class=v>${he.resync_queue||0}/${he.resync_pending||0}</div><div class=muted>file/pending resync</div></div><div><div class=v>${he.scan_queue||0}/${he.scan_queue_capacity||0}</div><div class=muted>file scan</div></div><div><div class=v>${he.scan_queue_drops||0}</div><div class=muted>abandons file scan</div></div><div><div class=v>${he.scan_coalesced||0}</div><div class=muted>updates fusionnées</div></div><div><div class=v>${he.db_queue||0}/${he.db_queue_capacity||0}</div><div class=muted>file DB</div></div><div><div class=v>${he.db_queue_drops||0}</div><div class=muted>abandons DB</div></div><div><div class=v>${((he.db_size_bytes||0)/1048576).toFixed(0)} / ${((he.db_wal_size_bytes||0)/1048576).toFixed(0)} MB</div><div class=muted>base / WAL</div></div><div><div class=v>${he.research_pending||0} / ${he.depth_capture_pending||0}</div><div class=muted>matrice live / captures pending</div></div><div><div class='v ${(he.shadow_overdue||0)===0?'good':'bad'}'>${he.shadow_pending||0} / ${he.shadow_overdue||0}</div><div class=muted>pending Shadow / en retard</div></div><div><div class=v>${he.shadow_execution_lag?.p95_ms==null?'-':he.shadow_execution_lag.p95_ms+' ms'}</div><div class=muted>retard worker Shadow p95</div></div><div><div class=v>${he.dashboard_cache_age_ms==null?'-':Math.round(he.dashboard_cache_age_ms/1000)+' s'}</div><div class=muted>âge statistiques page</div></div><div><div class=v>${he.dashboard_refresh_ms==null?'-':he.dashboard_refresh_ms+' ms'}</div><div class=muted>durée calcul statistiques</div></div></div>`;
 document.getElementById('coverage').innerHTML=`<div class=tag>AUDIT COMPLET DES ${cv.total_routes||d.routes} ROUTES</div><h3>Couverture reçue → qualité → exécution BOT</h3><div class=cards><div><div class=v>${rc.evaluations||0}/${cv.total_routes||0}</div><div class=muted>routes évaluées aujourd'hui</div></div><div><div class=v>${rc.calculable||0}</div><div class=muted>routes avec deux carnets calculables</div></div><div><div class=v>${rc.research_fresh||0}</div><div class=muted>routes Depth frais ≤${d.primary_age_ms||150} ms</div></div><div><div class=v>${rc.live_fresh||0}</div><div class=muted>routes fraîches passerelle ≤${lv.bbo_age_ms||50} ms</div></div><div><div class=v>${rc.edge_ge_030||0}</div><div class=muted>routes ayant atteint 0,30%</div></div><div><div class=v>${rc.edge_ge_035||0}</div><div class=muted>routes ayant atteint 0,35%</div></div><div><div class=v good>${rc.quality_eligible||0}</div><div class=muted>routes classées A/B+</div></div><div><div class=v>${cv.validated_now||0}</div><div class=muted>routes /order/test valides</div></div><div><div class=v good>${rc.bot_admitted||0}</div><div class=muted>routes arrivées en Shadow BOT</div></div></div><div class=muted style='margin-top:10px'>Observations agrégées : ≥0,30% ${tc.edge_ge_030||0} · ≥0,35% ${tc.edge_ge_035||0} · A/B+ ${tc.quality_eligible||0} (A ${tc.quality_a||0} · B+ ${tc.quality_bplus||0}). Écriture fixe : ${cv.storage_rows_per_day||0} lignes/jour, mise à jour toutes les ${cv.flush_sec||60} s — aucune ligne par tick.</div>`;
@@ -5588,10 +6056,10 @@ let liveCards=[
  [lv.account_cache_age_ms==null?'-':lv.account_cache_age_ms+' ms','âge cache compte']
 ];
 let liveCardHtml=liveCards.map(x=>"<div><div class='v "+(x[2]||'')+"'>"+x[0]+"</div><div class=muted>"+x[1]+"</div></div>").join('');
-document.getElementById('live').innerHTML=`<div class=tag>PASSERELLE PRIVÉE V2.4.6b</div><h3 class='${liveok?'good':((lv.configured_mode||'shadow')==='shadow'?'':'bad')}'>Mode ${mode} · ${la.reason||'-'}</h3><div class=cards>${liveCardHtml}</div><div class=muted style='margin-top:10px'>Soldes libres dédiés : ${lb||'-'} · Protection autres actifs ${lv.protected_bags?'active':'inactive'} · Rééquilibrage réel désactivé ; Shadows BOT ${lv.bot_shadow_rebalancing?'30 min / 4 h':'désactivé'} · Fraîcheur locale entrée/jambe 1 ≤${lv.bbo_age_ms||50} ms et MEXC ≤${lv.exchange_age_ms||100} ms · écart MEXC L1/L2 ≤${lv.max_exchange_skew_ms||50} ms · fraîcheur locale jambe 2 ≤${lv.leg2_bbo_age_ms||100} ms et MEXC ≤${lv.leg2_exchange_age_ms||150} ms · retard Depth L2 sur fill L1 ≤${lv.leg2_max_exchange_skew_ms||150} ms · Haircut unique ${Number(lv.fee_safety_pct||0).toFixed(2)}% · jambe 2 seulement si edge conservateur ≥${Number(lv.leg2_min_edge_pct||0).toFixed(2)}% · Commission jambe 1 différée ${lv.defer_leg1_commission?'oui':'non'} · Unwind ${lv.emergency_unwind==='prevalidated_market_without_depth_gate'?'MARKET prévalidé sans verrou Depth':'-'} · ${lv.circuit_causes?.length||0} cause(s) de circuit conservée(s) · Circuit ${lv.circuit_open?'OUVERT: '+(lv.circuit_reason||'-'):'fermé'} · journal critique séparé : ${lv.live_journal_path||'-'} · HTTP ordres gardé chaud toutes les ${lv.http_keepalive_sec||'-'} s · route testée dans les ${Number(lv.test_max_age_hours||0).toFixed(0)} h requise : ${lv.require_tested_route?'oui':'non'}. ${mode==='TEST'?'Les requêtes sont envoyées à /api/v3/order/test : aucune entrée dans le carnet et aucun fonds déplacé.':(mode==='LIVE'?'Les ordres réels exigent les trois verrous locaux.':'Passerelle inactive.')}</div>`;
+document.getElementById('live').innerHTML=`<div class=tag>PASSERELLE PRIVÉE V2.4.7</div><h3 class='${liveok?'good':((lv.configured_mode||'shadow')==='shadow'?'':'bad')}'>Mode ${mode} · ${la.reason||'-'}</h3><div class=cards>${liveCardHtml}</div><div class=muted style='margin-top:10px'>Soldes libres dédiés : ${lb||'-'} · Protection autres actifs ${lv.protected_bags?'active':'inactive'} · Rééquilibrage réel désactivé ; Shadows BOT ${lv.bot_shadow_rebalancing?'30 min / 4 h':'désactivé'} · Fraîcheur locale entrée/jambe 1 ≤${lv.bbo_age_ms||50} ms et MEXC ≤${lv.exchange_age_ms||100} ms · écart MEXC L1/L2 ≤${lv.max_exchange_skew_ms||50} ms · fraîcheur locale jambe 2 ≤${lv.leg2_bbo_age_ms||100} ms et MEXC ≤${lv.leg2_exchange_age_ms||150} ms · retard Depth L2 sur fill L1 ≤${lv.leg2_max_exchange_skew_ms||150} ms · Haircut unique ${Number(lv.fee_safety_pct||0).toFixed(2)}% · jambe 2 seulement si edge conservateur ≥${Number(lv.leg2_min_edge_pct||0).toFixed(2)}% · Commission jambe 1 différée ${lv.defer_leg1_commission?'oui':'non'} · Unwind ${lv.emergency_unwind==='prevalidated_market_without_depth_gate'?'MARKET prévalidé sans verrou Depth':'-'} · ${lv.circuit_causes?.length||0} cause(s) de circuit conservée(s) · Circuit ${lv.circuit_open?'OUVERT: '+(lv.circuit_reason||'-'):'fermé'} · journal critique séparé : ${lv.live_journal_path||'-'} · HTTP ordres gardé chaud toutes les ${lv.http_keepalive_sec||'-'} s · route testée dans les ${Number(lv.test_max_age_hours||0).toFixed(0)} h requise : ${lv.require_tested_route?'oui':'non'}. ${mode==='TEST'?'Les requêtes sont envoyées à /api/v3/order/test : aucune entrée dans le carnet et aucun fonds déplacé.':(mode==='LIVE'?'Les ordres réels exigent les trois verrous locaux.':'Passerelle inactive.')}</div>`;
 document.getElementById('live').insertAdjacentHTML('beforeend',`<div class=cards style='margin-top:10px'><div><div class=v>${lv.leg1_http_queue?.p95_ms==null?'-':Number(lv.leg1_http_queue.p95_ms).toFixed(1)+' ms'}</div><div class=muted>attente verrou HTTP jambe 1 p95</div></div><div><div class=v>${lv.leg2_http_queue?.p95_ms==null?'-':Number(lv.leg2_http_queue.p95_ms).toFixed(1)+' ms'}</div><div class=muted>attente verrou HTTP jambe 2 p95</div></div><div><div class=v>${Number(lv.http_keepalive_timeout_sec||0).toFixed(2)} s</div><div class=muted>timeout keep-alive HTTP</div></div></div>`);
 document.getElementById('live').insertAdjacentHTML('beforeend',`<div class=cards style='margin-top:10px'><div><div class=v>${pv.running?'ACTIVE':'OFF'}</div><div class=muted>prévalidation de fond TEST</div></div><div><div class=v>${pv.checked||0}/${cv.total_routes||0}</div><div class=muted>progression cycle courant</div></div><div><div class=v good>${pv.validated||0}</div><div class=muted>routes prévalidées depuis démarrage</div></div><div><div class=v>${pv.skipped_depth||0}/${pv.skipped_size||0}</div><div class=muted>reportées Depth / taille</div></div><div><div class='v ${(pv.errors||0)===0?'good':'bad'}'>${pv.errors||0}</div><div class=muted>erreurs de prévalidation</div></div></div><div class=muted style='margin-top:8px'>Session HTTP dédiée, une route toutes les ${Number(lv.prevalidation_interval_sec||0).toFixed(0)} s ; suspendue automatiquement en LIVE. Le carnet éventuellement ancien sert uniquement à construire la requête syntaxique /order/test : aucune admission BOT ne contourne la fraîcheur stricte de ${lv.bbo_age_ms||50} ms. Dernier état : ${pv.last_route||'-'} · ${pv.last_status||'-'}${pv.last_error?' · '+pv.last_error:''}.</div>`);
-let fc={};for(let r of (lf.rows||[])){let k=r.disposition+(r.reason?': '+r.reason:'');fc[k]=(fc[k]||0)+r.n}let fr=(lf.recent||[]).map(x=>`<tr><td>${new Date(x.decision_ts_ms).toLocaleTimeString()}</td><td>${x.route_id}</td><td>${x.grade} → ${x.fresh_grade||'-'}</td><td>${Number(x.selected_usd||0).toFixed(2)} $ → ${x.fresh_selected_usd==null?'-':Number(x.fresh_selected_usd).toFixed(2)+' $'}</td><td>${x.requested_usd==null?'-':Number(x.requested_usd).toFixed(2)+' $'}</td><td>${x.disposition}</td><td>${x.reason||'-'}</td><td>${x.retry_count||0}</td><td>${x.first_check_delay_ms==null?'-':x.first_check_delay_ms+' ms'} / ${x.gateway_delay_ms==null?'-':x.gateway_delay_ms+' ms'}</td><td>${x.route_depth_age_ms==null?'-':x.route_depth_age_ms+' ms'} / ${x.route_depth_skew_ms==null?'-':x.route_depth_skew_ms+' ms'}</td></tr>`).join('');document.getElementById('livefunnel').innerHTML=`<div class=tag>ENTONNOIR BOT V2.4.6b</div><h3>Classe initiale → classe fraîche réellement admise</h3><div class=cards><div><div class=v>${lv.validated_routes||0}</div><div class=muted>routes directionnelles valides</div></div><div><div class=v>${lv.bot_shadow_admissions||0}</div><div class=muted>signaux simulation BOT admis</div></div><div><div class=v>${he.ws_disconnects_5m||0} / ${he.ws_disconnects_15m||0} / ${he.ws_disconnects_60m||0}</div><div class=muted>chutes WS sur 5 / 15 / 60 min</div></div><div><div class=v>${lv.last_t0_to_leg1_submit_ms==null?'-':lv.last_t0_to_leg1_submit_ms+' ms'}</div><div class=muted>T0 → POST jambe 1</div></div><div><div class=v>${lv.last_leg1_done_to_leg2_submit_ms==null?'-':lv.last_leg1_done_to_leg2_submit_ms+' ms'}</div><div class=muted>confirmation jambe 1 → POST jambe 2</div></div><div><div class=v>${lv.last_t0_to_done_ms==null?'-':lv.last_t0_to_done_ms+' ms'}</div><div class=muted>T0 → route terminée</div></div></div><div class=muted style='margin-top:10px'>Mode TEST : jusqu'à ${lv.test_retry_max||0} relances / ${lv.test_retry_window_ms||0} ms pour découvrir une route. Mode LIVE : au plus ${lv.live_retry_max||0} relances / ${lv.live_retry_window_ms||0} ms, abandon avant tout POST si T0 dépasse ${lv.max_t0_to_leg1_post_ms||0} ms. Les capacités sont prévalidées en arrière-plan en TEST puis réutilisées pendant ${Number(lv.test_max_age_hours||0).toFixed(0)} h. Cooldown ${Number(lv.hard_cooldown_ms||0)/1000||5} s par crypto intermédiaire ; une autre crypto reste libre. Les six Shadows BOT sont planifiés hors du chemin critique.</div><table><thead><tr><th>Heure</th><th>Route</th><th>Classe T0 → fraîche</th><th>Taille T0 → fraîche</th><th>Demande bot</th><th>Disposition</th><th>Raison</th><th>Retries</th><th>1er contrôle / admission</th><th>Âge / skew Depth</th></tr></thead><tbody>${fr}</tbody></table>`;
+let fc={};for(let r of (lf.rows||[])){let k=r.disposition+(r.reason?': '+r.reason:'');fc[k]=(fc[k]||0)+r.n}let fr=(lf.recent||[]).map(x=>`<tr><td>${new Date(x.decision_ts_ms).toLocaleTimeString()}</td><td>${x.route_id}</td><td>${x.grade} → ${x.fresh_grade||'-'}</td><td>${Number(x.selected_usd||0).toFixed(2)} $ → ${x.fresh_selected_usd==null?'-':Number(x.fresh_selected_usd).toFixed(2)+' $'}</td><td>${x.requested_usd==null?'-':Number(x.requested_usd).toFixed(2)+' $'}</td><td>${x.disposition}</td><td>${x.reason||'-'}</td><td>${x.retry_count||0}</td><td>${x.first_check_delay_ms==null?'-':x.first_check_delay_ms+' ms'} / ${x.gateway_delay_ms==null?'-':x.gateway_delay_ms+' ms'}</td><td>${x.route_depth_age_ms==null?'-':x.route_depth_age_ms+' ms'} / ${x.route_depth_skew_ms==null?'-':x.route_depth_skew_ms+' ms'}</td></tr>`).join('');document.getElementById('livefunnel').innerHTML=`<div class=tag>ENTONNOIR BOT V2.4.7</div><h3>Classe initiale → classe fraîche réellement admise</h3><div class=cards><div><div class=v>${lv.validated_routes||0}</div><div class=muted>routes directionnelles valides</div></div><div><div class=v>${lv.bot_shadow_admissions||0}</div><div class=muted>signaux simulation BOT admis</div></div><div><div class=v>${he.ws_disconnects_5m||0} / ${he.ws_disconnects_15m||0} / ${he.ws_disconnects_60m||0}</div><div class=muted>chutes WS sur 5 / 15 / 60 min</div></div><div><div class=v>${lv.last_t0_to_leg1_submit_ms==null?'-':lv.last_t0_to_leg1_submit_ms+' ms'}</div><div class=muted>T0 → POST jambe 1</div></div><div><div class=v>${lv.last_leg1_done_to_leg2_submit_ms==null?'-':lv.last_leg1_done_to_leg2_submit_ms+' ms'}</div><div class=muted>confirmation jambe 1 → POST jambe 2</div></div><div><div class=v>${lv.last_t0_to_done_ms==null?'-':lv.last_t0_to_done_ms+' ms'}</div><div class=muted>T0 → route terminée</div></div></div><div class=muted style='margin-top:10px'>Mode TEST : jusqu'à ${lv.test_retry_max||0} relances / ${lv.test_retry_window_ms||0} ms pour découvrir une route. Mode LIVE : au plus ${lv.live_retry_max||0} relances / ${lv.live_retry_window_ms||0} ms, abandon avant tout POST si T0 dépasse ${lv.max_t0_to_leg1_post_ms||0} ms. Les capacités sont prévalidées en arrière-plan en TEST puis réutilisées pendant ${Number(lv.test_max_age_hours||0).toFixed(0)} h. Cooldown ${Number(lv.hard_cooldown_ms||0)/1000||5} s par crypto intermédiaire ; une autre crypto reste libre. Les six Shadows BOT sont planifiés hors du chemin critique.</div><table><thead><tr><th>Heure</th><th>Route</th><th>Classe T0 → fraîche</th><th>Taille T0 → fraîche</th><th>Demande bot</th><th>Disposition</th><th>Raison</th><th>Retries</th><th>1er contrôle / admission</th><th>Âge / skew Depth</th></tr></thead><tbody>${fr}</tbody></table>`;
 let sh=d.shadows||{},bf=sh.BOT_FAST||{},bn=['BOT_FAST','BOT_TARGET','BOT_DEGRADED','BOT_100_200','BOT_150_300','BOT_200_400'],bh=`<div class=tag>SIMULATION CONFIG BOT — CAP ${Number(lv.cap_usd||10).toFixed(0)} $</div><h3>6 profils de latence — ${(bf.capital||0).toFixed(0)} $ indépendants, routes validées uniquement</h3><div class=latency>`;for(let n of bn){let x=sh[n];if(!x)continue;let label=n.replace('BOT_','').split('_').join(' / '),bal=Object.entries(x.balances||{}).map(([a,v])=>`${a} <b>${v.toFixed(2)}</b>`).join(' · ');bh+=`<div class=latbox><div class=muted>${label} · Leg1 +${x.leg1_ms} ms · Leg2 +${x.leg2_ms} ms depuis l'admission</div><div class='v big ${x.profit>=0?'good':'bad'}'>${x.profit>=0?'+':''}${x.profit.toFixed(2)} $</div><div class=muted>NAV ${x.nav.toFixed(2)} $</div><div class=metricgrid><div class=metric><div class=v>${x.trades}</div><div class=muted>trades</div></div><div class=metric><div class=v>${x.wins} / ${x.losses}</div><div class=muted>gagnés / perdus</div></div></div><div class='balance muted'>Balance : ${bal}<br>cap ${Number(lv.cap_usd||10).toFixed(0)} $ · aucun rebalance · refus balance ${x.skipped_balance} · jambe 1 annulée ${x.skipped_flash}</div></div>`}bh+=`</div><div class=muted style='margin-top:10px'>Chaque délai virtuel est ajouté après l'admission fraîche du gateway. Les Shadows n'ajoutent aucune attente au bot : leur réservation et leur exécution sont hors du chemin critique. Ils utilisent le même capital ${Number(lv.capital_limit_usd||200).toFixed(0)} $, le même cap, la fraîcheur ${lv.bbo_age_ms||50} ms, le contrôle après jambe 1 et uniquement des routes dont jambe 1 / jambe 2 / unwind ont été acceptées par MEXC.</div>`;document.getElementById('botlatencies').innerHTML=bh;
 if(lv.bot_shadow_rebalancing){document.getElementById('botlatencies').innerHTML=document.getElementById('botlatencies').innerHTML.replaceAll('aucun rebalance','rebalance 30 min / 4 h actif')}
 document.querySelectorAll('#botlatencies .latbox').forEach((box,i)=>{let x=sh[bn[i]];if(x)box.insertAdjacentHTML('beforeend',`<div class=muted style='margin-top:5px'>Rééquilibrages ${x.rebalances||0} · coût ${Number(x.rebalance_cost||0).toFixed(3)} $</div>`)});
