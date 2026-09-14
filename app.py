@@ -9,8 +9,8 @@ from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, render_template_string
 import websocket
 
-VERSION = "2.4.8-bounded-public-flow"
-# V248: public reception/recovery, diagnostics and stale research-Shadow admission.
+VERSION = "2.4.9-local-catchup"
+# V249: pause/drain local congestion; off-lock bootstrap replay; private policy retained.
 # Private execution policy, arm phrase, journals, limits and fees are retained.
 # Offline-tested public-flow candidate. Server latency still needs validation.
 # Baseline SHA256: d4038460cdf499ac9b0b02da487680a2af37fc09e7985a13156cbc02642d2919
@@ -1352,9 +1352,13 @@ def build_balanced_ws_groups(symbols):
 # ---------- V2.4.8 bounded public reception ----------
 # Feed recovery thresholds are NOT admission thresholds. The 50/100/50 ms
 # private gates below remain unchanged. No individual Depth delta is skipped
-# while continuing the same book: overload invalidates the whole connection.
-PUBLIC_RX_QUEUE_MAX = 256
+# while continuing the same book: hard overflow invalidates the connection.
+# Local age alone pauses admission and drains ALL deltas without reconnecting.
+PUBLIC_RX_QUEUE_MAX = 1024
+PUBLIC_RX_QUEUE_BYTES = 4 * 1024 * 1024
 PUBLIC_RX_MAX_WAIT_MS = 100
+PUBLIC_RX_RESUME_MS = 25
+PUBLIC_RX_STALL_MS = 5000
 PUBLIC_LAG_RECOVERY_MS = 1000
 PUBLIC_LAG_PERSIST_MS = 200
 PUBLIC_BATCH_MAX = 32
@@ -1363,11 +1367,51 @@ public_feeds = {}
 public_symbol_feeds = {}
 public_recovery_events = deque(maxlen=200)
 public_recovery_lock = threading.Lock()
+public_catchup_events = deque(maxlen=200)
+public_reconnect_lock = threading.Lock()
+public_next_reconnect_mono = 0.0
+
+
+class PublicInbox(queue.Queue):
+    """Bound both packet count and queued raw bytes, with atomic accounting."""
+    def __init__(self):
+        super().__init__(PUBLIC_RX_QUEUE_MAX)
+        self.byte_count = 0
+
+    def put_nowait(self, item):
+        with self.not_full:
+            if self._qsize() >= self.maxsize or self.byte_count + len(item[0]) > PUBLIC_RX_QUEUE_BYTES:
+                raise queue.Full
+            self._put(item)
+            self.byte_count += len(item[0])
+            self.unfinished_tasks += 1
+            self.not_empty.notify()
+
+    def _get(self):
+        item = super()._get()
+        self.byte_count -= len(item[0])
+        return item
+
+
+def _public_symbol_receiving(symbol):
+    feed = public_symbol_feeds.get(symbol)
+    return feed is None or (feed.active and not feed.halt.is_set())
 
 
 def _public_symbol_usable(symbol):
     feed = public_symbol_feeds.get(symbol)
-    return feed is None or (feed.active and not feed.halt.is_set())
+    return feed is None or feed.usable()
+
+
+def _wait_public_reconnect_slot():
+    """Spread actual reconnects; a local catch-up needs no reconnect at all."""
+    global public_next_reconnect_mono
+    with public_reconnect_lock:
+        slot = max(time.monotonic(), public_next_reconnect_mono)
+        public_next_reconnect_mono = slot + 0.35
+    delay = slot - time.monotonic()
+    if delay > 0:
+        time.sleep(delay)
 
 
 def _public_epoch(symbol):
@@ -1426,8 +1470,13 @@ class PublicFeed:
     def __init__(self, symbols, worker_id, epoch):
         self.symbols = tuple(symbols); self.allowed = set(symbols)
         self.worker_id = worker_id; self.epoch = epoch
-        self.inbox = queue.Queue(maxsize=PUBLIC_RX_QUEUE_MAX)
+        self.inbox = PublicInbox()
         self.halt = threading.Event(); self.active = False
+        self.catching_up = threading.Event()
+        self.pressure_lock = threading.RLock()
+        self.inflight_mono = None
+        self.catchup_started_mono = None
+        self.dirty_symbols = set()
         self.fail_lock = threading.Lock(); self.close_callback = None
         self.bad_by_symbol = {}; self.reason = None
         self.threads = []
@@ -1435,15 +1484,77 @@ class PublicFeed:
                         'max_queue': 0, 'lag_ms': None, 'max_lag_ms': 0,
                         'max_queue_wait_ms': 0, 'max_decode_us': 0,
                         'max_apply_us': 0, 'max_callback_us': 0,
-                        'lock_wait_us_max': 0}
+                        'lock_wait_us_max': 0, 'processed': 0,
+                        'catchup_count': 0, 'catchup_completed': 0,
+                        'max_catchup_ms': 0}
         self.started_mono = time.monotonic()
+        self.last_progress_mono = self.started_mono
+
+    def backlog_age_ms(self):
+        with self.inbox.mutex:
+            oldest = self.inbox.queue[0][2] if self.inbox.queue else None
+        inflight = self.inflight_mono
+        pending = [t for t in (oldest, inflight) if t is not None]
+        return max(0.0, (time.monotonic() - min(pending)) * 1000) if pending else 0.0
+
+    def note_catchup(self, waited):
+        # No depth lock: block entry even if the consumer is waiting for it.
+        with self.pressure_lock:
+            if not self.catching_up.is_set():
+                self.catchup_started_mono = time.monotonic()
+                self.catching_up.set()
+                self.metrics['catchup_count'] += 1
+                with public_recovery_lock:
+                    public_catchup_events.append({'ts_ms': now_ms(), 'worker_id': self.worker_id,
+                        'epoch': self.epoch, 'event': 'paused', 'queue_age_ms': round(waited, 2)})
+
+    def check_pressure(self, allow_stall=False):
+        waited = self.backlog_age_ms()
+        self.metrics['max_queue_wait_ms'] = max(self.metrics['max_queue_wait_ms'], waited)
+        if waited > PUBLIC_RX_MAX_WAIT_MS:
+            self.note_catchup(waited)
+        if (allow_stall and waited > PUBLIC_RX_STALL_MS and
+                (time.monotonic() - self.last_progress_mono) * 1000 > PUBLIC_RX_STALL_MS):
+            self.fail('consumer_stalled')
+        return waited
+
+    def usable(self):
+        if not self.active or self.halt.is_set():
+            return False
+        self.check_pressure()
+        return not self.catching_up.is_set() and not self.halt.is_set()
+
+    def finish_batch(self):
+        with self.pressure_lock:
+            self.inflight_mono = None
+            waited = self.check_pressure()
+            if self.catching_up.is_set() and waited <= PUBLIC_RX_RESUME_MS and not self.halt.is_set():
+                elapsed = (time.monotonic() - self.catchup_started_mono) * 1000
+                self.metrics['max_catchup_ms'] = max(self.metrics['max_catchup_ms'], elapsed)
+                self.metrics['catchup_completed'] += 1
+                self.catching_up.clear()
+                # Also publish books rebuilt while this connection was paused.
+                self.dirty_symbols.update(self.symbols)
+                with public_recovery_lock:
+                    public_catchup_events.append({'ts_ms': now_ms(), 'worker_id': self.worker_id,
+                        'epoch': self.epoch, 'event': 'resumed', 'duration_ms': round(elapsed, 2)})
+        if self.usable():
+            for symbol in tuple(self.dirty_symbols):
+                if not self.usable():
+                    break
+                _publish_depth_bbo(symbol)
+                self.dirty_symbols.discard(symbol)
 
     def fail(self, reason):
         with self.fail_lock:
             if self.halt.is_set(): return
             self.reason = reason; self.active = False; self.halt.set()
         with public_recovery_lock:
-            public_recovery_events.append({"ts_ms":now_ms(),"worker_id":self.worker_id,"epoch":self.epoch,"reason":reason,"lag_ms":self.metrics["lag_ms"],"queue":self.inbox.qsize()})
+            public_recovery_events.append({"ts_ms":now_ms(),"worker_id":self.worker_id,"epoch":self.epoch,"reason":reason,"lag_ms":self.metrics["lag_ms"],"queue":self.inbox.qsize(),
+                "queue_age_ms":round(self.backlog_age_ms(),2),
+                "queue_bytes":getattr(self.inbox,'byte_count',None),
+                "max_apply_us":self.metrics['max_apply_us'],
+                "lock_wait_us_max":self.metrics['lock_wait_us_max']})
         # Keep the socket-reader callback short. Fail-closed visibility precedes
         # lock acquisition and actual closure, which happen in the helper.
         def finish():
@@ -1492,14 +1603,15 @@ class PublicFeed:
                 (time.perf_counter_ns()-started)/1000.0)
 
     def consume_batch(self, first):
-        started = time.monotonic(); item = first; updated = set(); count = 0
+        started = time.monotonic(); item = first; count = 0
         try:
             while item is not None and not self.halt.is_set():
                 payload, received, received_mono, symbol, sent = item
+                self.inflight_mono = received_mono
                 waited = (time.monotonic()-received_mono)*1000
                 self.metrics['max_queue_wait_ms'] = max(self.metrics['max_queue_wait_ms'], waited)
                 if waited > PUBLIC_RX_MAX_WAIT_MS:
-                    self.fail('receive_queue_age'); return
+                    self.note_catchup(waited)
                 decode_start = time.perf_counter_ns()
                 x = decode_depth(payload)
                 self.metrics['max_decode_us'] = max(self.metrics['max_decode_us'],
@@ -1510,7 +1622,11 @@ class PublicFeed:
                 if self.halt.is_set(): return
                 apply_start = time.perf_counter_ns()
                 if apply_depth_update(x, publish=False):
-                    updated.add(symbol); self.metrics['applied'] += 1
+                    self.dirty_symbols.add(symbol); self.metrics['applied'] += 1
+                self.metrics['processed'] += 1
+                self.last_progress_mono = time.monotonic()
+                self.inflight_mono = None
+                self.inbox.task_done()
                 self.metrics['max_apply_us'] = max(self.metrics['max_apply_us'],
                     (time.perf_counter_ns()-apply_start)/1000.0)
                 last = ws_latency_last_sample.get(symbol, 0)
@@ -1524,7 +1640,7 @@ class PublicFeed:
                 try: item = self.inbox.get_nowait()
                 except queue.Empty: item = None
             if not self.halt.is_set():
-                for symbol in updated: _publish_depth_bbo(symbol)
+                self.finish_batch()
                 self.metrics['batches'] += 1
         except Exception:
             # A decode/apply failure cannot be skipped while retaining a book.
@@ -1538,24 +1654,29 @@ class PublicFeed:
 
     def watchdog(self):
         while not self.halt.wait(0.05):
-            with self.inbox.mutex:
-                oldest = self.inbox.queue[0][2] if self.inbox.queue else None
-            if oldest is not None and (time.monotonic()-oldest)*1000 > PUBLIC_RX_MAX_WAIT_MS:
-                self.fail('receive_queue_age'); return
+            self.check_pressure(allow_stall=True)
 
     def snapshot(self):
+        usable = self.usable()
         result = dict(self.metrics)
         elapsed = max(0.001, time.monotonic()-self.started_mono)
         result.update(worker_id=self.worker_id, epoch=self.epoch, symbols=list(self.symbols),
                       active=self.active and not self.halt.is_set(), recovery_reason=self.reason,
-                      queue=self.inbox.qsize(), messages_per_sec=result['messages']/elapsed)
+                      catching_up=self.catching_up.is_set(), usable=usable,
+                      queue=self.inbox.qsize(), queue_age_ms=round(self.backlog_age_ms(),2),
+                      queue_bytes=getattr(self.inbox,'byte_count',None),
+                      messages_per_sec=result['messages']/elapsed)
         return result
 
 
 def public_flow_status():
-    with public_recovery_lock: recoveries=list(public_recovery_events)
+    with public_recovery_lock:
+        recoveries=list(public_recovery_events); catchups=list(public_catchup_events)
     return {'protobuf_backend':PUBLIC_PROTOBUF_BACKEND,'queue_limit': PUBLIC_RX_QUEUE_MAX, 'queue_max_wait_ms': PUBLIC_RX_MAX_WAIT_MS,
+            'queue_byte_limit':PUBLIC_RX_QUEUE_BYTES,'queue_resume_ms':PUBLIC_RX_RESUME_MS,
+            'consumer_stall_ms':PUBLIC_RX_STALL_MS,'local_age_action':'pause_and_drain_in_order',
             'recovery_lag_ms': PUBLIC_LAG_RECOVERY_MS, 'recent_recoveries':recoveries,
+            'recent_catchups':catchups,
             'workers': [feed.snapshot() for feed in list(public_feeds.values())]}
 
 
@@ -1827,7 +1948,7 @@ def apply_depth_update(x, publish=True):
         feed=public_symbol_feeds.get(sym)
         if feed:
             feed.metrics["lock_wait_us_max"]=max(feed.metrics["lock_wait_us_max"],(time.perf_counter_ns()-lock_started)/1000.0)
-        if not _public_symbol_usable(sym) or x.get("source_epoch",_public_epoch(sym))!=_public_epoch(sym): return False
+        if not _public_symbol_receiving(sym) or x.get("source_epoch",_public_epoch(sym))!=_public_epoch(sym): return False
         ob=state["depth"].get(sym)
         if not ob or not ob.get("ready"):
             depth_buffers[sym].append(x)
@@ -1854,45 +1975,58 @@ def apply_depth_update(x, publish=True):
 
 
 def init_depth_symbol(sym):
-    """Build one coherent local book. Return True only if snapshot + buffered deltas reconcile."""
+    """Build/replay off the global lock; atomically commit a reconciled epoch.
+
+    Consumers continue buffering while a temporary snapshot is replayed. A
+    changed buffer tail requires another catch-up pass before publication.
+    Neither a failed pass nor an obsolete HTTP response replaces a book.
+    """
     try:
         source_epoch=_public_epoch(sym)
-        if not _public_symbol_usable(sym): return False
+        if not _public_symbol_receiving(sym): return False
         r=requests.get(REST+"/api/v3/depth",params={"symbol":sym,"limit":100},timeout=8); r.raise_for_status(); j=r.json()
         bids={float(a):float(b) for a,b in j.get("bids",[]) if float(b)>0}; asks={float(a):float(b) for a,b in j.get("asks",[]) if float(b)>0}
-        ver=int(j.get("lastUpdateId",0)); received=now_ms(); ready=True
+        ver=int(j.get("lastUpdateId",0)); received=now_ms()
         if (ver<=0 or not bids or not asks or max(bids)>=min(asks) or
             not all(math.isfinite(p) and math.isfinite(q) and p>0 and q>0
                     for book in (bids,asks) for p,q in book.items())):
             return False
-        with depth_lock:
-            if not _public_symbol_usable(sym) or source_epoch!=_public_epoch(sym): return False
-            # REST snapshot has a version, but no certified exchange emission
-            # timestamp. It becomes LIVE-eligible only after a contiguous WS delta.
-            ob={"bids":bids,"asks":asks,"version":ver,"ready":True,"ts":received,
-                "send_ts":0,"snapshot_received_ts":received}
-            state["depth"][sym]=ob
-            buf=list(depth_buffers.pop(sym,[]))
+        # REST has no certified exchange timestamp. Do not fabricate one.
+        ob={"bids":bids,"asks":asks,"version":ver,"ready":True,"ts":received,
+            "send_ts":0,"snapshot_received_ts":received}
+        deadline=time.monotonic()+1.0
+        while time.monotonic()<deadline:
+            with depth_lock:
+                if not _public_symbol_receiving(sym) or source_epoch!=_public_epoch(sym): return False
+                buf=list(depth_buffers.get(sym,()))
+                tail=buf[-1] if buf else None
+            # Potentially thousands of deltas: never hold the global lock here.
             for x in buf:
-                if not _valid_depth_delta(x):
-                    ob["ready"]=False; ready=False; continue
+                if not _valid_depth_delta(x): return False
+                if x.get('source_epoch',source_epoch)!=source_epoch: return False
                 tv=x.get("to")
                 if tv<=ob["version"]: continue
                 fv=x.get("from")
                 if (fv>ob["version"]+1 or
                     (x.get("send",0)>0 and ob.get("send_ts",0)>x["send"])):
-                    ob["ready"]=False; ready=False
-                    # Keep the offending delta and later deltas for the next snapshot attempt.
-                    depth_buffers[sym].append(x)
-                    continue
-                if not ready:
-                    depth_buffers[sym].append(x); continue
-                if not _merge_depth_delta(ob,x):
-                    ob["ready"]=False; ready=False
-            state["depth_ready"]=sum(1 for z in state["depth"].values() if z.get("ready"))
-        if ready:
-            _publish_depth_bbo(sym)
-        return ready
+                    return False
+                if not _merge_depth_delta(ob,x): return False
+            with depth_lock:
+                if not _public_symbol_receiving(sym) or source_epoch!=_public_epoch(sym): return False
+                current=depth_buffers.get(sym,())
+                if (current[-1] if current else None) is tail:
+                    previous=state['depth'].get(sym)
+                    if previous and previous.get('ready') and int(previous.get('version') or 0)>ob['version']:
+                        return False
+                    state["depth"][sym]=ob
+                    depth_buffers.pop(sym,None)
+                    state["depth_ready"]=sum(1 for z in state["depth"].values() if z.get("ready"))
+                    break
+            time.sleep(0)  # Let readers/consumers run between catch-up passes.
+        else:
+            return False
+        _publish_depth_bbo(sym)
+        return True
     except Exception as e:
         logerr(f"depth snapshot {sym}: {e}")
         return False
@@ -1944,7 +2078,7 @@ def depth_bootstrap_worker(symbols):
 
 def depth_walk(symbol, frm, to, input_units, meta, age_limit_ms=PRIMARY_BBO_AGE_MS):
     m=meta.get(symbol)
-    if not m or input_units<=0: return None
+    if not m or input_units<=0 or not _public_symbol_usable(symbol): return None
     with depth_lock:
         ob=state["depth"].get(symbol)
         if not ob or not ob.get("ready"): return None
@@ -1983,7 +2117,7 @@ def _quality_books(route):
     with depth_lock:
         for sym in route["symbols"]:
             ob=state["depth"].get(sym)
-            if not ob or not ob.get("ready") or ts-ob.get("ts",0)>SHADOW_BBO_AGE_MS:
+            if not _public_symbol_usable(sym) or not ob or not ob.get("ready") or ts-ob.get("ts",0)>SHADOW_BBO_AGE_MS:
                 return None
             bids,asks=_depth_rows(ob)
             out[sym]={
@@ -5886,6 +6020,8 @@ def scan_worker():
 def ws_worker(symbols,worker_id,group_volume_24h=0.0):
     retry_delay=2.0; source_epoch=0
     while True:
+        if source_epoch:
+            _wait_public_reconnect_slot()
         source_epoch+=1
         feed=PublicFeed(symbols,worker_id,source_epoch)
         public_feeds[worker_id]=feed
@@ -6338,7 +6474,7 @@ function renderSimPanel(id,names,sh,title,description){
  host.querySelector('.sim-extra').innerHTML=`<table><thead><tr><th>Profil</th><th>Soldes</th><th>NAV</th><th>Edge T0 moy.</th><th>Rebal. / coût</th><th>Refus solde / L1 annulée / expositions</th></tr></thead><tbody>${extra}</tbody></table>`;
 }
 async function refresh(){let d=await fetch('/api/status').then(r=>r.json()),g=d.diag,p=d.v235_policy||{},cap=d.v235_capture||{},ql=d.quality||{},ad=d.admissions||{},sk=d.shadow_skips||{},he=d.health||{},lv=d.live||{},lf=d.live_funnel||{},la=lv.arm||{},cv=d.coverage||{},rc=cv.route_counts||{},tc=cv.tick_counts||{},pv=lv.prevalidation||{},pw=lv.private_order_stream||{};
-let pf=d.public_flow||{};let pfr=(pf.workers||[]).map(w=>`<tr><td>${w.worker_id}</td><td>${w.active?'actif':'récupération'}</td><td>${w.lag_ms??'-'}</td><td>${w.queue??0}</td><td>${Number(w.messages_per_sec||0).toFixed(0)}</td><td>${Number(w.max_callback_us||0).toFixed(0)} / ${Number(w.max_apply_us||0).toFixed(0)}</td><td>${w.recovery_reason||'-'}</td></tr>`).join('');document.getElementById('publicflow').innerHTML=`<h3>Flux publics V2.4.8</h3><p>Retard du dernier message, distinct de l'âge d'un carnet inactif. Les seuils d'entrée LIVE restent 50 / 100 / 50 ms.</p><table><thead><tr><th>WS</th><th>État</th><th>Retard ms</th><th>File</th><th>Messages/s</th><th>Réception / traitement max µs</th><th>Récupération</th></tr></thead><tbody>${pfr}</tbody></table>`;
+let pf=d.public_flow||{};let pfr=(pf.workers||[]).map(w=>`<tr><td>${w.worker_id}</td><td>${!w.active?'reconnexion':(w.catching_up?'rattrapage':'actif')}</td><td>${w.lag_ms??'-'}</td><td>${w.queue??0} / ${Number(w.queue_age_ms||0).toFixed(0)} ms</td><td>${Number(w.messages_per_sec||0).toFixed(0)}</td><td>${Number(w.max_callback_us||0).toFixed(0)} / ${Number(w.max_apply_us||0).toFixed(0)}</td><td>${w.recovery_reason||'-'}</td></tr>`).join('');document.getElementById('publicflow').innerHTML=`<h3>Flux publics V2.4.9</h3><p>Retard du dernier message, distinct de l'âge d'un carnet inactif. Rattrapage local : entrées suspendues, deltas conservés, socket maintenu. Seuils LIVE : 50 / 100 / 50 ms.</p><table><thead><tr><th>WS</th><th>État</th><th>Retard ms</th><th>File / attente</th><th>Messages/s</th><th>Réception / traitement max µs</th><th>Récupération</th></tr></thead><tbody>${pfr}</tbody></table>`;
 document.getElementById('v247').innerHTML=`<div class=tag>V2.4.7 · ADMISSION À TAILLE RÉELLE</div><h3>${lv.entry_order_policy||'-'} · ${lv.validated_routes||0} routes compatibles / ${lv.legacy_capabilities_stored||0} capacités stockées</h3><p>Le LIVE réévalue les nouvelles versions du carnet, indépendamment du premier classement replay. A/B+ LIVE est calculé à la taille abordable, cap 20 $, frais et réserve inclus. Les anciennes validations MARKET ne valident pas les ordres FOK.</p><p>Compteurs cumulés depuis ce démarrage (observations, pas trades) :</p><table>${Object.entries(lv.v247_counts||{}).sort((a,b)=>b[1]-a[1]).slice(0,12).map(([k,n])=>`<tr><td>${k}</td><td>${n}</td></tr>`).join('')}</table><p class=muted>Les Shadows restent des scénarios de carnet : absence de preuve de remplissage FOK, commissions supposées et absence de modèle de concurrence au matching. Leurs profits ne sont pas une prédiction du LIVE. Un snapshot REST sans timestamp MEXC reste exclu du LIVE jusqu'à un delta WS cohérent. Journaux et pertes historiques sont conservés.</p>`;
 document.getElementById('privatews').innerHTML=`<div class=tag>ORDRES WEBSOCKET PRIVÉ V2.4.7</div><h3 class='${pw.connected?'good':((lv.configured_mode||'shadow')==='shadow'?'':'bad')}'>Mode ${(pw.mode||'off').toUpperCase()} · ${pw.connected?'connecté':'déconnecté'}${pw.subscribed?' · abonné':''}</h3><div class=cards><div><div class=v>${pw.opens||0} / ${pw.disconnects||0}</div><div class=muted>ouvertures / chutes privées</div></div><div><div class=v>${pw.messages||0} / ${pw.order_events||0}</div><div class=muted>messages / événements ordre</div></div><div><div class=v>${pw.terminal_events||0}</div><div class=muted>événements terminaux</div></div><div><div class=v>${pw.matched_events||0} / ${pw.unmatched_events||0}</div><div class=muted>liés au bot / non liés</div></div><div><div class=v>${pw.ws_before_rest||0} / ${pw.rest_before_ws||0} / ${pw.same_ms||0}</div><div class=muted>WS avant REST / après / égal</div></div><div><div class=v>${pw.post_to_event?.p95_ms==null?'-':Number(pw.post_to_event.p95_ms).toFixed(1)+' ms'}</div><div class=muted>POST → événement privé p95</div></div><div><div class=v>${pw.ws_rest_delta?.p95_ms==null?'-':Number(pw.ws_rest_delta.p95_ms).toFixed(1)+' ms'}</div><div class=muted>delta WS − REST p95</div></div><div><div class=v>${pw.confirmations_ws||0} / ${pw.confirmations_rest||0} / ${pw.confirmations_post||0}</div><div class=muted>autorité WS / REST / POST</div></div><div><div class=v>${pw.pings||0} / ${pw.pongs||0}</div><div class=muted>PING / PONG privés</div></div><div><div class=v>${pw.listenkey_keepalive_ok||0} / ${pw.listenkey_keepalive_errors||0}</div><div class=muted>listenKey OK / erreurs</div></div><div><div class='v ${(pw.decode_errors||0)===0?'good':'bad'}'>${pw.decode_errors||0}</div><div class=muted>erreurs de décodage</div></div><div><div class=v>${pw.pending_orders||0}</div><div class=muted>ordres suivis</div></div></div><div class=muted style='margin-top:10px'>HYBRID : le premier résultat terminal correspondant exactement au clientOrderId et au symbole (WS privé ou REST) devient décisionnaire. Le contrôle REST indépendant continue après une confirmation WS afin de réconcilier et mesurer l'écart, sans retarder la jambe suivante. Une perte du WS bloque les nouvelles entrées ; le secours REST reste actif pour un ordre déjà envoyé.</div>`;
 document.getElementById('cards').innerHTML=`<div class=c><div class=v>${d.symbols}</div><div class=muted>marchés WS</div></div><div class=c><div class=v>${d.routes}</div><div class=muted>routes 2-leg</div></div><div class=c><div class=v>${d.ws}/${d.ws_expected}</div><div class=muted>WebSockets</div></div><div class=c><div class=v>${d.age_ms??'-'} ms</div><div class=muted>dernier BBO reçu</div></div><div class=c><div class=v>${d.depth_ready||0}/${d.symbols}</div><div class=muted>carnets Depth prêts</div></div><div class=c><div class=v>${d.v22?.decisions||0}</div><div class=muted>décisions replay ≥${(p.replay_min_edge_pct??0.30).toFixed(2)}%</div></div><div class=c><div class=v>${d.v22?.trace_points||0}</div><div class=muted>points trajectoire</div></div>`;
@@ -6347,7 +6483,7 @@ document.getElementById('coverage').innerHTML=`<div class=tag>AUDIT COMPLET DES 
 let modeBrief=(lv.configured_mode||'shadow').toUpperCase();let liveBlocked=lv.circuit_open||!la.effective;
 let briefCards=[[simNumber(lv.realized_pnl,4)+' $','PnL réalisé'],[simNumber(lv.completed,0),'Trades réels'],[simNumber(lv.open_exposures,0),'Expositions ouvertes'],[simNumber(lv.cap_usd,0)+' $','Cap par ordre'],[simNumber(lv.capital_limit_usd,0)+' $','Capital dédié'],[lv.api_ok?'OK':'NON','API privée']];
 document.getElementById('livebrief').innerHTML=`<p class="brief-state ${liveBlocked?'bad':'good'}"><b>${modeBrief}</b> · ${lv.circuit_open?'Circuit ouvert : '+(lv.circuit_reason||'—'):(la.reason||'État non disponible')}</p><div class=brief-grid>${briefCards.map(([v,label])=>`<div><div class=v>${v}</div><div class=muted>${label}</div></div>`).join('')}</div>`;
-let flowWorkers=(d.public_flow||{}).workers||[];let recovering=flowWorkers.filter(w=>!w.active).length;document.getElementById('publicflow-summary').textContent=`Flux publics · ${flowWorkers.length-recovering}/${flowWorkers.length} actifs · ${recovering} en récupération · décodeur ${(d.public_flow||{}).protobuf_backend||'—'}`;
+let flowWorkers=(d.public_flow||{}).workers||[];let recovering=flowWorkers.filter(w=>!w.active).length;document.getElementById('publicflow-summary').textContent=`Flux publics · ${flowWorkers.length-recovering}/${flowWorkers.length} connectés · ${flowWorkers.filter(w=>w.catching_up&&w.active).length} en rattrapage · ${recovering} en reconnexion · décodeur ${(d.public_flow||{}).protobuf_backend||'—'}`;
 let lb=Object.entries(lv.balances||{}).filter(([a])=>(lv.allowed_start_assets||[]).includes(a)).map(([a,v])=>`${a} <b>${Number(v.free||0).toFixed(4)}</b>`).join(' · '),liveok=la.effective&&!lv.circuit_open,mode=(lv.configured_mode||'shadow').toUpperCase();
 let fmtMs=x=>x?.p95_ms==null?'-':Number(x.p95_ms).toFixed(1)+' ms';
 let econ=lv.open_exposure_economic_pnl,realized=Number(lv.realized_pnl||0);

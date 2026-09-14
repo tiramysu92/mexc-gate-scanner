@@ -131,11 +131,23 @@ class FlowTests(unittest.TestCase):
         self.assertFalse(self.m._public_symbol_usable('XUSDT'))
         self.assertEqual(self.m._snapshot_freshness({'XUSDT':{'ts':1000000,'send_ts':1000000}},50,100,50),'route_public_feed_recovering')
 
-    def test_queue_residence_recovers(self):
-        self.feed.accept(packet('XUSDT',999990),1000000,time.monotonic()-0.2)
+    def test_queue_residence_pauses_then_drains_without_closing(self):
+        self.m.state['depth']['XUSDT'].update(send_ts=999780,ts=999785)
+        self.feed.accept(packet('XUSDT',999790),999800,time.monotonic()-0.2)
+        self.assertFalse(self.m._public_symbol_usable('XUSDT'))
+        self.assertTrue(self.m._public_symbol_receiving('XUSDT'))
         self.feed.consume_batch(self.feed.inbox.get_nowait())
-        self.assertEqual(self.feed.reason,'receive_queue_age')
-        self.assertEqual(self.feed.metrics['applied'],0)
+        self.assertIsNone(self.feed.reason)
+        self.assertFalse(self.feed.halt.is_set())
+        self.assertEqual(self.feed.metrics['applied'],1)
+        ob=self.m.state['depth']['XUSDT']
+        self.assertTrue(ob['ready']);self.assertEqual(ob['version'],101)
+        self.assertEqual(ob['ts'],999800);self.assertEqual(ob['send_ts'],999790)
+        self.assertIsNotNone(self.m._snapshot_freshness({'XUSDT':ob},50,100,50))
+        self.feed.accept(packet('XUSDT',999995,start=102,end=102),1000000,time.monotonic())
+        self.feed.consume_batch(self.feed.inbox.get_nowait())
+        self.assertIsNone(self.m._snapshot_freshness({'XUSDT':ob},50,100,50))
+        self.assertEqual(self.feed.epoch,1)
 
     def test_persistent_exchange_lag_recovers_but_one_spike_does_not(self):
         raw=packet('XUSDT',400000);base=time.monotonic()
@@ -203,9 +215,154 @@ class FlowTests(unittest.TestCase):
         self.feed.accept(packet('XUSDT',999990),1000000,time.monotonic()-.2)
         with self.m.depth_lock:
             worker=threading.Thread(target=self.feed.watchdog,daemon=True);worker.start()
-            self.assertTrue(self.feed.halt.wait(.5))
+            self.assertTrue(self.feed.catching_up.wait(.5))
             self.assertFalse(self.m._public_symbol_usable('XUSDT'))
+            self.assertFalse(self.feed.halt.is_set())
+        self.feed.stop()
         worker.join(.5)
+
+    def test_byte_overflow_is_bounded_and_fails_closed(self):
+        raw=packet('XUSDT',999990)
+        self.m.PUBLIC_RX_QUEUE_BYTES=len(raw)
+        self.assertTrue(self.feed.accept(raw,1000000,time.monotonic()))
+        self.assertEqual(self.feed.inbox.byte_count,len(raw))
+        self.assertFalse(self.feed.accept(raw,1000000,time.monotonic()))
+        self.assertEqual(self.feed.reason,'receive_queue_full')
+        self.assertEqual(self.feed.inbox.byte_count,len(raw))
+
+    def test_partial_catchup_preserves_deltas_and_defers_publication(self):
+        self.m.state['depth']['XUSDT'].update(send_ts=999780,ts=999785)
+        published=[];self.m._publish_depth_bbo=published.append
+        self.m.PUBLIC_BATCH_MAX=1
+        for v in (101,102):
+            self.feed.accept(packet('XUSDT',999790,start=v,end=v),999800,time.monotonic()-.2)
+        self.feed.consume_batch(self.feed.inbox.get_nowait())
+        self.assertTrue(self.feed.catching_up.is_set())
+        self.assertEqual(published,[])
+        self.assertEqual(self.m.state['depth']['XUSDT']['version'],101)
+        self.feed.consume_batch(self.feed.inbox.get_nowait())
+        self.assertEqual(self.m.state['depth']['XUSDT']['version'],102)
+        self.assertEqual(published,['XUSDT'])
+        self.assertEqual(self.feed.inbox.byte_count,0)
+        self.assertEqual(self.feed.inbox.unfinished_tasks,0)
+
+    def test_last_inflight_packet_blocks_entry_even_with_empty_queue(self):
+        self.feed.inflight_mono=time.monotonic()-.2
+        self.assertTrue(self.feed.inbox.empty())
+        self.assertFalse(self.feed.usable())
+        self.assertTrue(self.feed.catching_up.is_set())
+        self.assertFalse(self.feed.halt.is_set())
+
+    def test_stalled_consumer_still_invalidates_connection(self):
+        self.feed.inflight_mono=time.monotonic()-6
+        self.feed.last_progress_mono=time.monotonic()-6
+        self.feed.check_pressure(allow_stall=True)
+        self.assertEqual(self.feed.reason,'consumer_stalled')
+        self.assertFalse(self.m._public_symbol_receiving('XUSDT'))
+
+    def test_first_fresh_packet_after_idle_is_not_consumer_stall(self):
+        self.feed.last_progress_mono=time.monotonic()-60
+        self.feed.accept(packet('XUSDT',999990),1000000,time.monotonic())
+        self.feed.check_pressure(allow_stall=True)
+        self.assertFalse(self.feed.halt.is_set())
+        self.assertFalse(self.feed.catching_up.is_set())
+
+    def test_older_rest_snapshot_cannot_replace_an_advanced_ready_book(self):
+        self.m.state['depth']['XUSDT']['version']=105
+        self.m.requests.get=lambda *a,**kw:types.SimpleNamespace(raise_for_status=lambda:None,
+            json=lambda:{'lastUpdateId':100,'bids':[['99','1']],'asks':[['101','1']]})
+        self.assertFalse(self.m.init_depth_symbol('XUSDT'))
+        self.assertEqual(self.m.state['depth']['XUSDT']['version'],105)
+
+    def test_29_connections_survive_shared_lock_pause_and_catch_up(self):
+        m=self.m;feeds=[];threads=[]
+        for n in range(29):
+            sym=f'X{n}USDT';feed=m.PublicFeed([sym],n+1,1);feed.active=True
+            m.public_feeds[n+1]=feed;m.public_symbol_feeds[sym]=feed
+            m.state['depth'][sym]={'bids':{99.:1},'asks':{101.:1},'version':100,
+                                  'ready':True,'send_ts':999780,'ts':999785}
+            feeds.append(feed)
+            for v in range(101,165):
+                self.assertTrue(feed.accept(packet(sym,999790,start=v,end=v),999800,time.monotonic()-.2))
+        try:
+            with m.depth_lock:
+                for feed in feeds:
+                    for fn in (feed.run,feed.watchdog):
+                        thread=threading.Thread(target=fn,daemon=True);threads.append(thread);thread.start()
+                for feed in feeds:self.assertTrue(feed.catching_up.wait(1))
+                self.assertTrue(all(not feed.halt.is_set() for feed in feeds))
+            deadline=time.monotonic()+5
+            while any(f.metrics['processed']<64 for f in feeds) and time.monotonic()<deadline:
+                time.sleep(.01)
+            for feed in feeds:
+                self.assertEqual(feed.metrics['processed'],64)
+                self.assertEqual(m.state['depth'][feed.symbols[0]]['version'],164)
+                self.assertTrue(m.state['depth'][feed.symbols[0]]['ready'])
+                self.assertIsNone(feed.reason);self.assertFalse(feed.halt.is_set())
+            self.assertEqual(list(m.public_recovery_events),[])
+        finally:
+            for feed in feeds:feed.stop()
+            for thread in threads:thread.join(1)
+
+    def _fake_snapshot(self):
+        self.m.state['depth']['XUSDT']['ready']=False
+        self.m.requests.get=lambda *a,**kw:types.SimpleNamespace(raise_for_status=lambda:None,
+            json=lambda:{'lastUpdateId':100,'bids':[['99','1']],'asks':[['101','1']]})
+        x=self.m.decode_depth(packet('XUSDT',999990))
+        x['source_epoch']=1
+        self.m.apply_depth_update(x)
+
+    def test_snapshot_replay_releases_global_lock_and_catches_new_delta(self):
+        self._fake_snapshot();m=self.m;original=m._merge_depth_delta;called=[]
+        def merge(ob,x):
+            if not called:
+                called.append(True)
+                acquired=threading.Event()
+                def concurrent():
+                    with m.depth_lock:
+                        self.assertFalse(m.state['depth']['XUSDT']['ready'])
+                        acquired.set()
+                    y=m.decode_depth(packet('XUSDT',999995,start=102,end=102));y['source_epoch']=1
+                    m.apply_depth_update(y)
+                t=threading.Thread(target=concurrent);t.start()
+                self.assertTrue(acquired.wait(.5),'Snapshot replay held the global depth lock')
+                t.join(.5);self.assertFalse(t.is_alive())
+            return original(ob,x)
+        m._merge_depth_delta=merge
+        self.assertTrue(m.init_depth_symbol('XUSDT'))
+        self.assertEqual(m.state['depth']['XUSDT']['version'],102)
+        self.assertEqual(m.state['depth']['XUSDT']['send_ts'],999995)
+
+    def test_snapshot_replay_during_catchup_remains_entry_blocked(self):
+        self._fake_snapshot()
+        self.feed.note_catchup(200)
+        self.assertTrue(self.m.init_depth_symbol('XUSDT'))
+        self.assertTrue(self.m.state['depth']['XUSDT']['ready'])
+        self.assertFalse(self.m._public_symbol_usable('XUSDT'))
+        self.assertEqual(self.m._snapshot_freshness({'XUSDT':self.m.state['depth']['XUSDT']},50,100,50),
+                         'route_public_feed_recovering')
+
+    def test_snapshot_epoch_change_during_replay_cannot_overwrite_new_book(self):
+        self._fake_snapshot();m=self.m;original=m._merge_depth_delta
+        newbook={'bids':{98.:1},'asks':{102.:1},'version':500,'ready':True}
+        def merge(ob,x):
+            fresh=m.PublicFeed(['XUSDT'],1,2);fresh.active=True
+            m.public_symbol_feeds['XUSDT']=fresh
+            m.state['depth']['XUSDT']=newbook
+            return original(ob,x)
+        m._merge_depth_delta=merge
+        self.assertFalse(m.init_depth_symbol('XUSDT'))
+        self.assertIs(m.state['depth']['XUSDT'],newbook)
+
+    def test_snapshot_gap_keeps_unready_book_and_buffer(self):
+        self._fake_snapshot();m=self.m
+        x=m.decode_depth(packet('XUSDT',999995,start=103,end=103));x['source_epoch']=1
+        m.apply_depth_update(x)
+        old=m.state['depth']['XUSDT']
+        self.assertFalse(m.init_depth_symbol('XUSDT'))
+        self.assertIs(m.state['depth']['XUSDT'],old)
+        self.assertFalse(old['ready'])
+        self.assertEqual(len(m.depth_buffers['XUSDT']),2)
 
     def test_threaded_healthy_stream_progresses_without_recovery(self):
         threads=[threading.Thread(target=fn,daemon=True) for fn in (self.feed.run,self.feed.watchdog)]
