@@ -1,0 +1,129 @@
+{
+  "live_attempts_v240": [
+    {
+      "attempt_id": "synthetic_cto_attempt",
+      "decision_id": "synthetic_decision",
+      "day": "2024-01-01",
+      "created_ts_ms": 1704067200000,
+      "updated_ts_ms": 1704067200000,
+      "route_id": "USDT>CTO>USD1",
+      "path": "USDT>CTO>USD1",
+      "grade": "A",
+      "mode": "live",
+      "status": "open_exposure",
+      "requested_usd": 20,
+      "input_asset": "USDT",
+      "mid_asset": "CTO",
+      "output_asset": "USD1",
+      "input_units": 20,
+      "mid_acquired": 10000,
+      "mid_used": 0,
+      "output_units": 0,
+      "unwind_input": 0,
+      "unwind_output": 0,
+      "residual_mid": 10000,
+      "realized_pnl": 0,
+      "cash_output_usd": 0,
+      "residual_mark_usd": 0.002,
+      "residual_value_usd": 20,
+      "economic_pnl": 0,
+      "realized_cost_usd": 0,
+      "residual_cost_usd": 20,
+      "unrealized_pnl": 0,
+      "leg1_client_id": "synthetic_buy",
+      "unwind_client_id": "synthetic_exit",
+      "error": "Synthetic canceled exit"
+    }
+  ],
+  "live_open_exposures_v246": [
+    {
+      "attempt_id": "synthetic_cto_attempt",
+      "day": "2024-01-01",
+      "opened_ts_ms": 1704067200000,
+      "updated_ts_ms": 1704067200000,
+      "route_id": "USDT>CTO>USD1",
+      "symbol": "CTOUSDT",
+      "asset": "CTO",
+      "start_asset": "USDT",
+      "units": 10000,
+      "input_usd": 20,
+      "cash_output_usd": 0,
+      "residual_cost_usd": 20,
+      "last_mark_usd": 0.002,
+      "last_value_usd": 20,
+      "economic_pnl": 0,
+      "status": "open"
+    }
+  ],
+  "live_state_v240": [
+    {
+      "singleton": 1,
+      "updated_ts_ms": 1704067200000,
+      "mode": "live",
+      "api_ok": 1,
+      "balances_json": "{}",
+      "circuit_open": 1,
+      "circuit_reason": "residual_intermediate_asset",
+      "last_error": "Synthetic exposure",
+      "attempts": 1,
+      "test_validations": 0,
+      "completed": 0,
+      "wins": 0,
+      "losses": 0,
+      "realized_pnl": 0,
+      "forced_unwinds": 0,
+      "consecutive_unwinds": 0,
+      "last_attempt_id": "synthetic_cto_attempt",
+      "last_route": "USDT>CTO>USD1",
+      "last_status": "open_exposure"
+    }
+  ],
+  "live_circuit_events_v246": [
+    {
+      "event_id": 2,
+      "ts_ms": 1704067200000,
+      "day": "2024-01-01",
+      "attempt_id": "synthetic_cto_attempt",
+      "reason": "residual_intermediate_asset",
+      "error": "Synthetic exposure",
+      "active": 1
+    }
+  ],
+  "live_orders_v240": [
+    {
+      "client_order_id": "synthetic_buy",
+      "attempt_id": "synthetic_cto_attempt",
+      "leg": 1,
+      "purpose": "leg1",
+      "symbol": "CTOUSDT",
+      "side": "BUY",
+      "order_type": "FILL_OR_KILL",
+      "quantity": "10000",
+      "price": "0.002",
+      "status": "FILLED",
+      "exchange_order_id": "synthetic_exchange_buy",
+      "executed_qty": 10000,
+      "cumulative_quote_qty": 20,
+      "prepared_ts_ms": 1704067200000,
+      "submitted_ts_ms": 1704067200000,
+      "final_ts_ms": 1704067200000
+    },
+    {
+      "client_order_id": "synthetic_exit",
+      "attempt_id": "synthetic_cto_attempt",
+      "leg": 3,
+      "purpose": "unwind",
+      "symbol": "CTOUSDT",
+      "side": "SELL",
+      "order_type": "MARKET",
+      "quantity": "10000",
+      "status": "CANCELED",
+      "exchange_order_id": "synthetic_exchange_exit",
+      "executed_qty": 0,
+      "cumulative_quote_qty": 0,
+      "prepared_ts_ms": 1704067200000,
+      "submitted_ts_ms": 1704067200000,
+      "final_ts_ms": 1704067200000
+    }
+  ]
+}
