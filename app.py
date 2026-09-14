@@ -8,8 +8,9 @@ from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, render_template_string
 import websocket
+from session_live_v2412 import LiveSession, TOTALS_SQL as SESSION_TOTALS_SQL, totals as session_totals
 
-VERSION = "2.4.11-guarded-exit-recovery"
+VERSION = "2.4.12-bounded-live-session"
 # V2411: entry exit-headroom, bounded confirmed exit retry, manual-close accounting.
 # Public fair consumer and existing freshness/fee/size limits are retained.
 # Release installation keeps LIVE stopped; exchange-side cancellation is unresolved.
@@ -120,6 +121,14 @@ LIVE_ARMED = os.getenv("LIVE_ARMED", "0") == "1"
 LIVE_CAP_USD = max(0.0, float(os.getenv("LIVE_CAP_USD", "20")))
 LIVE_CAPITAL_LIMIT_USD = max(0.0, float(os.getenv("LIVE_CAPITAL_LIMIT_USD", "200")))
 LIVE_DAILY_LOSS_LIMIT_USD = max(0.0, float(os.getenv("LIVE_DAILY_LOSS_LIMIT_USD", "5")))
+# A separately authorized, finite allocation can be used after a reviewed loss.
+# The helper requires an explicit budget argument; historical PnL is untouched.
+LIVE_SESSION_REQUIRED = os.getenv("LIVE_SESSION_REQUIRED", "0") == "1"
+LIVE_SESSION_ID = os.getenv("LIVE_SESSION_ID", "")
+LIVE_EXCLUDED_ASSETS = frozenset(x.strip().upper() for x in os.getenv(
+    "LIVE_EXCLUDED_ASSETS", "").split(",") if x.strip())
+live_session_control = None
+live_session_totals = None
 LIVE_MAX_CONCURRENT = max(1, int(os.getenv("LIVE_MAX_CONCURRENT", "1")))
 LIVE_BBO_AGE_MS = max(1, int(os.getenv("LIVE_BBO_AGE_MS", "50")))
 LIVE_LEG2_BBO_AGE_MS = max(LIVE_BBO_AGE_MS, int(os.getenv("LIVE_LEG2_BBO_AGE_MS", "100")))
@@ -3206,6 +3215,7 @@ def live_open_exposure_snapshot():
 
 
 def refresh_live_daily_stats():
+    global live_session_totals
     _,_,day=local_day_bounds_ms(0)
     try:
         row=live_db_execute("""SELECT COUNT(*) attempts,
@@ -3219,6 +3229,8 @@ def refresh_live_daily_stats():
             SUM(CASE WHEN mode='live' AND status='forced_unwind' THEN 1 ELSE 0 END) forced_unwinds
             FROM live_attempts_v240 WHERE day=?""",(day,),one=True)
         exposure=live_open_exposure_snapshot()
+        if LIVE_SESSION_REQUIRED:
+            live_session_totals=session_totals(live_db_execute(SESSION_TOTALS_SQL,one=True))
         with live_lock:
             live_runtime["attempts"]=int(row["attempts"] or 0); live_runtime["test_validations"]=int(row["test_validations"] or 0)
             live_runtime["completed"]=int(row["completed"] or 0); live_runtime["wins"]=int(row["wins"] or 0)
@@ -3228,7 +3240,23 @@ def refresh_live_daily_stats():
             live_runtime["open_exposure_value_usd"]=float(exposure["value_usd"] or 0.0)
             live_runtime["open_exposure_unrealized_pnl"]=exposure["unrealized_pnl"]
             live_runtime["open_exposure_economic_pnl"]=exposure["economic_pnl"]
-    except Exception as exc: logerr(f"live daily stats: {exc}")
+    except Exception as exc:
+        live_session_totals=None
+        logerr(f"live daily stats: {exc}")
+
+
+def live_session_status():
+    if not LIVE_SESSION_REQUIRED: return {"required":False,"reason":None}
+    if live_session_control is None:
+        return {"required":True,"reason":"session_missing_or_invalid"}
+    try: return live_session_control.status(live_session_totals)
+    except Exception: return {"required":True,"reason":"session_accounting_invalid"}
+
+
+def live_loss_limit_reached(daily_pnl):
+    if LIVE_SESSION_REQUIRED:
+        return live_session_status().get("reason")=="session_loss_limit"
+    return LIVE_DAILY_LOSS_LIMIT_USD>0 and daily_pnl<=-LIVE_DAILY_LOSS_LIMIT_USD
 
 
 def live_trip(reason, error=None, attempt_id=None):
@@ -3257,6 +3285,7 @@ def live_trip(reason, error=None, attempt_id=None):
 
 def live_arm_status():
     stop=os.path.exists(LIVE_STOP_FILE); file_ok=False; file_fresh=False
+    session_reason=live_session_status().get("reason") if TRADING_MODE=="live" else None
     try:
         with open(LIVE_ARM_FILE,"r",encoding="utf-8") as f: file_ok=f.read().strip()==LIVE_ARM_PHRASE
         file_fresh=int(os.path.getmtime(LIVE_ARM_FILE)*1000)>=int(state.get("started_ms",0))-1000
@@ -3271,6 +3300,7 @@ def live_arm_status():
     if TRADING_MODE=="shadow": effective=False; reason="mode_shadow"
     elif stop: effective=False; reason="stop_file"
     elif circuit: effective=False; reason="circuit_open"
+    elif session_reason: effective=False; reason=session_reason
     elif not api_ok: effective=False; reason="api_not_ready"
     elif TRADING_MODE=="test": effective=True; reason="test_endpoint_only"
     elif LIVE_PRIVATE_WS_MODE=="hybrid" and not private_connected: effective=False; reason="private_ws_disconnected"
@@ -4090,6 +4120,8 @@ def live_sized_quality(route,x,budget):
 
 
 def _live_health_status(route):
+    if TRADING_MODE=="live" and LIVE_EXCLUDED_ASSETS.intersection(route.get("path",())):
+        return "route_asset_excluded",None,None,None,None
     if any(not _public_symbol_usable(sym) for sym in route.get("symbols",())):
         return "route_public_feed_recovering",None,None,None,None
     ts=now_ms(); exchange_ts=mexc_now_ms()
@@ -4856,8 +4888,8 @@ def process_live_candidate(q):
     gate=live_arm_status()
     if not gate["effective"]: return skipped("gate_"+gate["reason"])
     with live_lock: daily_pnl=float(live_runtime.get("realized_pnl",0.0))
-    if LIVE_DAILY_LOSS_LIMIT_USD>0 and daily_pnl<=-LIVE_DAILY_LOSS_LIMIT_USD:
-        live_trip("daily_loss_limit"); return skipped("daily_loss_limit")
+    if live_loss_limit_reached(daily_pnl):
+        live_trip("session_loss_limit" if LIVE_SESSION_REQUIRED else "daily_loss_limit"); return skipped("daily_loss_limit")
     reason,depth_age,depth_skew,exchange_age,exchange_skew=_live_health_status(q["route"])
     q["route_depth_age_ms"]=depth_age; q["route_depth_skew_ms"]=depth_skew
     q["route_exchange_age_ms"]=exchange_age; q["route_exchange_skew_ms"]=exchange_skew
@@ -4977,8 +5009,8 @@ def process_live_candidate(q):
             with live_lock:
                 daily_pnl=float(live_runtime.get("realized_pnl") or 0.0)
                 consecutive=int(live_runtime.get("consecutive_unwinds") or 0)
-            if LIVE_DAILY_LOSS_LIMIT_USD>0 and daily_pnl<=-LIVE_DAILY_LOSS_LIMIT_USD:
-                live_trip("daily_loss_limit",attempt_id=attempt_id)
+            if live_loss_limit_reached(daily_pnl):
+                live_trip("session_loss_limit" if LIVE_SESSION_REQUIRED else "daily_loss_limit",attempt_id=attempt_id)
             if consecutive>=LIVE_MAX_CONSECUTIVE_UNWINDS:
                 live_trip("consecutive_unwind_limit",attempt_id=attempt_id)
         _live_admission_upsert(q,status,requested_usd=requested,attempt_id=attempt_id,
@@ -5036,6 +5068,7 @@ def maybe_live_candidate(route,x,ts,event_start_ts):
     order is retried here; the consumed event and crypto cooldown still apply.
     """
     if TRADING_MODE=="shadow" or not x or x.get("net",-1)<SHADOW_MIN_EDGE: return False
+    if TRADING_MODE=="live" and LIVE_EXCLUDED_ASSETS.intersection(route.get("path",())): return False
     key=(route["id"],int(event_start_ts))
     versions=tuple(b.get("version") for b in x.get("leg_books",()))
     with live_lock:
@@ -5190,8 +5223,19 @@ def live_http_keepalive_worker():
 
 def initialize_live_gateway():
     global live_client,live_order_status_client,live_account_client,live_prevalidation_client,live_user_stream_client
+    global live_session_control
     initialize_live_journal()
     load_live_state()
+    if LIVE_SESSION_REQUIRED:
+        try:
+            row=live_db_execute("SELECT policy_json FROM live_rearm_sessions_v2412 WHERE session_id=?",
+                (LIVE_SESSION_ID,),one=True)
+            policy=json.loads(row['policy_json'])
+            if policy['session_id']!=LIVE_SESSION_ID: raise ValueError('session mismatch')
+            live_session_control=LiveSession(policy,now_ms=now_ms)
+        except Exception:
+            live_session_control=None
+            live_trip('session_missing_or_invalid')
     # Restore measured LIVE confirmation times without adding any request to
     # the entry path. TEST timings must never make the budget look faster.
     try:
@@ -5281,6 +5325,8 @@ def live_status():
     retry_max=LIVE_EXEC_RETRY_MAX if TRADING_MODE=="live" else LIVE_RETRY_MAX
     with live_v247_lock: v247_counts=dict(live_v247_counts)
     out.update({"configured_mode":TRADING_MODE,"arm":arm,"cap_usd":LIVE_CAP_USD,
+        "session":live_session_status(),"excluded_assets":sorted(LIVE_EXCLUDED_ASSETS),
+        "max_consecutive_unwinds":LIVE_MAX_CONSECUTIVE_UNWINDS,
         "v247_counts":v247_counts,"price_protected":LIVE_PRICE_PROTECTED,
         "entry_order_policy":"FILL_OR_KILL" if LIVE_PRICE_PROTECTED else "capability",
         "sizing_scope":"live_affordable_size","research_grades_unchanged":True,
@@ -6684,6 +6730,11 @@ document.getElementById('coverage').innerHTML=`<div class=tag>AUDIT COMPLET DES 
 let modeBrief=(lv.configured_mode||'shadow').toUpperCase();let liveBlocked=lv.circuit_open||!la.effective;
 let briefCards=[[simNumber(lv.realized_pnl,4)+' $','PnL réalisé'],[simNumber(lv.completed,0),'Trades réels'],[simNumber(lv.open_exposures,0),'Expositions ouvertes'],[simNumber(lv.cap_usd,0)+' $','Cap par ordre'],[simNumber(lv.capital_limit_usd,0)+' $','Capital dédié'],[lv.api_ok?'OK':'NON','API privée']];
 document.getElementById('livebrief').innerHTML=`<p class="brief-state ${liveBlocked?'bad':'good'}"><b>${modeBrief}</b> · ${lv.circuit_open?'Circuit ouvert : '+(lv.circuit_reason||'—'):(la.reason||'État non disponible')}</p><div class=brief-grid>${briefCards.map(([v,label])=>`<div><div class=v>${v}</div><div class=muted>${label}</div></div>`).join('')}</div>`;
+if(lv.session?.required){
+ let ss=lv.session, note=document.createElement('p');
+ note.textContent=`Session LIVE limitée · PnL net ${simNumber(ss.pnl,4)} $ · ${ss.buys??'—'}/${ss.max_buys??'—'} achats · seuil supplémentaire ${ss.additional_loss_usd??'—'} $ · fin ${ss.expires_ts_ms?new Date(ss.expires_ts_ms).toLocaleTimeString():'—'} · ${ss.reason||'ouverte'} · exclus : ${(lv.excluded_assets||[]).join(', ')}`;
+ document.getElementById('livebrief').appendChild(note);
+}
 if(Number(lv.open_exposures)>0){
  let alert=document.createElement('div');alert.className='bad';alert.style.cssText='border:2px solid #f87171;border-radius:8px;padding:12px;margin-top:10px';
  let items=(lv.open_exposure_items||[]).map(x=>`${simNumber(x.units,8)} ${x.asset}`).join(' · ');
@@ -6698,7 +6749,7 @@ let liveCards=[
  [lv.api_ok?'OK':'NON','API privée / canTrade',lv.api_ok?'good':'bad'],
  [Number(lv.cap_usd||0).toFixed(0)+' $','cap par ordre initial'],
  [Number(lv.capital_limit_usd||0).toFixed(0)+' $','capital dédié maximal'],
- [Number(lv.daily_loss_limit_usd||0).toFixed(0)+' $','coupe-circuit sur pertes réalisées'],
+ [Number(lv.daily_loss_limit_usd||0).toFixed(0)+' $',lv.session?.required?'seuil quotidien standard (session active ci-dessus)':'coupe-circuit sur pertes réalisées'],
  [lv.validated_routes||0,'routes directionnelles valides'],
  [lv.test_validations||0,'validations opportunité /order/test'],
  [lv.capability_reuses||0,'validations réutilisées'],
