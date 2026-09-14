@@ -1,0 +1,2 @@
+# Additional dependency only; retain the existing scanner requirements.
+protobuf==7.36.1

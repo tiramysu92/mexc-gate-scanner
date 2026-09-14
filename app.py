@@ -9,8 +9,10 @@ from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, render_template_string
 import websocket
 
-VERSION = "2.4.7-sized-fresh-execution"
-# Release candidate for TEST; no orders were placed during offline validation.
+VERSION = "2.4.8-bounded-public-flow"
+# V248: public reception/recovery, diagnostics and stale research-Shadow admission.
+# Private execution policy, arm phrase, journals, limits and fees are retained.
+# Offline-tested public-flow candidate. Server latency still needs validation.
 # Baseline SHA256: d4038460cdf499ac9b0b02da487680a2af37fc09e7985a13156cbc02642d2919
 # Main changes: independent version-triggered admission; affordable-size A/B+;
 # continuous Depth versions/timestamps; midpoint HTTP clock; cached sorted books;
@@ -1084,7 +1086,7 @@ def _coverage_observe(route, x, ts):
     old=row.get("max_edge")
     if old is None or net>old: row["max_edge"]=net
     research_fresh=(x.get("max_age",999999)<=SHADOW_BBO_AGE_MS and
-                    x.get("bbo_skew",999999)<=SHADOW_MAX_SKEW_MS)
+                    x.get("bbo_skew",999999)<=SHADOW_MAX_SKEW_MS and _research_exchange_reason(x) is None)
     live_fresh=(x.get("max_age",999999)<=LIVE_BBO_AGE_MS and
                 x.get("bbo_skew",999999)<=LIVE_MAX_SKEW_MS and
                 bool(x.get("exchange_ts_complete")) and
@@ -1146,7 +1148,7 @@ def route_coverage_flush_worker():
                     for sym in symbols if (ob:=state["depth"].get(sym))}
             put_db(("diagnostics_v247",(now_ms(),started_ms,json.dumps({"version":VERSION,
                 "counts":counts,"transport":transport,"books":freshness,
-                "scan_queue":scanq.qsize(),"db_queue":dbq.qsize()},sort_keys=True))))
+                "scan_queue":scanq.qsize(),"db_queue":dbq.qsize(),"public_flow":public_flow_status()},sort_keys=True))))
             _,_,today=local_day_bounds_ms(0)
             if route_coverage_day!=today:
                 with state_lock: routes=list(state.get("routes") or [])
@@ -1347,6 +1349,216 @@ def build_balanced_ws_groups(symbols):
     for g in groups: g.sort()
     return groups,loads,mode
 
+# ---------- V2.4.8 bounded public reception ----------
+# Feed recovery thresholds are NOT admission thresholds. The 50/100/50 ms
+# private gates below remain unchanged. No individual Depth delta is skipped
+# while continuing the same book: overload invalidates the whole connection.
+PUBLIC_RX_QUEUE_MAX = 256
+PUBLIC_RX_MAX_WAIT_MS = 100
+PUBLIC_LAG_RECOVERY_MS = 1000
+PUBLIC_LAG_PERSIST_MS = 200
+PUBLIC_BATCH_MAX = 32
+PUBLIC_BATCH_BUDGET_MS = 2
+public_feeds = {}
+public_symbol_feeds = {}
+public_recovery_events = deque(maxlen=200)
+public_recovery_lock = threading.Lock()
+
+
+def _public_symbol_usable(symbol):
+    feed = public_symbol_feeds.get(symbol)
+    return feed is None or (feed.active and not feed.halt.is_set())
+
+
+def _public_epoch(symbol):
+    feed = public_symbol_feeds.get(symbol)
+    return feed.epoch if feed else 0
+
+
+def _invalidate_public_books(symbols, source=None):
+    with depth_lock:
+        for sym in symbols:
+            if source is not None and public_symbol_feeds.get(sym) is not source: continue
+            ob = state['depth'].get(sym)
+            if ob is not None:
+                ob['ready'] = False
+            depth_buffers.pop(sym, None)
+        state['depth_ready'] = sum(1 for ob in state['depth'].values() if ob.get('ready'))
+        with state_lock:
+            for sym in symbols:
+                if source is not None and public_symbol_feeds.get(sym) is not source: continue
+                state['bbo'].pop(sym, None)
+
+
+def _public_depth_header(payload):
+    """Read envelope only; do not copy/decode every price in the receive thread.
+
+    Official mexcdevelop/websocket-proto: symbol=3, sendTime=6,
+    publicAggreDepths=313. Missing sendTime remains zero, never local time.
+    """
+    pos = 0; symbol = None; sent = 0; depth = False
+    while pos < len(payload):
+        key, pos = _pb_varint(payload, pos); field, wire = key >> 3, key & 7
+        if wire == 0:
+            value, pos = _pb_varint(payload, pos)
+            if field == 6: sent = value
+        elif wire == 2:
+            length, pos = _pb_varint(payload, pos); end = pos + length
+            if end > len(payload): raise ValueError('truncated public envelope')
+            if field == 3: symbol = payload[pos:end].decode('utf-8')
+            if field == 313: depth = True
+            pos = end
+        elif wire in (1, 5):
+            pos += 8 if wire == 1 else 4
+            if pos > len(payload): raise ValueError('truncated fixed field')
+        else: raise ValueError('invalid public envelope wire')
+    return (symbol, int(sent)) if depth and symbol else None
+
+
+class PublicFeed:
+    """One bounded reader/consumer pair per socket, with one source epoch.
+
+    The reader only parses the header and queues bytes. The consumer applies
+    ALL contiguous deltas, then publishes the latest book once per tiny batch.
+    Once failed, this feed cannot publish or admit a route, including while the
+    close helper is waiting for a lock. A reconnect always starts a new epoch.
+    """
+    def __init__(self, symbols, worker_id, epoch):
+        self.symbols = tuple(symbols); self.allowed = set(symbols)
+        self.worker_id = worker_id; self.epoch = epoch
+        self.inbox = queue.Queue(maxsize=PUBLIC_RX_QUEUE_MAX)
+        self.halt = threading.Event(); self.active = False
+        self.fail_lock = threading.Lock(); self.close_callback = None
+        self.bad_by_symbol = {}; self.reason = None
+        self.threads = []
+        self.metrics = {'messages': 0, 'bytes': 0, 'applied': 0, 'batches': 0,
+                        'max_queue': 0, 'lag_ms': None, 'max_lag_ms': 0,
+                        'max_queue_wait_ms': 0, 'max_decode_us': 0,
+                        'max_apply_us': 0, 'max_callback_us': 0,
+                        'lock_wait_us_max': 0}
+        self.started_mono = time.monotonic()
+
+    def fail(self, reason):
+        with self.fail_lock:
+            if self.halt.is_set(): return
+            self.reason = reason; self.active = False; self.halt.set()
+        with public_recovery_lock:
+            public_recovery_events.append({"ts_ms":now_ms(),"worker_id":self.worker_id,"epoch":self.epoch,"reason":reason,"lag_ms":self.metrics["lag_ms"],"queue":self.inbox.qsize()})
+        # Keep the socket-reader callback short. Fail-closed visibility precedes
+        # lock acquisition and actual closure, which happen in the helper.
+        def finish():
+            _invalidate_public_books(self.symbols, self)
+            if self.close_callback:
+                try: self.close_callback()
+                except Exception: pass
+        threading.Thread(target=finish, daemon=True).start()
+
+    def stop(self):
+        self.active = False; self.halt.set()
+        _invalidate_public_books(self.symbols, self)
+
+    def accept(self, payload, received_ms, received_mono):
+        if not self.active or self.halt.is_set(): return False
+        started = time.perf_counter_ns()
+        try:
+            header = _public_depth_header(payload)
+            if header is None: return False
+            symbol, sent = header
+            if symbol not in self.allowed:
+                self.fail('unexpected_symbol'); return False
+            self.metrics['messages'] += 1; self.metrics['bytes'] += len(payload)
+            # Raw transport delay, separate from age of an inactive book.
+            lag = received_ms + (mexc_now_ms() - now_ms()) - sent if sent else None
+            self.metrics['lag_ms'] = lag
+            if lag is not None:
+                self.metrics['max_lag_ms'] = max(self.metrics['max_lag_ms'], lag)
+            if lag is not None and lag > PUBLIC_LAG_RECOVERY_MS:
+                first,count=self.bad_by_symbol.get(symbol,(received_mono,0))
+                self.bad_by_symbol[symbol]=(first,count+1)
+                if count+1 >= 3 and (received_mono-first)*1000 >= PUBLIC_LAG_PERSIST_MS:
+                    self.fail('exchange_backlog'); return False
+            else:
+                self.bad_by_symbol.pop(symbol,None)
+            try:
+                self.inbox.put_nowait((payload, received_ms, received_mono, symbol, sent))
+            except queue.Full:
+                self.fail('receive_queue_full'); return False
+            self.metrics['max_queue'] = max(self.metrics['max_queue'], self.inbox.qsize())
+            return True
+        except Exception:
+            self.fail('invalid_public_packet'); return False
+        finally:
+            self.metrics['max_callback_us'] = max(self.metrics['max_callback_us'],
+                (time.perf_counter_ns()-started)/1000.0)
+
+    def consume_batch(self, first):
+        started = time.monotonic(); item = first; updated = set(); count = 0
+        try:
+            while item is not None and not self.halt.is_set():
+                payload, received, received_mono, symbol, sent = item
+                waited = (time.monotonic()-received_mono)*1000
+                self.metrics['max_queue_wait_ms'] = max(self.metrics['max_queue_wait_ms'], waited)
+                if waited > PUBLIC_RX_MAX_WAIT_MS:
+                    self.fail('receive_queue_age'); return
+                decode_start = time.perf_counter_ns()
+                x = decode_depth(payload)
+                self.metrics['max_decode_us'] = max(self.metrics['max_decode_us'],
+                    (time.perf_counter_ns()-decode_start)/1000.0)
+                if not x or x['symbol'] != symbol or x['send'] != sent:
+                    self.fail('public_header_mismatch'); return
+                x['received_ts'] = received; x['source_epoch'] = self.epoch
+                if self.halt.is_set(): return
+                apply_start = time.perf_counter_ns()
+                if apply_depth_update(x, publish=False):
+                    updated.add(symbol); self.metrics['applied'] += 1
+                self.metrics['max_apply_us'] = max(self.metrics['max_apply_us'],
+                    (time.perf_counter_ns()-apply_start)/1000.0)
+                last = ws_latency_last_sample.get(symbol, 0)
+                if sent > 0 and received-last >= WS_LATENCY_SAMPLE_MS:
+                    ws_latency_last_sample[symbol] = received
+                    offset = mexc_now_ms()-now_ms()
+                    put_db(('ws_lat_v22', (received, symbol, sent, received, max(0, received+offset-sent))))
+                count += 1
+                if count >= PUBLIC_BATCH_MAX or (time.monotonic()-started)*1000 >= PUBLIC_BATCH_BUDGET_MS:
+                    break
+                try: item = self.inbox.get_nowait()
+                except queue.Empty: item = None
+            if not self.halt.is_set():
+                for symbol in updated: _publish_depth_bbo(symbol)
+                self.metrics['batches'] += 1
+        except Exception:
+            # A decode/apply failure cannot be skipped while retaining a book.
+            self.fail('public_processing_error')
+
+    def run(self):
+        while not self.halt.is_set():
+            try: item = self.inbox.get(timeout=0.05)
+            except queue.Empty: continue
+            self.consume_batch(item)
+
+    def watchdog(self):
+        while not self.halt.wait(0.05):
+            with self.inbox.mutex:
+                oldest = self.inbox.queue[0][2] if self.inbox.queue else None
+            if oldest is not None and (time.monotonic()-oldest)*1000 > PUBLIC_RX_MAX_WAIT_MS:
+                self.fail('receive_queue_age'); return
+
+    def snapshot(self):
+        result = dict(self.metrics)
+        elapsed = max(0.001, time.monotonic()-self.started_mono)
+        result.update(worker_id=self.worker_id, epoch=self.epoch, symbols=list(self.symbols),
+                      active=self.active and not self.halt.is_set(), recovery_reason=self.reason,
+                      queue=self.inbox.qsize(), messages_per_sec=result['messages']/elapsed)
+        return result
+
+
+def public_flow_status():
+    with public_recovery_lock: recoveries=list(public_recovery_events)
+    return {'protobuf_backend':PUBLIC_PROTOBUF_BACKEND,'queue_limit': PUBLIC_RX_QUEUE_MAX, 'queue_max_wait_ms': PUBLIC_RX_MAX_WAIT_MS,
+            'recovery_lag_ms': PUBLIC_LAG_RECOVERY_MS, 'recent_recoveries':recoveries,
+            'workers': [feed.snapshot() for feed in list(public_feeds.values())]}
+
+
 # ---------- protobuf BBO ----------
 def _pb_varint(data,pos):
     value=0; shift=0
@@ -1390,7 +1602,7 @@ def _decode_level(blob):
     try: return float(vals[1]),float(vals[2])
     except Exception: return None
 
-def decode_depth(payload):
+def _decode_depth_python(payload):
     symbol=None; send=None; body=None
     for f,w,v in _pb_fields(payload):
         if f==3 and w==2: symbol=v.decode("utf-8","ignore")
@@ -1411,6 +1623,58 @@ def decode_depth(payload):
             except: pass
     return {"symbol":symbol,"send":int(send or 0),"received_ts":now_ms(),
             "asks":asks,"bids":bids,"from":fv,"to":tv}
+
+
+FAST_DEPTH_MESSAGE = None
+PUBLIC_PROTOBUF_BACKEND = "not_initialized"
+
+
+def _initialize_depth_codec():
+    """Native protobuf parser, using the official public schema field numbers.
+
+    No change to private order decoding. Refuse a slow pure-Python protobuf
+    backend rather than silently returning to the original hot-path cost.
+    """
+    global FAST_DEPTH_MESSAGE,PUBLIC_PROTOBUF_BACKEND
+    try:
+        from google.protobuf import descriptor_pb2,descriptor_pool,message_factory
+        from google.protobuf.internal import api_implementation
+    except ImportError as exc:
+        raise RuntimeError("V248 requires protobuf: python3 -m pip install 'protobuf==7.36.1'") from exc
+    backend=api_implementation.Type()
+    if backend not in ("upb","cpp"):
+        raise RuntimeError("V248 requires native protobuf backend (upb/cpp); pure Python backend refused")
+    fd=descriptor_pb2.FileDescriptorProto(name="mexc_public_v248.proto",package="mexc248",syntax="proto3")
+    def message(name):
+        item=fd.message_type.add();item.name=name;return item
+    def field(msg,name,num,kind,repeated=False,target=None):
+        f=msg.field.add();f.name=name;f.number=num;f.type=kind
+        f.label=3 if repeated else 1
+        if target:f.type_name=".mexc248."+target
+    item=message("Level");field(item,"price",1,9);field(item,"quantity",2,9)
+    depth=message("Depth")
+    field(depth,"asks",1,11,True,"Level");field(depth,"bids",2,11,True,"Level")
+    field(depth,"fromVersion",4,9);field(depth,"toVersion",5,9)
+    wrapper=message("Envelope")
+    field(wrapper,"channel",1,9);field(wrapper,"symbol",3,9);field(wrapper,"sendTime",6,3)
+    field(wrapper,"depth",313,11,False,"Depth")
+    pool=descriptor_pool.DescriptorPool();pool.Add(fd)
+    FAST_DEPTH_MESSAGE=message_factory.GetMessageClass(pool.FindMessageTypeByName("mexc248.Envelope"))
+    PUBLIC_PROTOBUF_BACKEND=backend
+
+
+def decode_depth(payload):
+    if FAST_DEPTH_MESSAGE is None:
+        # Offline reference/tests only: production bootstrap initializes native
+        # decoding before starting any socket or private gateway.
+        return _decode_depth_python(payload)
+    envelope=FAST_DEPTH_MESSAGE();envelope.ParseFromString(payload)
+    if not envelope.symbol or not envelope.HasField("depth"):return None
+    body=envelope.depth
+    return {"symbol":envelope.symbol,"send":int(envelope.sendTime),"received_ts":now_ms(),
+            "asks":[(float(z.price),float(z.quantity)) for z in body.asks],
+            "bids":[(float(z.price),float(z.quantity)) for z in body.bids],
+            "from":int(body.fromVersion),"to":int(body.toVersion)}
 
 
 _PRIVATE_ORDER_STATUS = {
@@ -1492,22 +1756,39 @@ def _valid_depth_delta(x):
             for side in ("bids","asks") for p,q in x.get(side,())))
 
 
+def _book_top(ob):
+    cached=ob.get("_best")
+    if cached is None:
+        cached=(max(ob["bids"],default=None),min(ob["asks"],default=None))
+        ob["_best"]=cached
+    return cached
+
+
 def _merge_depth_delta(ob,x):
+    bp,ap=_book_top(ob)
     for side in ("asks","bids"):
+        book=ob[side]
         for price,qty in x[side]:
-            if qty==0: ob[side].pop(price,None)
-            else: ob[side][price]=qty
+            if qty==0: book.pop(price,None)
+            else:
+                book[price]=qty
+                if side=="bids" and (bp is None or price>bp): bp=price
+                if side=="asks" and (ap is None or price<ap): ap=price
+    # Full scan is needed only when the previous best level was removed.
+    if bp not in ob["bids"]: bp=max(ob["bids"],default=None)
+    if ap not in ob["asks"]: ap=min(ob["asks"],default=None)
+    ob["_best"]=(bp,ap)
     ob.update(version=x["to"],send_ts=int(x.get("send") or 0),
               ts=int(x.get("received_ts") or now_ms()))
     ob.pop("_rows",None)
-    return bool(ob["bids"] and ob["asks"] and max(ob["bids"])<min(ob["asks"]))
+    return bp is not None and ap is not None and bp<ap
 
 
 def _publish_depth_bbo(sym, send_ts=None):
     with depth_lock:
         ob=state["depth"].get(sym)
-        if not ob or not ob.get("ready") or not ob["bids"] or not ob["asks"]: return
-        bp=max(ob["bids"]); ap=min(ob["asks"]); bq=ob["bids"][bp]; aq=ob["asks"][ap]
+        if not _public_symbol_usable(sym) or not ob or not ob.get("ready") or not ob["bids"] or not ob["asks"]: return
+        bp,ap=_book_top(ob); bq=ob["bids"][bp]; aq=ob["asks"][ap]
         if bp>=ap: return
         ts=int(ob.get("ts") or 0); send_ts=int(ob.get("send_ts") or 0)
         with state_lock:
@@ -1537,11 +1818,16 @@ def queue_depth_resync(sym, reason="gap"):
     return True
 
 
-def apply_depth_update(x):
+def apply_depth_update(x, publish=True):
     sym=x["symbol"]
     x.setdefault("received_ts",now_ms())
     need_resync=False
+    lock_started=time.perf_counter_ns()
     with depth_lock:
+        feed=public_symbol_feeds.get(sym)
+        if feed:
+            feed.metrics["lock_wait_us_max"]=max(feed.metrics["lock_wait_us_max"],(time.perf_counter_ns()-lock_started)/1000.0)
+        if not _public_symbol_usable(sym) or x.get("source_epoch",_public_epoch(sym))!=_public_epoch(sym): return False
         ob=state["depth"].get(sym)
         if not ob or not ob.get("ready"):
             depth_buffers[sym].append(x)
@@ -1563,12 +1849,15 @@ def apply_depth_update(x):
     if need_resync:
         queue_depth_resync(sym,"version_or_book_invalid")
         return False
-    _publish_depth_bbo(sym,x["send"]); return True
+    if publish: _publish_depth_bbo(sym,x["send"])
+    return True
 
 
 def init_depth_symbol(sym):
     """Build one coherent local book. Return True only if snapshot + buffered deltas reconcile."""
     try:
+        source_epoch=_public_epoch(sym)
+        if not _public_symbol_usable(sym): return False
         r=requests.get(REST+"/api/v3/depth",params={"symbol":sym,"limit":100},timeout=8); r.raise_for_status(); j=r.json()
         bids={float(a):float(b) for a,b in j.get("bids",[]) if float(b)>0}; asks={float(a):float(b) for a,b in j.get("asks",[]) if float(b)>0}
         ver=int(j.get("lastUpdateId",0)); received=now_ms(); ready=True
@@ -1577,6 +1866,7 @@ def init_depth_symbol(sym):
                     for book in (bids,asks) for p,q in book.items())):
             return False
         with depth_lock:
+            if not _public_symbol_usable(sym) or source_epoch!=_public_epoch(sym): return False
             # REST snapshot has a version, but no certified exchange emission
             # timestamp. It becomes LIVE-eligible only after a contiguous WS delta.
             ob={"bids":bids,"asks":asks,"version":ver,"ready":True,"ts":received,
@@ -1897,6 +2187,7 @@ def route_calc(route,books,meta, age_limit_ms=None, allow_small_capacity=False):
     symbols=route["symbols"]
     if len(symbols)!=len(route["path"])-1: return None
     for i,sym in enumerate(symbols):
+        if not _public_symbol_usable(sym): return None
         b=books.get(sym); m=meta.get(sym)
         if not b or not m: return None
         raw_send_ts=b.get("send_ts")
@@ -3499,7 +3790,8 @@ def _v247_count(reason):
 
 def _snapshot_freshness(books, local_limit, exchange_limit, skew_limit=None):
     local_now=now_ms(); exchange_now=mexc_now_ms(); sends=[]; receives=[]
-    for book in books.values():
+    for symbol,book in books.items():
+        if not _public_symbol_usable(symbol): return "route_public_feed_recovering"
         received=int(book.get("book_ts",book.get("ts",0)) or 0)
         sent=int(book.get("send_ts") or 0)
         if not sent: return "route_exchange_timestamp_missing"
@@ -3586,6 +3878,8 @@ def live_sized_quality(route,x,budget):
 
 
 def _live_health_status(route):
+    if any(not _public_symbol_usable(sym) for sym in route.get("symbols",())):
+        return "route_public_feed_recovering",None,None,None,None
     ts=now_ms(); exchange_ts=mexc_now_ms()
     with state_lock:
         if LIVE_REQUIRE_ALL_WS and state.get("ws_connected")!=state.get("ws_expected"): return "websocket_count",None,None,None,None
@@ -5254,6 +5548,13 @@ def record_active_trace(route,ts,x):
         if keep: active_traces[route["id"]]=keep
         else: active_traces.pop(route["id"],None)
 
+def _research_exchange_reason(x):
+    if not x.get("exchange_ts_complete"): return "exchange_timestamp_missing"
+    if x.get("exchange_max_age",999999)>LIVE_EXCHANGE_AGE_MS: return "exchange_depth_stale"
+    if x.get("exchange_skew",999999)>LIVE_MAX_EXCHANGE_SKEW_MS: return "exchange_depth_skew"
+    return None
+
+
 def schedule_decision(route,x,ts,event_start_ts):
     rid=route["id"]
     event_key=(rid,int(event_start_ts))
@@ -5305,6 +5606,10 @@ def schedule_decision(route,x,ts,event_start_ts):
     if _policy_reason=="base_eligible":
         quality=depth_quality_decision(route,x)
         _policy_reason=quality["reason"]
+    temporal_reason=_research_exchange_reason(x)
+    if quality.get("eligible") and temporal_reason:
+        quality=dict(quality,eligible=False,reason=temporal_reason)
+        _policy_reason=temporal_reason
     if quality_due:
         _coverage_mark_quality(rid,quality)
     # Private gateway gets the same A/B+ signal but performs a fresh, stricter
@@ -5579,11 +5884,16 @@ def scan_worker():
 
 # ---------- WS ----------
 def ws_worker(symbols,worker_id,group_volume_24h=0.0):
-    retry_delay=2.0
+    retry_delay=2.0; source_epoch=0
     while True:
+        source_epoch+=1
+        feed=PublicFeed(symbols,worker_id,source_epoch)
+        public_feeds[worker_id]=feed
+        for sym in symbols: public_symbol_feeds[sym]=feed
+        _invalidate_public_books(symbols,feed)
         opened=False; health_last_publish=0; connection_stop=threading.Event(); connection_started=time.monotonic()
         try:
-            def application_ping_loop(ws):
+            def application_ping_loop(ws, connection_stop=connection_stop):
                 with state_lock: expected=max(1,state.get("ws_expected",1))
                 # Spread all application PINGs over one interval instead of
                 # creating a synchronized burst on every socket.
@@ -5618,6 +5928,10 @@ def ws_worker(symbols,worker_id,group_volume_24h=0.0):
                         return
             def on_open(ws):
                 nonlocal opened; opened=True
+                feed.active=True; feed.close_callback=ws.close
+                for target in (feed.run,feed.watchdog):
+                    thread=threading.Thread(target=target,daemon=True); feed.threads.append(thread); thread.start()
+                for sym in symbols: queue_depth_resync(sym,"public_connection_epoch")
                 ts=now_ms()
                 with state_lock:
                     state["ws_connected"]+=1
@@ -5637,6 +5951,8 @@ def ws_worker(symbols,worker_id,group_volume_24h=0.0):
                 print(f"[Routes V{VERSION}] WS {worker_id}: {len(symbols)} symbols load24h={group_volume_24h:,.0f}")
             def on_message(ws,msg):
                 nonlocal health_last_publish
+                callback_started=time.perf_counter_ns()
+                received=now_ms(); received_mono=time.monotonic()
                 if isinstance(msg,str):
                     try:
                         j=json.loads(msg)
@@ -5649,21 +5965,13 @@ def ws_worker(symbols,worker_id,group_volume_24h=0.0):
                                     h["last_pong_ms"]=ts; h["pongs"]=int(h.get("pongs",0))+1
                     except Exception: pass
                     return
-                try:
-                    x=decode_depth(msg)
-                    if not x: return
-                    ts=now_ms()
-                    if ts-health_last_publish>=1000:
-                        health_last_publish=ts
+                if feed.accept(msg,received,received_mono):
+                    if received-health_last_publish>=1000:
+                        health_last_publish=received
                         with state_lock:
                             h=state["ws_workers"].get(worker_id)
-                            if h is not None: h["last_message_ms"]=ts
-                    last_lat=ws_latency_last_sample.get(x["symbol"],0)
-                    if x.get("send",0)>0 and ts-last_lat>=WS_LATENCY_SAMPLE_MS:
-                        ws_latency_last_sample[x["symbol"]]=ts
-                        put_db(("ws_lat_v22",(ts,x["symbol"],x["send"],ts,max(0,mexc_now_ms()-x["send"]))))
-                    apply_depth_update(x)
-                except Exception as e: logerr(f"decode WS {worker_id}: {e}")
+                            if h is not None: h["last_message_ms"]=received
+                feed.metrics["max_callback_us"]=max(feed.metrics["max_callback_us"],(time.perf_counter_ns()-callback_started)/1000.0)
             def on_error(ws,e):
                 with state_lock:
                     h=state["ws_workers"].get(worker_id)
@@ -5671,7 +5979,7 @@ def ws_worker(symbols,worker_id,group_volume_24h=0.0):
                 logerr(f"WS {worker_id}: {e}")
             def on_close(ws,code,msg):
                 nonlocal opened
-                connection_stop.set()
+                connection_stop.set(); feed.stop()
                 if opened:
                     with state_lock:
                         closed_ts=now_ms()
@@ -5688,7 +5996,8 @@ def ws_worker(symbols,worker_id,group_volume_24h=0.0):
             w.run_forever(ping_interval=0)
         except Exception as e: logerr(f"WS loop {worker_id}: {e}")
         finally:
-            connection_stop.set()
+            connection_stop.set(); feed.stop()
+            for thread in feed.threads: thread.join(timeout=0.5)
             # websocket-client normally invokes on_close. Keep the counters exact
             # even if run_forever exits through an exception before that callback.
             if opened:
@@ -5702,7 +6011,7 @@ def ws_worker(symbols,worker_id,group_volume_24h=0.0):
                         h["closed_ms"]=closed_ts; h["last_close_code"]="run_forever_exit"
                 opened=False
         lived=time.monotonic()-connection_started
-        retry_delay=2.0 if lived>=120 else min(30.0,max(2.0,retry_delay*1.5))
+        retry_delay=2.0 if lived>=120 and not feed.reason else min(30.0,max(2.0,retry_delay*1.5))
         time.sleep(retry_delay+random.uniform(0.0,1.5))
 
 # ---------- Dashboard ----------
@@ -5977,7 +6286,7 @@ def api_status():
                  "trace_window_ms":TRACE_WINDOW_MS,"decision_max_recv_age_ms":DECISION_MAX_RECV_AGE_MS,"decision_max_skew_ms":DECISION_MAX_SKEW_MS,"primary_max_skew_ms":PRIMARY_MAX_SKEW_MS,"paper_rearm_neutral_ms":PAPER_REARM_NEUTRAL_MS,"paper_hard_cooldown_ms":PAPER_HARD_COOLDOWN_MS,
                  "recent_decisions":cached.get("recent_decisions",[]),"shadows":cached.get("shadows",{}),"quality":cached.get("quality",{}),
                  "admissions":cached.get("admissions",{}),"shadow_skips":cached.get("shadow_skips",{}),"health":runtime_health(now),
-                 "live":live_status(),"live_funnel":cached.get("live_funnel",{}),
+                 "live":live_status(),"live_funnel":cached.get("live_funnel",{}),"public_flow":public_flow_status(),
                  "coverage":route_coverage_status(),
                  "shadow_profiles":{k:{"leg1_ms":v[0],"leg2_ms":v[1]} for k,v in SHADOW_PROFILES.items()},
                  "v235_policy":{"edge_min_pct":SHADOW_MIN_EDGE*100,"target_weights":SHADOW_TARGET_WEIGHTS,
@@ -5994,28 +6303,51 @@ def api_status():
                  "v235_capture":cached.get("v235_capture",{})})
     return jsonify(base)
 
-HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MEXC 2-Leg V2.4.7</title>
-<style>body{background:#090d14;color:#e8edf5;font-family:system-ui;margin:0;padding:16px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.c,.panel{background:#111827;border:1px solid #273248;border-radius:10px;padding:12px}.v{font-weight:800;font-size:20px}.big{font-size:28px}.muted{color:#9aa7bd;font-size:12px}.good{color:#22d38a}.bad{color:#ff6677}.panel{margin-top:12px;overflow:auto}.latency{display:grid;grid-template-columns:repeat(3,minmax(250px,1fr));gap:10px}.latbox{background:#0c1421;border:1px solid #2a3850;border-radius:10px;padding:12px}.balance{margin-top:8px;line-height:1.7}.metricgrid{display:grid;grid-template-columns:repeat(2,minmax(95px,1fr));gap:7px;margin-top:10px}.metric{background:#111b2b;border-radius:8px;padding:8px}.tag{display:inline-block;border:1px solid #334155;border-radius:999px;padding:3px 7px;font-size:11px;color:#bac6d8}table{border-collapse:collapse;width:100%;font-size:12px}th,td{padding:8px;border-bottom:1px solid #263044;text-align:right}th:first-child,td:first-child{text-align:left}@media(max-width:900px){.latency{grid-template-columns:1fr}}</style></head><body>
-<h2>MEXC — Scanner + micro-bot Spot 2-leg V2.4.7</h2><div class=cards id=cards></div>
-<div class=panel id=health></div>
-<div class=panel id=coverage></div>
-<div class=panel id=v247></div>
-<div class=panel id=live></div>
-<div class=panel id=privatews></div>
-<div class=panel id=livefunnel></div>
-<div class=panel id=botlatencies></div>
-<div class=panel id=latencies></div>
-<div class=panel id=policy></div>
-<div class=panel id=quality></div>
-<div class=panel><h3>Décisions récentes — Depth Quality à T0</h3><table><thead><tr><th>Heure</th><th>Route</th><th>Edge T0</th><th>Classe</th><th>Taille retenue</th><th>Edge −50% BBO</th><th>Edge sans L1</th><th>Réserve L1–L3</th><th>Calcul</th></tr></thead><tbody id=recent></tbody></table></div>
+HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MEXC 2-Leg V2.4.8</title>
+<style>body{background:#090d14;color:#e8edf5;font-family:system-ui;margin:0;padding:16px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.c,.panel{background:#111827;border:1px solid #273248;border-radius:10px;padding:12px}.v{font-weight:800;font-size:20px}.big{font-size:28px}.muted{color:#9aa7bd;font-size:12px}.good{color:#22d38a}.bad{color:#ff6677}.panel{margin-top:12px;overflow:auto}.latency{display:grid;grid-template-columns:repeat(3,minmax(250px,1fr));gap:10px}.latbox{background:#0c1421;border:1px solid #2a3850;border-radius:10px;padding:12px}.balance{margin-top:8px;line-height:1.7}.metricgrid{display:grid;grid-template-columns:repeat(2,minmax(95px,1fr));gap:7px;margin-top:10px}.metric{background:#111b2b;border-radius:8px;padding:8px}.tag{display:inline-block;border:1px solid #334155;border-radius:999px;padding:3px 7px;font-size:11px;color:#bac6d8}table{border-collapse:collapse;width:100%;font-size:12px}th,td{padding:8px;border-bottom:1px solid #263044;text-align:right}th:first-child,td:first-child{text-align:left}@media(max-width:900px){.latency{grid-template-columns:1fr}}
+h2{font-size:22px;margin:4px 0 12px}h3{font-size:15px;margin:8px 0}.panel{padding:10px}.sim-panels{display:grid;grid-template-columns:1fr 1fr;gap:12px}.sim-panel{min-width:0}.sim-panel table{font-variant-numeric:tabular-nums}.sim-panel th,.sim-panel td{padding:6px 5px;white-space:nowrap}.sim-panel .pnl{font-weight:700}.sim-description{margin:4px 0 8px}.sim-detail{margin-top:8px;border-top:1px solid #273248;padding-top:7px}.sim-detail summary{font-size:12px;color:#bac6d8}.sim-scroll{overflow:auto}.sim-caption{font-size:11px;color:#9aa7bd;margin:6px 0 0}summary{cursor:pointer;font-weight:600;line-height:1.6}summary:focus-visible{outline:2px solid #79b8ff;outline-offset:3px}details[open]>summary{margin-bottom:8px}.brief-grid{display:grid;grid-template-columns:repeat(6,minmax(90px,1fr));gap:10px}.brief-grid .v{font-size:18px}.brief-state{margin:0 0 8px}.sim-detail td{white-space:normal;min-width:65px}.sim-detail td.balances{min-width:150px}@media(max-width:1050px){.sim-panels{grid-template-columns:1fr}.brief-grid{grid-template-columns:repeat(3,minmax(90px,1fr))}}@media(max-width:600px){body{padding:10px}.cards{gap:6px;grid-template-columns:repeat(3,minmax(0,1fr))}.cards .v{font-size:16px}h2{font-size:18px}.sim-panel table{font-size:11px}.sim-panel th,.sim-panel td{padding:6px 3px}.sim-nav{display:none}.brief-grid{gap:7px}.brief-grid .v{font-size:16px}.panel{padding:9px}}
+</style></head><body>
+<h2>MEXC — Scanner + micro-bot Spot 2-leg V2.4.8</h2><div class=cards id=cards></div>
+<div class=panel id=livebrief></div>
+<div class=sim-panels><div class="panel sim-panel" id=latencies></div><div class="panel sim-panel" id=botlatencies></div></div>
+<details class=panel id=publicflow-fold><summary id=publicflow-summary>Flux publics</summary><div id=publicflow></div></details>
+<details class=panel><summary>Exécution LIVE — métriques et paramètres</summary><div id=live></div></details>
+<details class=panel><summary>Santé du serveur et des connexions</summary><div id=health></div></details>
+<details class=panel><summary>Couverture des routes</summary><div id=coverage></div></details>
+<details class=panel><summary>Règles d'admission à taille réelle</summary><div id=v247></div></details>
+<details class=panel><summary>Confirmation des ordres — WebSocket privé</summary><div id=privatews></div></details>
+<details class=panel><summary>Admissions et motifs de refus BOT</summary><div id=livefunnel></div></details>
+<details class=panel><summary>Politique de simulation</summary><div id=policy></div></details>
+<details class=panel><summary>Qualité des signaux — compteurs détaillés</summary><div id=quality></div></details>
+<div class=panel><h3>Décisions récentes — qualité économique à T0</h3><p>La classe A/B+ décrit la profondeur. Une donnée MEXC périmée reste enregistrée mais est refusée pour une nouvelle admission Shadow ou LIVE.</p><table><thead><tr><th>Heure</th><th>Route</th><th>Edge T0</th><th>Classe</th><th>Taille retenue</th><th>Edge −50% BBO</th><th>Edge sans L1</th><th>Réserve L1–L3</th><th>Calcul</th></tr></thead><tbody id=recent></tbody></table></div>
 <div class=panel id=capture></div><div class=panel id=diag></div>
 <script>
+function simNumber(v,n=2){return v==null||!Number.isFinite(Number(v))?'—':Number(v).toFixed(n)}
+function simLabel(n){return n.replace('BOT_','').replaceAll('_',' / ')}
+function renderSimPanel(id,names,sh,title,description){
+ let host=document.getElementById(id);
+ if(!host.querySelector('.sim-main'))host.innerHTML='<h3 class="sim-title"></h3><p class="muted sim-description"></p><div class="sim-scroll sim-main"></div><details class="sim-detail"><summary>Soldes, coûts et détails</summary><div class="sim-scroll sim-extra"></div></details><p class="sim-caption">Simulation uniquement · aucun total entre profils indépendants.</p>';
+ host.querySelector('.sim-title').textContent=title;host.querySelector('.sim-description').textContent=description;
+ host.querySelector('.sim-caption').textContent='Simulation · profils indépendants · L1 et L2 mesurées '+(names[0].startsWith('BOT_')?'depuis l’admission fraîche.':'depuis T0.');
+ let rows='',extra='';
+ for(let n of names){let x=sh[n];if(!x)continue;let pnl=simNumber(x.profit),pc=x.profit==null?'muted':(Number(x.profit)>=0?'good':'bad');
+ rows+=`<tr><td>${simLabel(n)}</td><td>${simNumber(x.leg1_ms,0)} / ${simNumber(x.leg2_ms,0)}</td><td class="pnl ${pc}">${Number(x.profit)>0?'+':''}${pnl} $</td><td>${simNumber(x.trades,0)}</td><td>${simNumber(x.wins,0)} / ${simNumber(x.losses,0)}</td><td class=sim-nav>${simNumber(x.nav)} $</td></tr>`;
+ let balances=Object.entries(x.balances||{}).map(([a,v])=>`${a} ${simNumber(v)}`).join(' · ');
+ extra+=`<tr><td>${simLabel(n)}</td><td class=balances>${balances||'—'}</td><td>${simNumber(x.nav)} $</td><td>${x.avg_edge==null?'—':simNumber(100*x.avg_edge,3)+'%'}</td><td>${simNumber(x.rebalances,0)} / ${simNumber(x.rebalance_cost,3)} $</td><td>${simNumber(x.skipped_balance,0)} / ${simNumber(x.skipped_flash,0)} / ${simNumber(x.open_exposures,0)}</td></tr>`;}
+ host.querySelector('.sim-main').innerHTML=`<table><thead><tr><th>Profil</th><th>L1 / L2 ms</th><th>PnL</th><th>Trades</th><th>Gagnés / perdus</th><th class=sim-nav>NAV</th></tr></thead><tbody>${rows||'<tr><td colspan=6>En attente de données</td></tr>'}</tbody></table>`;
+ host.querySelector('.sim-extra').innerHTML=`<table><thead><tr><th>Profil</th><th>Soldes</th><th>NAV</th><th>Edge T0 moy.</th><th>Rebal. / coût</th><th>Refus solde / L1 annulée / expositions</th></tr></thead><tbody>${extra}</tbody></table>`;
+}
 async function refresh(){let d=await fetch('/api/status').then(r=>r.json()),g=d.diag,p=d.v235_policy||{},cap=d.v235_capture||{},ql=d.quality||{},ad=d.admissions||{},sk=d.shadow_skips||{},he=d.health||{},lv=d.live||{},lf=d.live_funnel||{},la=lv.arm||{},cv=d.coverage||{},rc=cv.route_counts||{},tc=cv.tick_counts||{},pv=lv.prevalidation||{},pw=lv.private_order_stream||{};
+let pf=d.public_flow||{};let pfr=(pf.workers||[]).map(w=>`<tr><td>${w.worker_id}</td><td>${w.active?'actif':'récupération'}</td><td>${w.lag_ms??'-'}</td><td>${w.queue??0}</td><td>${Number(w.messages_per_sec||0).toFixed(0)}</td><td>${Number(w.max_callback_us||0).toFixed(0)} / ${Number(w.max_apply_us||0).toFixed(0)}</td><td>${w.recovery_reason||'-'}</td></tr>`).join('');document.getElementById('publicflow').innerHTML=`<h3>Flux publics V2.4.8</h3><p>Retard du dernier message, distinct de l'âge d'un carnet inactif. Les seuils d'entrée LIVE restent 50 / 100 / 50 ms.</p><table><thead><tr><th>WS</th><th>État</th><th>Retard ms</th><th>File</th><th>Messages/s</th><th>Réception / traitement max µs</th><th>Récupération</th></tr></thead><tbody>${pfr}</tbody></table>`;
 document.getElementById('v247').innerHTML=`<div class=tag>V2.4.7 · ADMISSION À TAILLE RÉELLE</div><h3>${lv.entry_order_policy||'-'} · ${lv.validated_routes||0} routes compatibles / ${lv.legacy_capabilities_stored||0} capacités stockées</h3><p>Le LIVE réévalue les nouvelles versions du carnet, indépendamment du premier classement replay. A/B+ LIVE est calculé à la taille abordable, cap 20 $, frais et réserve inclus. Les anciennes validations MARKET ne valident pas les ordres FOK.</p><p>Compteurs cumulés depuis ce démarrage (observations, pas trades) :</p><table>${Object.entries(lv.v247_counts||{}).sort((a,b)=>b[1]-a[1]).slice(0,12).map(([k,n])=>`<tr><td>${k}</td><td>${n}</td></tr>`).join('')}</table><p class=muted>Les Shadows restent des scénarios de carnet : absence de preuve de remplissage FOK, commissions supposées et absence de modèle de concurrence au matching. Leurs profits ne sont pas une prédiction du LIVE. Un snapshot REST sans timestamp MEXC reste exclu du LIVE jusqu'à un delta WS cohérent. Journaux et pertes historiques sont conservés.</p>`;
 document.getElementById('privatews').innerHTML=`<div class=tag>ORDRES WEBSOCKET PRIVÉ V2.4.7</div><h3 class='${pw.connected?'good':((lv.configured_mode||'shadow')==='shadow'?'':'bad')}'>Mode ${(pw.mode||'off').toUpperCase()} · ${pw.connected?'connecté':'déconnecté'}${pw.subscribed?' · abonné':''}</h3><div class=cards><div><div class=v>${pw.opens||0} / ${pw.disconnects||0}</div><div class=muted>ouvertures / chutes privées</div></div><div><div class=v>${pw.messages||0} / ${pw.order_events||0}</div><div class=muted>messages / événements ordre</div></div><div><div class=v>${pw.terminal_events||0}</div><div class=muted>événements terminaux</div></div><div><div class=v>${pw.matched_events||0} / ${pw.unmatched_events||0}</div><div class=muted>liés au bot / non liés</div></div><div><div class=v>${pw.ws_before_rest||0} / ${pw.rest_before_ws||0} / ${pw.same_ms||0}</div><div class=muted>WS avant REST / après / égal</div></div><div><div class=v>${pw.post_to_event?.p95_ms==null?'-':Number(pw.post_to_event.p95_ms).toFixed(1)+' ms'}</div><div class=muted>POST → événement privé p95</div></div><div><div class=v>${pw.ws_rest_delta?.p95_ms==null?'-':Number(pw.ws_rest_delta.p95_ms).toFixed(1)+' ms'}</div><div class=muted>delta WS − REST p95</div></div><div><div class=v>${pw.confirmations_ws||0} / ${pw.confirmations_rest||0} / ${pw.confirmations_post||0}</div><div class=muted>autorité WS / REST / POST</div></div><div><div class=v>${pw.pings||0} / ${pw.pongs||0}</div><div class=muted>PING / PONG privés</div></div><div><div class=v>${pw.listenkey_keepalive_ok||0} / ${pw.listenkey_keepalive_errors||0}</div><div class=muted>listenKey OK / erreurs</div></div><div><div class='v ${(pw.decode_errors||0)===0?'good':'bad'}'>${pw.decode_errors||0}</div><div class=muted>erreurs de décodage</div></div><div><div class=v>${pw.pending_orders||0}</div><div class=muted>ordres suivis</div></div></div><div class=muted style='margin-top:10px'>HYBRID : le premier résultat terminal correspondant exactement au clientOrderId et au symbole (WS privé ou REST) devient décisionnaire. Le contrôle REST indépendant continue après une confirmation WS afin de réconcilier et mesurer l'écart, sans retarder la jambe suivante. Une perte du WS bloque les nouvelles entrées ; le secours REST reste actif pour un ordre déjà envoyé.</div>`;
 document.getElementById('cards').innerHTML=`<div class=c><div class=v>${d.symbols}</div><div class=muted>marchés WS</div></div><div class=c><div class=v>${d.routes}</div><div class=muted>routes 2-leg</div></div><div class=c><div class=v>${d.ws}/${d.ws_expected}</div><div class=muted>WebSockets</div></div><div class=c><div class=v>${d.age_ms??'-'} ms</div><div class=muted>dernier BBO reçu</div></div><div class=c><div class=v>${d.depth_ready||0}/${d.symbols}</div><div class=muted>carnets Depth prêts</div></div><div class=c><div class=v>${d.v22?.decisions||0}</div><div class=muted>décisions replay ≥${(p.replay_min_edge_pct??0.30).toFixed(2)}%</div></div><div class=c><div class=v>${d.v22?.trace_points||0}</div><div class=muted>points trajectoire</div></div>`;
 let wsok=(he.ws_connected===he.ws_expected)&&(he.stale_workers||0)===0&&(he.workers_without_pong||0)===0&&(d.depth_ready===d.symbols)&&(he.resync_pending||0)===0;document.getElementById('health').innerHTML=`<div class=tag>SANTÉ TEMPS RÉEL</div><h3 class='${wsok?'good':'bad'}'>WebSockets ${he.ws_connected||0}/${he.ws_expected||0} · ${he.stale_workers||0} silencieux &gt;30 s</h3><div class=cards><div><div class=v>${he.ws_disconnects||0}</div><div class=muted>chutes WS</div></div><div><div class=v>${he.ws_reconnects||0}</div><div class=muted>reconnexions WS</div></div><div><div class=v>${he.ws_app_pings||0} / ${he.ws_app_pongs||0}</div><div class=muted>PING / PONG MEXC</div></div><div><div class=v>${he.max_pong_age_ms==null?'-':he.max_pong_age_ms+' ms'}</div><div class=muted>âge maximal PONG</div></div><div><div class=v>${he.workers_without_pong||0} / ${he.ws_ping_errors||0}</div><div class=muted>PONG en retard / erreurs ping</div></div><div><div class=v>${he.max_worker_message_age_ms==null?'-':he.max_worker_message_age_ms+' ms'}</div><div class=muted>silence maximal worker WS</div></div><div><div class=v>${he.depth_book_age_p95_ms==null?'-':he.depth_book_age_p95_ms+' ms'}</div><div class=muted>âge Depth p95</div></div><div><div class=v>${he.depth_book_age_max_ms==null?'-':he.depth_book_age_max_ms+' ms'}</div><div class=muted>âge Depth maximum prêt</div></div><div><div class=v>${he.depth_gap_events||0}</div><div class=muted>gaps Depth hors bootstrap</div></div><div><div class=v>${he.depth_resync_failures||0}</div><div class=muted>échecs resync</div></div><div><div class=v>${he.resync_queue||0}/${he.resync_pending||0}</div><div class=muted>file/pending resync</div></div><div><div class=v>${he.scan_queue||0}/${he.scan_queue_capacity||0}</div><div class=muted>file scan</div></div><div><div class=v>${he.scan_queue_drops||0}</div><div class=muted>abandons file scan</div></div><div><div class=v>${he.scan_coalesced||0}</div><div class=muted>updates fusionnées</div></div><div><div class=v>${he.db_queue||0}/${he.db_queue_capacity||0}</div><div class=muted>file DB</div></div><div><div class=v>${he.db_queue_drops||0}</div><div class=muted>abandons DB</div></div><div><div class=v>${((he.db_size_bytes||0)/1048576).toFixed(0)} / ${((he.db_wal_size_bytes||0)/1048576).toFixed(0)} MB</div><div class=muted>base / WAL</div></div><div><div class=v>${he.research_pending||0} / ${he.depth_capture_pending||0}</div><div class=muted>matrice live / captures pending</div></div><div><div class='v ${(he.shadow_overdue||0)===0?'good':'bad'}'>${he.shadow_pending||0} / ${he.shadow_overdue||0}</div><div class=muted>pending Shadow / en retard</div></div><div><div class=v>${he.shadow_execution_lag?.p95_ms==null?'-':he.shadow_execution_lag.p95_ms+' ms'}</div><div class=muted>retard worker Shadow p95</div></div><div><div class=v>${he.dashboard_cache_age_ms==null?'-':Math.round(he.dashboard_cache_age_ms/1000)+' s'}</div><div class=muted>âge statistiques page</div></div><div><div class=v>${he.dashboard_refresh_ms==null?'-':he.dashboard_refresh_ms+' ms'}</div><div class=muted>durée calcul statistiques</div></div></div>`;
 document.getElementById('coverage').innerHTML=`<div class=tag>AUDIT COMPLET DES ${cv.total_routes||d.routes} ROUTES</div><h3>Couverture reçue → qualité → exécution BOT</h3><div class=cards><div><div class=v>${rc.evaluations||0}/${cv.total_routes||0}</div><div class=muted>routes évaluées aujourd'hui</div></div><div><div class=v>${rc.calculable||0}</div><div class=muted>routes avec deux carnets calculables</div></div><div><div class=v>${rc.research_fresh||0}</div><div class=muted>routes Depth frais ≤${d.primary_age_ms||150} ms</div></div><div><div class=v>${rc.live_fresh||0}</div><div class=muted>routes fraîches passerelle ≤${lv.bbo_age_ms||50} ms</div></div><div><div class=v>${rc.edge_ge_030||0}</div><div class=muted>routes ayant atteint 0,30%</div></div><div><div class=v>${rc.edge_ge_035||0}</div><div class=muted>routes ayant atteint 0,35%</div></div><div><div class=v good>${rc.quality_eligible||0}</div><div class=muted>routes classées A/B+</div></div><div><div class=v>${cv.validated_now||0}</div><div class=muted>routes /order/test valides</div></div><div><div class=v good>${rc.bot_admitted||0}</div><div class=muted>routes arrivées en Shadow BOT</div></div></div><div class=muted style='margin-top:10px'>Observations agrégées : ≥0,30% ${tc.edge_ge_030||0} · ≥0,35% ${tc.edge_ge_035||0} · A/B+ ${tc.quality_eligible||0} (A ${tc.quality_a||0} · B+ ${tc.quality_bplus||0}). Écriture fixe : ${cv.storage_rows_per_day||0} lignes/jour, mise à jour toutes les ${cv.flush_sec||60} s — aucune ligne par tick.</div>`;
+let modeBrief=(lv.configured_mode||'shadow').toUpperCase();let liveBlocked=lv.circuit_open||!la.effective;
+let briefCards=[[simNumber(lv.realized_pnl,4)+' $','PnL réalisé'],[simNumber(lv.completed,0),'Trades réels'],[simNumber(lv.open_exposures,0),'Expositions ouvertes'],[simNumber(lv.cap_usd,0)+' $','Cap par ordre'],[simNumber(lv.capital_limit_usd,0)+' $','Capital dédié'],[lv.api_ok?'OK':'NON','API privée']];
+document.getElementById('livebrief').innerHTML=`<p class="brief-state ${liveBlocked?'bad':'good'}"><b>${modeBrief}</b> · ${lv.circuit_open?'Circuit ouvert : '+(lv.circuit_reason||'—'):(la.reason||'État non disponible')}</p><div class=brief-grid>${briefCards.map(([v,label])=>`<div><div class=v>${v}</div><div class=muted>${label}</div></div>`).join('')}</div>`;
+let flowWorkers=(d.public_flow||{}).workers||[];let recovering=flowWorkers.filter(w=>!w.active).length;document.getElementById('publicflow-summary').textContent=`Flux publics · ${flowWorkers.length-recovering}/${flowWorkers.length} actifs · ${recovering} en récupération · décodeur ${(d.public_flow||{}).protobuf_backend||'—'}`;
 let lb=Object.entries(lv.balances||{}).filter(([a])=>(lv.allowed_start_assets||[]).includes(a)).map(([a,v])=>`${a} <b>${Number(v.free||0).toFixed(4)}</b>`).join(' · '),liveok=la.effective&&!lv.circuit_open,mode=(lv.configured_mode||'shadow').toUpperCase();
 let fmtMs=x=>x?.p95_ms==null?'-':Number(x.p95_ms).toFixed(1)+' ms';
 let econ=lv.open_exposure_economic_pnl,realized=Number(lv.realized_pnl||0);
@@ -6060,11 +6392,9 @@ document.getElementById('live').innerHTML=`<div class=tag>PASSERELLE PRIVÉE V2.
 document.getElementById('live').insertAdjacentHTML('beforeend',`<div class=cards style='margin-top:10px'><div><div class=v>${lv.leg1_http_queue?.p95_ms==null?'-':Number(lv.leg1_http_queue.p95_ms).toFixed(1)+' ms'}</div><div class=muted>attente verrou HTTP jambe 1 p95</div></div><div><div class=v>${lv.leg2_http_queue?.p95_ms==null?'-':Number(lv.leg2_http_queue.p95_ms).toFixed(1)+' ms'}</div><div class=muted>attente verrou HTTP jambe 2 p95</div></div><div><div class=v>${Number(lv.http_keepalive_timeout_sec||0).toFixed(2)} s</div><div class=muted>timeout keep-alive HTTP</div></div></div>`);
 document.getElementById('live').insertAdjacentHTML('beforeend',`<div class=cards style='margin-top:10px'><div><div class=v>${pv.running?'ACTIVE':'OFF'}</div><div class=muted>prévalidation de fond TEST</div></div><div><div class=v>${pv.checked||0}/${cv.total_routes||0}</div><div class=muted>progression cycle courant</div></div><div><div class=v good>${pv.validated||0}</div><div class=muted>routes prévalidées depuis démarrage</div></div><div><div class=v>${pv.skipped_depth||0}/${pv.skipped_size||0}</div><div class=muted>reportées Depth / taille</div></div><div><div class='v ${(pv.errors||0)===0?'good':'bad'}'>${pv.errors||0}</div><div class=muted>erreurs de prévalidation</div></div></div><div class=muted style='margin-top:8px'>Session HTTP dédiée, une route toutes les ${Number(lv.prevalidation_interval_sec||0).toFixed(0)} s ; suspendue automatiquement en LIVE. Le carnet éventuellement ancien sert uniquement à construire la requête syntaxique /order/test : aucune admission BOT ne contourne la fraîcheur stricte de ${lv.bbo_age_ms||50} ms. Dernier état : ${pv.last_route||'-'} · ${pv.last_status||'-'}${pv.last_error?' · '+pv.last_error:''}.</div>`);
 let fc={};for(let r of (lf.rows||[])){let k=r.disposition+(r.reason?': '+r.reason:'');fc[k]=(fc[k]||0)+r.n}let fr=(lf.recent||[]).map(x=>`<tr><td>${new Date(x.decision_ts_ms).toLocaleTimeString()}</td><td>${x.route_id}</td><td>${x.grade} → ${x.fresh_grade||'-'}</td><td>${Number(x.selected_usd||0).toFixed(2)} $ → ${x.fresh_selected_usd==null?'-':Number(x.fresh_selected_usd).toFixed(2)+' $'}</td><td>${x.requested_usd==null?'-':Number(x.requested_usd).toFixed(2)+' $'}</td><td>${x.disposition}</td><td>${x.reason||'-'}</td><td>${x.retry_count||0}</td><td>${x.first_check_delay_ms==null?'-':x.first_check_delay_ms+' ms'} / ${x.gateway_delay_ms==null?'-':x.gateway_delay_ms+' ms'}</td><td>${x.route_depth_age_ms==null?'-':x.route_depth_age_ms+' ms'} / ${x.route_depth_skew_ms==null?'-':x.route_depth_skew_ms+' ms'}</td></tr>`).join('');document.getElementById('livefunnel').innerHTML=`<div class=tag>ENTONNOIR BOT V2.4.7</div><h3>Classe initiale → classe fraîche réellement admise</h3><div class=cards><div><div class=v>${lv.validated_routes||0}</div><div class=muted>routes directionnelles valides</div></div><div><div class=v>${lv.bot_shadow_admissions||0}</div><div class=muted>signaux simulation BOT admis</div></div><div><div class=v>${he.ws_disconnects_5m||0} / ${he.ws_disconnects_15m||0} / ${he.ws_disconnects_60m||0}</div><div class=muted>chutes WS sur 5 / 15 / 60 min</div></div><div><div class=v>${lv.last_t0_to_leg1_submit_ms==null?'-':lv.last_t0_to_leg1_submit_ms+' ms'}</div><div class=muted>T0 → POST jambe 1</div></div><div><div class=v>${lv.last_leg1_done_to_leg2_submit_ms==null?'-':lv.last_leg1_done_to_leg2_submit_ms+' ms'}</div><div class=muted>confirmation jambe 1 → POST jambe 2</div></div><div><div class=v>${lv.last_t0_to_done_ms==null?'-':lv.last_t0_to_done_ms+' ms'}</div><div class=muted>T0 → route terminée</div></div></div><div class=muted style='margin-top:10px'>Mode TEST : jusqu'à ${lv.test_retry_max||0} relances / ${lv.test_retry_window_ms||0} ms pour découvrir une route. Mode LIVE : au plus ${lv.live_retry_max||0} relances / ${lv.live_retry_window_ms||0} ms, abandon avant tout POST si T0 dépasse ${lv.max_t0_to_leg1_post_ms||0} ms. Les capacités sont prévalidées en arrière-plan en TEST puis réutilisées pendant ${Number(lv.test_max_age_hours||0).toFixed(0)} h. Cooldown ${Number(lv.hard_cooldown_ms||0)/1000||5} s par crypto intermédiaire ; une autre crypto reste libre. Les six Shadows BOT sont planifiés hors du chemin critique.</div><table><thead><tr><th>Heure</th><th>Route</th><th>Classe T0 → fraîche</th><th>Taille T0 → fraîche</th><th>Demande bot</th><th>Disposition</th><th>Raison</th><th>Retries</th><th>1er contrôle / admission</th><th>Âge / skew Depth</th></tr></thead><tbody>${fr}</tbody></table>`;
-let sh=d.shadows||{},bf=sh.BOT_FAST||{},bn=['BOT_FAST','BOT_TARGET','BOT_DEGRADED','BOT_100_200','BOT_150_300','BOT_200_400'],bh=`<div class=tag>SIMULATION CONFIG BOT — CAP ${Number(lv.cap_usd||10).toFixed(0)} $</div><h3>6 profils de latence — ${(bf.capital||0).toFixed(0)} $ indépendants, routes validées uniquement</h3><div class=latency>`;for(let n of bn){let x=sh[n];if(!x)continue;let label=n.replace('BOT_','').split('_').join(' / '),bal=Object.entries(x.balances||{}).map(([a,v])=>`${a} <b>${v.toFixed(2)}</b>`).join(' · ');bh+=`<div class=latbox><div class=muted>${label} · Leg1 +${x.leg1_ms} ms · Leg2 +${x.leg2_ms} ms depuis l'admission</div><div class='v big ${x.profit>=0?'good':'bad'}'>${x.profit>=0?'+':''}${x.profit.toFixed(2)} $</div><div class=muted>NAV ${x.nav.toFixed(2)} $</div><div class=metricgrid><div class=metric><div class=v>${x.trades}</div><div class=muted>trades</div></div><div class=metric><div class=v>${x.wins} / ${x.losses}</div><div class=muted>gagnés / perdus</div></div></div><div class='balance muted'>Balance : ${bal}<br>cap ${Number(lv.cap_usd||10).toFixed(0)} $ · aucun rebalance · refus balance ${x.skipped_balance} · jambe 1 annulée ${x.skipped_flash}</div></div>`}bh+=`</div><div class=muted style='margin-top:10px'>Chaque délai virtuel est ajouté après l'admission fraîche du gateway. Les Shadows n'ajoutent aucune attente au bot : leur réservation et leur exécution sont hors du chemin critique. Ils utilisent le même capital ${Number(lv.capital_limit_usd||200).toFixed(0)} $, le même cap, la fraîcheur ${lv.bbo_age_ms||50} ms, le contrôle après jambe 1 et uniquement des routes dont jambe 1 / jambe 2 / unwind ont été acceptées par MEXC.</div>`;document.getElementById('botlatencies').innerHTML=bh;
-if(lv.bot_shadow_rebalancing){document.getElementById('botlatencies').innerHTML=document.getElementById('botlatencies').innerHTML.replaceAll('aucun rebalance','rebalance 30 min / 4 h actif')}
-document.querySelectorAll('#botlatencies .latbox').forEach((box,i)=>{let x=sh[bn[i]];if(x)box.insertAdjacentHTML('beforeend',`<div class=muted style='margin-top:5px'>Rééquilibrages ${x.rebalances||0} · coût ${Number(x.rebalance_cost||0).toFixed(3)} $</div>`)});
-let first=sh.FAST||{},h=`<div class=tag>LATENCE D'EXÉCUTION — RECHERCHE</div><h3>FAST / TARGET / DEGRADED — ${(first.capital||0).toFixed(0)} $ indépendants chacun</h3><div class=latency>`;
-for(let n of ['FAST','TARGET','DEGRADED']){let x=sh[n];if(!x)continue;let bal=Object.entries(x.balances||{}).map(([a,v])=>`${a} <b>${v.toFixed(2)}</b>`).join(' · ');h+=`<div class=latbox><div class=muted>${n} · Leg1 +${x.leg1_ms} ms · Leg2 +${x.leg2_ms} ms</div><div class='v big ${x.profit>=0?'good':'bad'}'>${x.profit>=0?'+':''}${x.profit.toFixed(2)} $</div><div class=muted>NAV ${x.nav.toFixed(2)} $</div><div class=metricgrid><div class=metric><div class=v>${x.trades}</div><div class=muted>trades</div></div><div class=metric><div class=v>${x.wins} / ${x.losses}</div><div class=muted>gagnés / perdus</div></div><div class=metric><div class=v>${x.avg_edge==null?'-':(100*x.avg_edge).toFixed(3)+'%'}</div><div class=muted>edge T0 moyen</div></div><div class=metric><div class=v>${x.rebalances}</div><div class=muted>rebalances</div></div></div><div class='balance muted'>Balance : ${bal}<br>Coût rebalance ${x.rebalance_cost.toFixed(3)} $ · refus balance ${x.skipped_balance} · jambe 1 annulée ${x.skipped_flash} · expositions ${x.open_exposures}</div></div>`}h+=`</div><div class=muted style='margin-top:10px'>Même signal et mêmes carnets MEXC réels. Seuls les délais virtuels diffèrent. Cette section reste 100% simulée.</div>`;document.getElementById('latencies').innerHTML=h;
+let sh=d.shadows||{};
+renderSimPanel('latencies',['FAST','TARGET','DEGRADED'],sh,'Shadows de recherche',`3 profils · capital ${simNumber(sh.FAST?.capital??1000,0)} $ par profil · cap ${simNumber(p.absolute_cap_usd||350,0)} $`);
+renderSimPanel('botlatencies',['BOT_FAST','BOT_TARGET','BOT_DEGRADED','BOT_100_200','BOT_150_300','BOT_200_400'],sh,'Simulations de latence BOT',`6 profils · capital ${simNumber(sh.BOT_FAST?.capital??lv.capital_limit_usd??200,0)} $ par profil · cap ${simNumber(lv.cap_usd||20,0)} $ · rebal. ${lv.bot_shadow_rebalancing?'30 min / 4 h':'désactivé'}`);
 let tw=Object.entries(p.target_weights||{}).map(([a,v])=>`${a} ${(100*v).toFixed(0)}%`).join(' · ');document.getElementById('policy').innerHTML=`<div class=tag>POLITIQUE V2.4</div><h3>Depth Quality adaptatif — cap Shadow ${(p.absolute_cap_usd||0).toFixed(0)} $</h3><div class=cards><div><div class=v>${(p.edge_min_pct??0).toFixed(2)}%</div><div class=muted>edge initial minimum</div></div><div><div class=v>A · ${(p.a_fraction_pct??0).toFixed(0)}%</div><div class=muted>capacité si suppression L1 ≥ edge min</div></div><div><div class=v>B+ · ${(p.b_fraction_pct??0).toFixed(0)}%</div><div class=muted>capacité si −50% BBO ≥ ${(p.bplus_half_edge_pct??0).toFixed(2)}%</div></div><div><div class=v>×${(p.coverage3_min??0).toFixed(0)}</div><div class=muted>réserve minimum niveaux 1–3</div></div><div><div class=v>${tw}</div><div class=muted>allocation cible Shadow</div></div><div><div class=v>${p.rebalance_check_min??'-'} min / ${p.rebalance_max_h??'-'} h</div><div class=muted>contrôle / rebalance Shadow</div></div><div><div class=v>${(p.replay_min_edge_pct??0).toFixed(2)}%</div><div class=muted>plancher dataset replay</div></div><div><div class=v>${p.online_research_trials?'ON':'OFF'}</div><div class=muted>matrice 66 essais en ligne</div></div></div><div class=muted style='margin-top:10px'>A : 50% de la capacité robuste. B+ : 33%, edge après −50% BBO ≥0,75%, edge sans niveau 1 ≥−2%, réserve L1–L3 ≥×3. B−, C et D sont refusés. Le Shadow est plafonné à ${(p.absolute_cap_usd||0).toFixed(0)} $ ; la passerelle privée reste plafonnée séparément.</div>`;
 document.getElementById('policy').insertAdjacentHTML('beforeend',`<div class=muted style='margin-top:8px'>Après confirmation de la jambe 1 : haircut appliqué une seule fois à ${Number(p.fee_safety_pct||0).toFixed(2)}%, puis jambe 2 autorisée si l'edge conservateur reste ≥${Number(p.leg2_min_edge_pct||0).toFixed(2)}%. Rééquilibrage 30 min / 4 h actif dans les Shadows BOT ; rééquilibrage réel toujours désactivé.</div>`);
 let qa=0,qb=0,qsmall=0,qbm=0,qcd=0;for(let r of (ql.rows||[])){if(r.grade==='A'&&r.eligible===1)qa+=r.n;if(r.grade==='B+'&&r.eligible===1)qb+=r.n;if((r.grade==='A'||r.grade==='B+')&&r.reason==='below_min_trade')qsmall+=r.n;if(r.grade==='B-')qbm+=r.n;if(r.grade==='C'||r.grade==='D')qcd+=r.n}let ac={},aprofiles=0;for(let r of (ad.rows||[])){ac[r.disposition]=(ac[r.disposition]||0)+r.n;aprofiles+=r.profiles_reserved||0}let sr={};for(let r of (sk.rows||[]))sr[r.reason]=(sr[r.reason]||0)+r.n;let aexec=(ac.executed_all_profiles||0)+(ac.executed_partial_profiles||0),finished=['FAST','TARGET','DEGRADED'].reduce((n,k)=>n+((sh[k]||{}).trades||0),0),ablock=(ac.blocked_same_event||0)+(ac.blocked_not_rearmed||0)+(ac.blocked_cooldown||0),perf=ql.compute||{},cf=ql.coverage_counterfactual||{};document.getElementById('quality').innerHTML=`<div class=tag>QUALITÉ DEPTH AUJOURD'HUI</div><h3>A / B+ admis — entonnoir d'exécution explicite</h3><div class=cards><div><div class=v good>${qa}</div><div class=muted>A admissibles</div></div><div><div class=v good>${qb}</div><div class=muted>B+ admissibles</div></div><div><div class=v>${qsmall}</div><div class=muted>A/B+ sous 10 $</div></div><div><div class=v good>${aexec}</div><div class=muted>signaux réservés</div></div><div><div class=v>${aprofiles}</div><div class=muted>exécutions profil réservées</div></div><div><div class=v>${finished}</div><div class=muted>exécutions profil terminées</div></div><div><div class='v ${(he.shadow_overdue||0)===0?'good':'bad'}'>${he.shadow_pending||0} / ${he.shadow_overdue||0}</div><div class=muted>Shadow pending / en retard</div></div><div><div class=v>${sr.depth_stale||0} / ${sr.depth_not_ready||0}</div><div class=muted>annulées Depth ancien / absent</div></div><div><div class=v>${sr.no_liquidity||0} / ${sr.below_min_fill||0}</div><div class=muted>annulées sans liquidité / sous 10 $</div></div><div><div class=v>${ablock}</div><div class=muted>bloqués event/réarmement/cooldown</div></div><div><div class=v>${ac.blocked_no_profile_balance||0}</div><div class=muted>bloqués balance</div></div><div><div class=v>${qbm}</div><div class=muted>B− refusés</div></div><div><div class=v>${qcd}</div><div class=muted>C / D refusés</div></div><div><div class=v>${cf.x1??0} / ${cf.x3??0}</div><div class=muted>B+ potentiels si couverture ×1 / ×3</div></div><div><div class=v>${ql.max_selected_usd==null?'-':ql.max_selected_usd.toFixed(2)+' $'}</div><div class=muted>taille Depth max admise</div></div><div><div class=v>${perf.p95_us==null?'-':perf.p95_us.toFixed(1)+' µs'}</div><div class=muted>temps calcul qualité p95</div></div></div>`;
@@ -6080,6 +6410,7 @@ def index(): return render_template_string(HTML)
 
 
 def bootstrap():
+    _initialize_depth_codec()
     threading.Thread(target=db_writer,daemon=True).start()
     if not db_ready.wait(10): raise RuntimeError("SQLite schema initialization timeout")
     load_paper_state(); load_shadow_state()

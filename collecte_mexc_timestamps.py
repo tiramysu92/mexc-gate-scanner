@@ -116,8 +116,13 @@ def main():
     ap.add_argument('--since', default='2026-09-14T01:10:00+02:00')
     ap.add_argument('--until', default='2026-09-14T01:45:00+02:00')
     ap.add_argument('--limit', type=int, default=12000)
+    ap.add_argument('--recent-minutes',type=int,help='Collecter les N dernières minutes au lieu de la fenêtre fixe.')
     ap.add_argument('--out', help='Nouvelle archive ZIP ; un fichier existant ne sera pas écrasé.')
     args = ap.parse_args()
+    if args.recent_minutes is not None:
+        if args.recent_minutes<1 or args.recent_minutes>60:ap.error('--recent-minutes doit être compris entre 1 et 60')
+        now=dt.datetime.now(dt.timezone.utc)
+        args.until=now.isoformat();args.since=(now-dt.timedelta(minutes=args.recent_minutes)).isoformat()
     start, end = epoch(args.since), epoch(args.until)
     if start > end or args.limit < 1:
         ap.error('Fenêtre ou limite invalide')
@@ -150,6 +155,7 @@ def main():
                 status = json.loads(payload)
             report['current_status'] = {k: status.get(k) for k in
                 ('version', 'ws', 'ws_expected', 'age_ms', 'depth_ready', 'scan_updates', 'fee_pct')}
+            report['current_status']['public_flow'] = status.get('public_flow')
             report['current_status']['live'] = {k: status.get('live', {}).get(k) for k in LIVE_KEYS}
             report['current_status']['health'] = {k: status.get('health', {}).get(k) for k in HEALTH_KEYS}
         except Exception as exc:
