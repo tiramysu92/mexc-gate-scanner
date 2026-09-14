@@ -9,10 +9,10 @@ from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, render_template_string
 import websocket
 
-VERSION = "2.4.10-fair-public-dispatch"
-# V2410: one fair public consumer; native batch decode off lock; private policy retained.
-# Private execution policy, arm phrase, journals, limits and fees are retained.
-# Offline-tested public-flow candidate. Server latency still needs validation.
+VERSION = "2.4.11-guarded-exit-recovery"
+# V2411: entry exit-headroom, bounded confirmed exit retry, manual-close accounting.
+# Public fair consumer and existing freshness/fee/size limits are retained.
+# Release installation keeps LIVE stopped; exchange-side cancellation is unresolved.
 # Baseline SHA256: d4038460cdf499ac9b0b02da487680a2af37fc09e7985a13156cbc02642d2919
 # Main changes: independent version-triggered admission; affordable-size A/B+;
 # continuous Depth versions/timestamps; midpoint HTTP clock; cached sorted books;
@@ -211,6 +211,14 @@ LIVE_FUTURE_TOLERANCE_MS = 25
 LIVE_RECHECK_INTERVAL_MS = 10
 LIVE_SIZE_SEARCH_STEPS = 6
 LIVE_PREVALIDATE_ERROR_BACKOFF_MS = 900000
+
+# V2411: a recent exit book needs headroom for a real first-leg confirmation.
+# 75 ms floor covers the observed CTO 69 ms; 10 ms reserves post-confirm work.
+# These are estimates, not guarantees; the existing L2 freshness guards remain.
+LIVE_EXIT_CONFIRM_FLOOR_MS = 75
+LIVE_EXIT_PREP_MARGIN_MS = 10
+LIVE_UNWIND_MAX_ATTEMPTS = 2
+LIVE_UNWIND_RETRY_WINDOW_MS = 1500
 
 # Coverage accounting is updated in RAM on the scan path and persisted as only
 # 800 aggregate rows at this cadence. It never writes one row per market tick.
@@ -3202,10 +3210,10 @@ def refresh_live_daily_stats():
     try:
         row=live_db_execute("""SELECT COUNT(*) attempts,
             SUM(CASE WHEN status='test_validated' THEN 1 ELSE 0 END) test_validations,
-            SUM(CASE WHEN mode='live' AND status IN ('completed','forced_unwind') AND realized_pnl IS NOT NULL THEN 1 ELSE 0 END) completed,
-            SUM(CASE WHEN mode='live' AND status IN ('completed','forced_unwind') AND realized_pnl>0 THEN 1 ELSE 0 END) wins,
-            SUM(CASE WHEN mode='live' AND status IN ('completed','forced_unwind') AND realized_pnl<0 THEN 1 ELSE 0 END) losses,
-            COALESCE(SUM(CASE WHEN mode='live' AND (status IN ('completed','forced_unwind')
+            SUM(CASE WHEN mode='live' AND status IN ('completed','forced_unwind','manual_closed') AND realized_pnl IS NOT NULL THEN 1 ELSE 0 END) completed,
+            SUM(CASE WHEN mode='live' AND status IN ('completed','forced_unwind','manual_closed') AND realized_pnl>0 THEN 1 ELSE 0 END) wins,
+            SUM(CASE WHEN mode='live' AND status IN ('completed','forced_unwind','manual_closed') AND realized_pnl<0 THEN 1 ELSE 0 END) losses,
+            COALESCE(SUM(CASE WHEN mode='live' AND (status IN ('completed','forced_unwind','manual_closed')
                 OR (status='open_exposure' AND residual_cost_usd IS NOT NULL))
                 THEN realized_pnl ELSE 0 END),0) pnl,
             SUM(CASE WHEN mode='live' AND status='forced_unwind' THEN 1 ELSE 0 END) forced_unwinds
@@ -4378,6 +4386,29 @@ def live_prevalidation_worker():
         time.sleep(30.0 if api_calls else 10.0)
 
 
+def _exit_confirmation_budget_ms():
+    samples=sorted(float(x) for x in list(live_leg1_confirm_ms)[-200:]
+        if x is not None and math.isfinite(float(x)) and float(x)>0)
+    observed=samples[min(len(samples)-1,math.ceil(.95*len(samples))-1)] if samples else 0
+    return max(LIVE_EXIT_CONFIRM_FLOOR_MS,observed)+LIVE_EXIT_PREP_MARGIN_MS
+
+
+def _entry_exit_headroom(route):
+    sym=route['symbols'][1]
+    with depth_lock: ob=dict(state['depth'].get(sym) or {})
+    reason=_snapshot_freshness({sym:ob},LIVE_BBO_AGE_MS,LIVE_EXCHANGE_AGE_MS)
+    if not ob.get('ready'): reason='route_depth_not_ready'
+    if reason: raise MexcSignalExpired(reason)
+    budget=_exit_confirmation_budget_ms()
+    age=max(0,now_ms()-int(ob.get('ts') or 0))
+    exchange_age=max(0,mexc_now_ms()-int(ob.get('send_ts') or 0))
+    if age+budget>LIVE_LEG2_BBO_AGE_MS:
+        raise MexcSignalExpired(f'exit_local_headroom: {age}+{budget:g} ms > {LIVE_LEG2_BBO_AGE_MS} ms')
+    if exchange_age+budget>LIVE_LEG2_EXCHANGE_AGE_MS:
+        raise MexcSignalExpired(f'exit_exchange_headroom: {exchange_age}+{budget:g} ms > {LIVE_LEG2_EXCHANGE_AGE_MS} ms')
+    return {'local_age_ms':age,'exchange_age_ms':exchange_age,'budget_ms':budget}
+
+
 def _entry_price_guard(route,spec,t0,requested_usd):
     if now_ms()-t0>LIVE_MAX_T0_TO_LEG1_POST_MS:
         raise MexcSignalExpired("signal_too_old_before_post")
@@ -4385,6 +4416,7 @@ def _entry_price_guard(route,spec,t0,requested_usd):
     if not arm["effective"]: raise MexcSignalExpired("gate_"+arm["reason"])
     reason,*_= _live_health_status(route)
     if reason: raise MexcSignalExpired(reason)
+    _entry_exit_headroom(route)
     with state_lock: meta=state["market_meta"]; books=dict(state["bbo"])
     if spec["order_type"]=="FILL_OR_KILL":
         # At the frozen entry price, including quantity/price rounding, the
@@ -4417,6 +4449,102 @@ def _leg2_post_guard(route,spec,fill_ts,input_usd):
         with state_lock: books=dict(state["bbo"]); meta=state["market_meta"]
         edge=float(spec["quantity"])*float(spec["price"])*(1-FEE)*stable_mark_usdt(route["path"][2],books,meta)/max(input_usd,1e-12)-1
         if edge<LIVE_LEG2_MIN_EDGE: raise MexcSignalExpired("rounded_leg2_price_edge")
+
+
+def _unwind_retry_inventory(result,spec,remaining,baseline_units,asset):
+    """A second SELL requires an independent, identical terminal REST result.
+
+    Never interpret a timeout, a WS/REST mismatch or an unavailable balance as
+    permission to sell again. The pre-trade inventory is reserved for its owner.
+    """
+    try:
+        order=(live_order_status_client or live_client).order(spec['symbol'],spec['client_order_id'])
+    except Exception as exc:
+        raise MexcOrderUncertain('Unwind: confirmation REST indisponible avant seconde sortie') from exc
+    before=result['order']
+    if (not _private_ws_order_is_authoritative(spec,order) or
+        'executedQty' not in order or not any(k in order for k in ('cummulativeQuoteQty','cumulativeQuoteQty')) or
+        str(order.get('orderId'))!=str(before.get('orderId')) or
+        str(order.get('side','')).upper()!='SELL' or
+        str(order.get('status','')).upper()!=str(before.get('status','')).upper() or
+        any(not math.isclose(a,b,rel_tol=1e-8,abs_tol=1e-10)
+            for a,b in zip(_order_numbers(order),_order_numbers(before)))):
+        raise MexcOrderUncertain('Unwind: résultats WS/REST divergents, aucune seconde vente')
+    executed,_=_order_numbers(order)
+    if executed>0 and not result.get('commission_known'):
+        raise MexcAPIError('Unwind partiel: commission inconnue, seconde sortie bloquée')
+    account=(live_account_client or live_client).account()
+    if not isinstance(account,dict) or account.get('canTrade') is not True:
+        raise MexcAPIError('Unwind: solde de vente non confirmé')
+    row=next((r for r in account.get('balances',[]) if r.get('asset')==asset),None)
+    if row is None: raise MexcAPIError('Unwind: actif absent du relevé de solde')
+    free=float(row.get('free',0))
+    if not math.isfinite(free) or free<0: raise MexcAPIError('Unwind: solde invalide')
+    return min(remaining,max(0.0,free-baseline_units))
+
+
+def _bounded_emergency_unwind(attempt_id,route,remaining,balances,meta,capability,
+                              estimated_unit_value,attempt_values):
+    """At most two immediate MARKET exits, only for this attempt's inventory.
+
+    This is not a background liquidation loop. Uncertain orders stop the chain;
+    unsuccessful confirmed exits leave a durable exposure and a visible circuit.
+    """
+    start,asset,_=route['path']; symbol=route['symbols'][0]
+    baseline=balances.get(asset) or {}
+    try:
+        baseline_units=float(baseline.get('total',float(baseline.get('free',0))+float(baseline.get('locked',0))))
+        if not math.isfinite(baseline_units) or baseline_units<0:raise ValueError()
+    except (ValueError,TypeError):
+        return [],0.0,0.0,MexcAPIError('Unwind: inventaire initial invalide'),None
+    records=[];used=output=0.0;error=None;last_spec=None
+    deadline=time.monotonic()+LIVE_UNWIND_RETRY_WINDOW_MS/1000.0
+    for index in range(LIVE_UNWIND_MAX_ATTEMPTS):
+        left=max(0.0,remaining-used)
+        if left<=0 or left*estimated_unit_value<=LIVE_DUST_USD: break
+        try:
+            quantity=left
+            if index:
+                if time.monotonic()>=deadline:
+                    raise MexcAPIError('Unwind: fenêtre de seconde sortie expirée')
+                previous,previous_spec=records[-1]
+                quantity=_unwind_retry_inventory(previous,previous_spec,left,baseline_units,asset)
+                if quantity<=0: raise MexcAPIError('Unwind: aucun solde libre propre au trade')
+            client_id=(_live_client_id(attempt_id,'unwind') if index==0 else
+                       ('v2411UW'+str(index)+attempt_id[-22:])[:32])
+            spec=live_emergency_market_spec(symbol,asset,start,quantity,meta[symbol],client_id,capability)
+            last_spec=spec
+            if index:
+                def guard(ts):
+                    if time.monotonic()>=deadline:
+                        raise MexcSignalExpired('Unwind: fenêtre de seconde sortie expirée avant POST')
+                spec['_post_guard']=guard
+            purpose='unwind' if index==0 else 'unwind_retry'
+            prep=_live_prepare_followup_order(attempt_id,3+index,purpose,spec,
+                **dict(attempt_values,status='unwind_submitting',unwind_client_id=client_id,
+                       unwind_order_type=spec['order_type'],unwind_input=used,unwind_output=output))
+            spec['_prepare_journal_ms']=prep
+            result=_submit_live_order(attempt_id,3+index,purpose,spec,False,prepared=True)
+            records.append((result,spec))
+            effects=_order_effects(result['order'],result['commissions'],meta[symbol],spec['side'],result['commission_known'])
+            if not all(math.isfinite(float(effects[k])) and effects[k]>=0 for k in ('input','output')):
+                raise MexcOrderUncertain('Unwind: quantités finales invalides')
+            if effects['input']>left+1e-8:
+                raise MexcOrderUncertain('Unwind: quantité consommée supérieure à l’inventaire suivi')
+            used+=effects['input'];output+=effects['output']
+            if max(0.0,remaining-used)*estimated_unit_value>LIVE_DUST_USD:
+                detail=f"Unwind {result['order'].get('status')}: exécuté {effects['input']:g}, reste {remaining-used:g} {asset}"
+                _live_order_update(client_id,str(result['order'].get('status') or 'final'),error=detail)
+                error=MexcAPIError(detail)
+            else: error=None
+        except MexcOrderUncertain:
+            _live_attempt_update(attempt_id,status='reconciliation_required',
+                unwind_input=used,unwind_output=output,realized_pnl=None,
+                error='Sortie incertaine: aucune vente supplémentaire automatique')
+            raise
+        except Exception as exc:
+            error=exc;break
+    return records,used,output,error,last_spec
 
 
 def _live_real_attempt(q, attempt_id, x, quality, requested_usd, balances, meta):
@@ -4545,26 +4673,15 @@ def _live_real_attempt(q, attempt_id, x, quality, requested_usd, balances, meta)
     remaining_value_est=(remaining*remaining_mark if remaining_mark is not None else
         requested_usd*remaining/max(mid_acquired,1e-18))
     unwind_required=bool(remaining>0 and remaining_value_est>LIVE_DUST_USD)
-    unwind_used=0.0; unwind_out=0.0; uwid=None; unwind_error=None; uw=None; uwspec=None
+    unwind_used=0.0; unwind_out=0.0; uwid=None; unwind_error=None; uwspec=None
+    unwind_records=[]
     if unwind_required:
-        uwid=_live_client_id(attempt_id,"unwind")
-        try:
-            # Emergency exit is intentionally independent of local Depth age.
-            # The MARKET syntax/direction was validated before any live entry.
-            uwspec=live_emergency_market_spec(route["symbols"][0],mid,start,remaining,
-                meta[route["symbols"][0]],uwid,capability["unwind"])
-            uwprep=_live_prepare_followup_order(attempt_id,3,"unwind",uwspec,status="unwind_submitting",
-                                                unwind_client_id=uwid,unwind_order_type=uwspec["order_type"])
-            uwspec["_prepare_journal_ms"]=uwprep
-            uw=_submit_live_order(attempt_id,3,"unwind",uwspec,False,prepared=True)
-            uwe=_order_effects(uw["order"],uw["commissions"],meta[route["symbols"][0]],uwspec["side"],uw["commission_known"])
-            unwind_used=min(remaining,uwe["input"]); unwind_out=uwe["output"]
-        except MexcOrderUncertain:
-            _live_attempt_update(attempt_id,status="reconciliation_required",realized_pnl=None,
-                                 error="Statut unwind inconnu: réconciliation obligatoire")
-            raise
-        except Exception as exc:
-            unwind_error=exc
+        unit_value=remaining_value_est/max(remaining,1e-18)
+        unwind_records,unwind_used,unwind_out,unwind_error,uwspec=_bounded_emergency_unwind(
+            attempt_id,route,remaining,balances,meta,capability['unwind'],unit_value,
+            {'input_units':e1['input'],'mid_acquired':mid_acquired,'mid_used':mid_used,
+             'output_units':end_out,'leg1_client_id':l1id})
+        uwid=uwspec['client_order_id'] if uwspec else None
     # Once the market-risk phase is over, replace the conservative leg-1 fee
     # haircut with the exact commission.  This REST call can no longer delay
     # leg 2 or the emergency unwind.
@@ -4574,7 +4691,7 @@ def _live_real_attempt(q, attempt_id, x, quality, requested_usd, balances, meta)
         _reconcile_order_commissions(r2,spec2)
         e2=_order_effects(r2["order"],r2["commissions"],meta[route["symbols"][1]],spec2["side"],True)
         mid_used=e2["input"]; end_out=e2["output"]
-    fee_results=[(r1,spec1)]+([(r2,spec2)] if r2 else [])+([(uw,uwspec)] if uw else [])
+    fee_results=[(r1,spec1)]+([(r2,spec2)] if r2 else [])+unwind_records
     fees_known=all(r.get("commission_known") or _order_numbers(r["order"])[0]<=0 for r,_ in fee_results)
     e1=_order_effects(r1["order"],r1["commissions"],meta[route["symbols"][0]],
                       spec1["side"],True)
@@ -4761,6 +4878,9 @@ def process_live_candidate(q):
         q["fresh_quality"]=dict(quality)
         q["fresh_edge"]=x.get("net") if x else quality.get("normal_edge")
     if reason: return skipped(reason)
+    if TRADING_MODE=='live':
+        try: q['exit_headroom']=_entry_exit_headroom(q['route'])
+        except MexcSignalExpired as exc: return skipped(str(exc).split(':',1)[0])
     q["quality"]=dict(quality)
     if TRADING_MODE=="live" and not tested:
         return skipped("route_not_test_validated")
@@ -5072,6 +5192,14 @@ def initialize_live_gateway():
     global live_client,live_order_status_client,live_account_client,live_prevalidation_client,live_user_stream_client
     initialize_live_journal()
     load_live_state()
+    # Restore measured LIVE confirmation times without adding any request to
+    # the entry path. TEST timings must never make the budget look faster.
+    try:
+        times=live_db_execute("""SELECT leg1_confirm_ms FROM live_attempts_v240
+            WHERE mode='live' AND leg1_confirm_ms>0 ORDER BY created_ts_ms DESC LIMIT 200""",many=True)
+        live_leg1_confirm_ms.extend(float(r['leg1_confirm_ms']) for r in reversed(times or []))
+    except Exception as exc:
+        live_trip('confirmation_history_unavailable',type(exc).__name__)
     _load_route_capabilities()
     refresh_live_daily_stats()
     try:
@@ -5204,7 +5332,12 @@ def live_status():
         "private_order_stream":private_stream,
         "private_order_stream_mode":LIVE_PRIVATE_WS_MODE,
         "private_order_stream_authoritative":LIVE_PRIVATE_WS_MODE=="hybrid",
-        "emergency_unwind":"prevalidated_market_without_depth_gate"})
+        "emergency_unwind":"prevalidated_market_without_depth_gate",
+        "unwind_max_attempts":LIVE_UNWIND_MAX_ATTEMPTS,
+        "unwind_retry_window_ms":LIVE_UNWIND_RETRY_WINDOW_MS,
+        "exit_confirmation_budget_ms":_exit_confirmation_budget_ms(),
+        "exit_confirmation_floor_ms":LIVE_EXIT_CONFIRM_FLOOR_MS,
+        "exit_prepare_margin_ms":LIVE_EXIT_PREP_MARGIN_MS})
     return out
 
 # ---------- Paper engine ----------
@@ -6507,7 +6640,7 @@ def api_status():
                  "v235_capture":cached.get("v235_capture",{})})
     return jsonify(base)
 
-HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MEXC 2-Leg V2.4.8</title>
+HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MEXC 2-Leg V2.4.11</title>
 <style>body{background:#090d14;color:#e8edf5;font-family:system-ui;margin:0;padding:16px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.c,.panel{background:#111827;border:1px solid #273248;border-radius:10px;padding:12px}.v{font-weight:800;font-size:20px}.big{font-size:28px}.muted{color:#9aa7bd;font-size:12px}.good{color:#22d38a}.bad{color:#ff6677}.panel{margin-top:12px;overflow:auto}.latency{display:grid;grid-template-columns:repeat(3,minmax(250px,1fr));gap:10px}.latbox{background:#0c1421;border:1px solid #2a3850;border-radius:10px;padding:12px}.balance{margin-top:8px;line-height:1.7}.metricgrid{display:grid;grid-template-columns:repeat(2,minmax(95px,1fr));gap:7px;margin-top:10px}.metric{background:#111b2b;border-radius:8px;padding:8px}.tag{display:inline-block;border:1px solid #334155;border-radius:999px;padding:3px 7px;font-size:11px;color:#bac6d8}table{border-collapse:collapse;width:100%;font-size:12px}th,td{padding:8px;border-bottom:1px solid #263044;text-align:right}th:first-child,td:first-child{text-align:left}@media(max-width:900px){.latency{grid-template-columns:1fr}}
 h2{font-size:22px;margin:4px 0 12px}h3{font-size:15px;margin:8px 0}.panel{padding:10px}.sim-panels{display:grid;grid-template-columns:1fr 1fr;gap:12px}.sim-panel{min-width:0}.sim-panel table{font-variant-numeric:tabular-nums}.sim-panel th,.sim-panel td{padding:6px 5px;white-space:nowrap}.sim-panel .pnl{font-weight:700}.sim-description{margin:4px 0 8px}.sim-detail{margin-top:8px;border-top:1px solid #273248;padding-top:7px}.sim-detail summary{font-size:12px;color:#bac6d8}.sim-scroll{overflow:auto}.sim-caption{font-size:11px;color:#9aa7bd;margin:6px 0 0}summary{cursor:pointer;font-weight:600;line-height:1.6}summary:focus-visible{outline:2px solid #79b8ff;outline-offset:3px}details[open]>summary{margin-bottom:8px}.brief-grid{display:grid;grid-template-columns:repeat(6,minmax(90px,1fr));gap:10px}.brief-grid .v{font-size:18px}.brief-state{margin:0 0 8px}.sim-detail td{white-space:normal;min-width:65px}.sim-detail td.balances{min-width:150px}@media(max-width:1050px){.sim-panels{grid-template-columns:1fr}.brief-grid{grid-template-columns:repeat(3,minmax(90px,1fr))}}@media(max-width:600px){body{padding:10px}.cards{gap:6px;grid-template-columns:repeat(3,minmax(0,1fr))}.cards .v{font-size:16px}h2{font-size:18px}.sim-panel table{font-size:11px}.sim-panel th,.sim-panel td{padding:6px 3px}.sim-nav{display:none}.brief-grid{gap:7px}.brief-grid .v{font-size:16px}.panel{padding:9px}}
 </style></head><body>
@@ -6551,6 +6684,12 @@ document.getElementById('coverage').innerHTML=`<div class=tag>AUDIT COMPLET DES 
 let modeBrief=(lv.configured_mode||'shadow').toUpperCase();let liveBlocked=lv.circuit_open||!la.effective;
 let briefCards=[[simNumber(lv.realized_pnl,4)+' $','PnL réalisé'],[simNumber(lv.completed,0),'Trades réels'],[simNumber(lv.open_exposures,0),'Expositions ouvertes'],[simNumber(lv.cap_usd,0)+' $','Cap par ordre'],[simNumber(lv.capital_limit_usd,0)+' $','Capital dédié'],[lv.api_ok?'OK':'NON','API privée']];
 document.getElementById('livebrief').innerHTML=`<p class="brief-state ${liveBlocked?'bad':'good'}"><b>${modeBrief}</b> · ${lv.circuit_open?'Circuit ouvert : '+(lv.circuit_reason||'—'):(la.reason||'État non disponible')}</p><div class=brief-grid>${briefCards.map(([v,label])=>`<div><div class=v>${v}</div><div class=muted>${label}</div></div>`).join('')}</div>`;
+if(Number(lv.open_exposures)>0){
+ let alert=document.createElement('div');alert.className='bad';alert.style.cssText='border:2px solid #f87171;border-radius:8px;padding:12px;margin-top:10px';
+ let items=(lv.open_exposure_items||[]).map(x=>`${simNumber(x.units,8)} ${x.asset}`).join(' · ');
+ alert.textContent=`INTERVENTION REQUISE — ${items||lv.open_exposures+' position(s) ouverte(s)'}. Les nouvelles entrées sont bloquées. La sortie automatique est terminée ; une position peut continuer à perdre de la valeur.`;
+ document.getElementById('livebrief').appendChild(alert);
+}
 let flowWorkers=(d.public_flow||{}).workers||[];let recovering=flowWorkers.filter(w=>!w.active).length;document.getElementById('publicflow-summary').textContent=`Flux publics · ${flowWorkers.length-recovering}/${flowWorkers.length} connectés · ${flowWorkers.filter(w=>w.catching_up&&w.active).length} en rattrapage · ${recovering} en reconnexion · décodeur ${(d.public_flow||{}).protobuf_backend||'—'}`;
 let lb=Object.entries(lv.balances||{}).filter(([a])=>(lv.allowed_start_assets||[]).includes(a)).map(([a,v])=>`${a} <b>${Number(v.free||0).toFixed(4)}</b>`).join(' · '),liveok=la.effective&&!lv.circuit_open,mode=(lv.configured_mode||'shadow').toUpperCase();
 let fmtMs=x=>x?.p95_ms==null?'-':Number(x.p95_ms).toFixed(1)+' ms';
