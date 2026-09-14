@@ -9,8 +9,8 @@ from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, render_template_string
 import websocket
 
-VERSION = "2.4.9-local-catchup"
-# V249: pause/drain local congestion; off-lock bootstrap replay; private policy retained.
+VERSION = "2.4.10-fair-public-dispatch"
+# V2410: one fair public consumer; native batch decode off lock; private policy retained.
 # Private execution policy, arm phrase, journals, limits and fees are retained.
 # Offline-tested public-flow candidate. Server latency still needs validation.
 # Baseline SHA256: d4038460cdf499ac9b0b02da487680a2af37fc09e7985a13156cbc02642d2919
@@ -1362,7 +1362,10 @@ PUBLIC_RX_STALL_MS = 5000
 PUBLIC_LAG_RECOVERY_MS = 1000
 PUBLIC_LAG_PERSIST_MS = 200
 PUBLIC_BATCH_MAX = 32
-PUBLIC_BATCH_BUDGET_MS = 2
+PUBLIC_DISPATCH_MODE = 'single_fair_consumer'
+public_work_available = threading.Event()
+public_dispatch_metrics = {'rounds':0,'processed':0,'max_round_ms':0}
+public_flow_totals = {'catchup_started':0,'catchup_completed':0,'hard_recoveries':0}
 public_feeds = {}
 public_symbol_feeds = {}
 public_recovery_events = deque(maxlen=200)
@@ -1479,6 +1482,7 @@ class PublicFeed:
         self.dirty_symbols = set()
         self.fail_lock = threading.Lock(); self.close_callback = None
         self.bad_by_symbol = {}; self.reason = None
+        self.symbol_messages = defaultdict(int)
         self.threads = []
         self.metrics = {'messages': 0, 'bytes': 0, 'applied': 0, 'batches': 0,
                         'max_queue': 0, 'lag_ms': None, 'max_lag_ms': 0,
@@ -1505,6 +1509,7 @@ class PublicFeed:
                 self.catching_up.set()
                 self.metrics['catchup_count'] += 1
                 with public_recovery_lock:
+                    public_flow_totals['catchup_started'] += 1
                     public_catchup_events.append({'ts_ms': now_ms(), 'worker_id': self.worker_id,
                         'epoch': self.epoch, 'event': 'paused', 'queue_age_ms': round(waited, 2)})
 
@@ -1536,6 +1541,7 @@ class PublicFeed:
                 # Also publish books rebuilt while this connection was paused.
                 self.dirty_symbols.update(self.symbols)
                 with public_recovery_lock:
+                    public_flow_totals['catchup_completed'] += 1
                     public_catchup_events.append({'ts_ms': now_ms(), 'worker_id': self.worker_id,
                         'epoch': self.epoch, 'event': 'resumed', 'duration_ms': round(elapsed, 2)})
         if self.usable():
@@ -1550,6 +1556,7 @@ class PublicFeed:
             if self.halt.is_set(): return
             self.reason = reason; self.active = False; self.halt.set()
         with public_recovery_lock:
+            public_flow_totals['hard_recoveries'] += 1
             public_recovery_events.append({"ts_ms":now_ms(),"worker_id":self.worker_id,"epoch":self.epoch,"reason":reason,"lag_ms":self.metrics["lag_ms"],"queue":self.inbox.qsize(),
                 "queue_age_ms":round(self.backlog_age_ms(),2),
                 "queue_bytes":getattr(self.inbox,'byte_count',None),
@@ -1578,6 +1585,7 @@ class PublicFeed:
             if symbol not in self.allowed:
                 self.fail('unexpected_symbol'); return False
             self.metrics['messages'] += 1; self.metrics['bytes'] += len(payload)
+            self.symbol_messages[symbol] += 1
             # Raw transport delay, separate from age of an inactive book.
             lag = received_ms + (mexc_now_ms() - now_ms()) - sent if sent else None
             self.metrics['lag_ms'] = lag
@@ -1595,6 +1603,7 @@ class PublicFeed:
             except queue.Full:
                 self.fail('receive_queue_full'); return False
             self.metrics['max_queue'] = max(self.metrics['max_queue'], self.inbox.qsize())
+            public_work_available.set()
             return True
         except Exception:
             self.fail('invalid_public_packet'); return False
@@ -1603,11 +1612,19 @@ class PublicFeed:
                 (time.perf_counter_ns()-started)/1000.0)
 
     def consume_batch(self, first):
-        started = time.monotonic(); item = first; count = 0
+        # Drain only frames already available, without delaying a fresh packet.
+        # One lock acquisition for <=32 updates. Waiting for that lock no
+        # longer consumes a 2 ms wall-clock budget and collapses the batch.
+        items = [first]
+        self.inflight_mono = first[2]
+        while len(items) < PUBLIC_BATCH_MAX:
+            try: items.append(self.inbox.get_nowait())
+            except queue.Empty: break
+        prepared = []; resync = []; latency_rows = []
         try:
-            while item is not None and not self.halt.is_set():
+            for item in items:
+                if self.halt.is_set(): return
                 payload, received, received_mono, symbol, sent = item
-                self.inflight_mono = received_mono
                 waited = (time.monotonic()-received_mono)*1000
                 self.metrics['max_queue_wait_ms'] = max(self.metrics['max_queue_wait_ms'], waited)
                 if waited > PUBLIC_RX_MAX_WAIT_MS:
@@ -1619,26 +1636,30 @@ class PublicFeed:
                 if not x or x['symbol'] != symbol or x['send'] != sent:
                     self.fail('public_header_mismatch'); return
                 x['received_ts'] = received; x['source_epoch'] = self.epoch
-                if self.halt.is_set(): return
-                apply_start = time.perf_counter_ns()
-                if apply_depth_update(x, publish=False):
-                    self.dirty_symbols.add(symbol); self.metrics['applied'] += 1
-                self.metrics['processed'] += 1
-                self.last_progress_mono = time.monotonic()
-                self.inflight_mono = None
-                self.inbox.task_done()
-                self.metrics['max_apply_us'] = max(self.metrics['max_apply_us'],
-                    (time.perf_counter_ns()-apply_start)/1000.0)
-                last = ws_latency_last_sample.get(symbol, 0)
-                if sent > 0 and received-last >= WS_LATENCY_SAMPLE_MS:
-                    ws_latency_last_sample[symbol] = received
-                    offset = mexc_now_ms()-now_ms()
-                    put_db(('ws_lat_v22', (received, symbol, sent, received, max(0, received+offset-sent))))
-                count += 1
-                if count >= PUBLIC_BATCH_MAX or (time.monotonic()-started)*1000 >= PUBLIC_BATCH_BUDGET_MS:
-                    break
-                try: item = self.inbox.get_nowait()
-                except queue.Empty: item = None
+                prepared.append((x, received, symbol, sent))
+            lock_start = time.perf_counter_ns()
+            with depth_lock:
+                self.metrics['lock_wait_us_max'] = max(self.metrics['lock_wait_us_max'],
+                    (time.perf_counter_ns()-lock_start)/1000.0)
+                for x, received, symbol, sent in prepared:
+                    if self.halt.is_set(): return
+                    apply_start = time.perf_counter_ns()
+                    if apply_depth_update(x, publish=False, resync_out=resync):
+                        self.dirty_symbols.add(symbol); self.metrics['applied'] += 1
+                    self.metrics['processed'] += 1
+                    self.last_progress_mono = time.monotonic()
+                    self.inbox.task_done()
+                    self.metrics['max_apply_us'] = max(self.metrics['max_apply_us'],
+                        (time.perf_counter_ns()-apply_start)/1000.0)
+                    last = ws_latency_last_sample.get(symbol, 0)
+                    if sent > 0 and received-last >= WS_LATENCY_SAMPLE_MS:
+                        ws_latency_last_sample[symbol] = received
+                        offset = mexc_now_ms()-now_ms()
+                        latency_rows.append(('ws_lat_v22', (received, symbol, sent, received, max(0, received+offset-sent))))
+            self.inflight_mono = None
+            for symbol in dict.fromkeys(resync):
+                queue_depth_resync(symbol, 'version_or_book_invalid')
+            for row in latency_rows: put_db(row)
             if not self.halt.is_set():
                 self.finish_batch()
                 self.metrics['batches'] += 1
@@ -1665,18 +1686,64 @@ class PublicFeed:
                       catching_up=self.catching_up.is_set(), usable=usable,
                       queue=self.inbox.qsize(), queue_age_ms=round(self.backlog_age_ms(),2),
                       queue_bytes=getattr(self.inbox,'byte_count',None),
+                      symbol_messages=dict(self.symbol_messages),
                       messages_per_sec=result['messages']/elapsed)
         return result
 
 
+def public_dispatch_worker(stop_event=None):
+    """One public consumer, rotating among sockets with a 32-frame quantum.
+
+    No wait for a batch to fill. Busy sockets get subsequent rounds; every
+    nonempty socket gets a turn. Readers retain their independent bounded queues.
+    """
+    stop_event = stop_event or threading.Event()
+    cursor = 0
+    while not stop_event.is_set():
+        public_work_available.wait(0.05)
+        public_work_available.clear()
+        feeds = list(public_feeds.values())
+        if not feeds: continue
+        started = time.monotonic()
+        cursor %= len(feeds)
+        for feed in feeds[cursor:] + feeds[:cursor]:
+            if stop_event.is_set(): return
+            if not feed.active or feed.halt.is_set(): continue
+            try: first = feed.inbox.get_nowait()
+            except queue.Empty: continue
+            before = feed.metrics['processed']
+            feed.consume_batch(first)
+            public_dispatch_metrics['processed'] += feed.metrics['processed'] - before
+        cursor += 1
+        public_dispatch_metrics['rounds'] += 1
+        public_dispatch_metrics['max_round_ms'] = max(public_dispatch_metrics['max_round_ms'],
+            (time.monotonic()-started)*1000)
+        if any(feed.active and not feed.halt.is_set() and not feed.inbox.empty() for feed in list(public_feeds.values())):
+            public_work_available.set()
+
+
+def public_watchdog_worker(stop_event=None):
+    stop_event = stop_event or threading.Event()
+    while not stop_event.wait(0.05):
+        for feed in list(public_feeds.values()):
+            if feed.active and not feed.halt.is_set():
+                feed.check_pressure(allow_stall=True)
+
+
 def public_flow_status():
+    cpu_times=os.times()
     with public_recovery_lock:
-        recoveries=list(public_recovery_events); catchups=list(public_catchup_events)
+        recoveries=list(public_recovery_events); catchups=list(public_catchup_events); totals=dict(public_flow_totals)
     return {'protobuf_backend':PUBLIC_PROTOBUF_BACKEND,'queue_limit': PUBLIC_RX_QUEUE_MAX, 'queue_max_wait_ms': PUBLIC_RX_MAX_WAIT_MS,
             'queue_byte_limit':PUBLIC_RX_QUEUE_BYTES,'queue_resume_ms':PUBLIC_RX_RESUME_MS,
             'consumer_stall_ms':PUBLIC_RX_STALL_MS,'local_age_action':'pause_and_drain_in_order',
             'recovery_lag_ms': PUBLIC_LAG_RECOVERY_MS, 'recent_recoveries':recoveries,
-            'recent_catchups':catchups,
+            'recent_catchups':catchups,'totals':totals,
+            'dispatch_mode':PUBLIC_DISPATCH_MODE,'batch_max':PUBLIC_BATCH_MAX,
+            'dispatch':dict(public_dispatch_metrics),
+            'process_cpu_seconds':cpu_times.user+cpu_times.system,
+            'process_started_ms':state.get('started_ms'),
+            'process_threads':threading.active_count(),
             'workers': [feed.snapshot() for feed in list(public_feeds.values())]}
 
 
@@ -1939,7 +2006,7 @@ def queue_depth_resync(sym, reason="gap"):
     return True
 
 
-def apply_depth_update(x, publish=True):
+def apply_depth_update(x, publish=True, resync_out=None):
     sym=x["symbol"]
     x.setdefault("received_ts",now_ms())
     need_resync=False
@@ -1968,7 +2035,10 @@ def apply_depth_update(x, publish=True):
         if need_resync:
             state["depth_ready"]=sum(1 for z in state["depth"].values() if z.get("ready"))
     if need_resync:
-        queue_depth_resync(sym,"version_or_book_invalid")
+        if resync_out is None:
+            queue_depth_resync(sym,"version_or_book_invalid")
+        else:
+            resync_out.append(sym)
         return False
     if publish: _publish_depth_bbo(sym,x["send"])
     return True
@@ -6065,8 +6135,6 @@ def ws_worker(symbols,worker_id,group_volume_24h=0.0):
             def on_open(ws):
                 nonlocal opened; opened=True
                 feed.active=True; feed.close_callback=ws.close
-                for target in (feed.run,feed.watchdog):
-                    thread=threading.Thread(target=target,daemon=True); feed.threads.append(thread); thread.start()
                 for sym in symbols: queue_depth_resync(sym,"public_connection_epoch")
                 ts=now_ms()
                 with state_lock:
@@ -6474,7 +6542,7 @@ function renderSimPanel(id,names,sh,title,description){
  host.querySelector('.sim-extra').innerHTML=`<table><thead><tr><th>Profil</th><th>Soldes</th><th>NAV</th><th>Edge T0 moy.</th><th>Rebal. / coût</th><th>Refus solde / L1 annulée / expositions</th></tr></thead><tbody>${extra}</tbody></table>`;
 }
 async function refresh(){let d=await fetch('/api/status').then(r=>r.json()),g=d.diag,p=d.v235_policy||{},cap=d.v235_capture||{},ql=d.quality||{},ad=d.admissions||{},sk=d.shadow_skips||{},he=d.health||{},lv=d.live||{},lf=d.live_funnel||{},la=lv.arm||{},cv=d.coverage||{},rc=cv.route_counts||{},tc=cv.tick_counts||{},pv=lv.prevalidation||{},pw=lv.private_order_stream||{};
-let pf=d.public_flow||{};let pfr=(pf.workers||[]).map(w=>`<tr><td>${w.worker_id}</td><td>${!w.active?'reconnexion':(w.catching_up?'rattrapage':'actif')}</td><td>${w.lag_ms??'-'}</td><td>${w.queue??0} / ${Number(w.queue_age_ms||0).toFixed(0)} ms</td><td>${Number(w.messages_per_sec||0).toFixed(0)}</td><td>${Number(w.max_callback_us||0).toFixed(0)} / ${Number(w.max_apply_us||0).toFixed(0)}</td><td>${w.recovery_reason||'-'}</td></tr>`).join('');document.getElementById('publicflow').innerHTML=`<h3>Flux publics V2.4.9</h3><p>Retard du dernier message, distinct de l'âge d'un carnet inactif. Rattrapage local : entrées suspendues, deltas conservés, socket maintenu. Seuils LIVE : 50 / 100 / 50 ms.</p><table><thead><tr><th>WS</th><th>État</th><th>Retard ms</th><th>File / attente</th><th>Messages/s</th><th>Réception / traitement max µs</th><th>Récupération</th></tr></thead><tbody>${pfr}</tbody></table>`;
+let pf=d.public_flow||{};let pfr=(pf.workers||[]).map(w=>`<tr><td>${w.worker_id}</td><td>${!w.active?'reconnexion':(w.catching_up?'rattrapage':'actif')}</td><td>${w.lag_ms??'-'}</td><td>${w.queue??0} / ${Number(w.queue_age_ms||0).toFixed(0)} ms</td><td>${Number(w.messages_per_sec||0).toFixed(0)} / ${Number((w.processed||0)/Math.max(1,w.batches||0)).toFixed(1)}</td><td>${Number(w.max_callback_us||0).toFixed(0)} / ${Number(w.max_apply_us||0).toFixed(0)}</td><td>${w.recovery_reason||'-'}</td></tr>`).join('');document.getElementById('publicflow').innerHTML=`<h3>Flux publics V2.4.10</h3><p>Retard du dernier message, distinct de l'âge d'un carnet inactif. Traitement public centralisé, équitable, par lots de 32 maximum sans délai de remplissage. Rattrapage : entrées suspendues, deltas conservés. Seuils LIVE : 50 / 100 / 50 ms.</p><table><thead><tr><th>WS</th><th>État</th><th>Retard ms</th><th>File / attente</th><th>Messages/s / lot moyen</th><th>Réception / traitement max µs</th><th>Récupération</th></tr></thead><tbody>${pfr}</tbody></table>`;
 document.getElementById('v247').innerHTML=`<div class=tag>V2.4.7 · ADMISSION À TAILLE RÉELLE</div><h3>${lv.entry_order_policy||'-'} · ${lv.validated_routes||0} routes compatibles / ${lv.legacy_capabilities_stored||0} capacités stockées</h3><p>Le LIVE réévalue les nouvelles versions du carnet, indépendamment du premier classement replay. A/B+ LIVE est calculé à la taille abordable, cap 20 $, frais et réserve inclus. Les anciennes validations MARKET ne valident pas les ordres FOK.</p><p>Compteurs cumulés depuis ce démarrage (observations, pas trades) :</p><table>${Object.entries(lv.v247_counts||{}).sort((a,b)=>b[1]-a[1]).slice(0,12).map(([k,n])=>`<tr><td>${k}</td><td>${n}</td></tr>`).join('')}</table><p class=muted>Les Shadows restent des scénarios de carnet : absence de preuve de remplissage FOK, commissions supposées et absence de modèle de concurrence au matching. Leurs profits ne sont pas une prédiction du LIVE. Un snapshot REST sans timestamp MEXC reste exclu du LIVE jusqu'à un delta WS cohérent. Journaux et pertes historiques sont conservés.</p>`;
 document.getElementById('privatews').innerHTML=`<div class=tag>ORDRES WEBSOCKET PRIVÉ V2.4.7</div><h3 class='${pw.connected?'good':((lv.configured_mode||'shadow')==='shadow'?'':'bad')}'>Mode ${(pw.mode||'off').toUpperCase()} · ${pw.connected?'connecté':'déconnecté'}${pw.subscribed?' · abonné':''}</h3><div class=cards><div><div class=v>${pw.opens||0} / ${pw.disconnects||0}</div><div class=muted>ouvertures / chutes privées</div></div><div><div class=v>${pw.messages||0} / ${pw.order_events||0}</div><div class=muted>messages / événements ordre</div></div><div><div class=v>${pw.terminal_events||0}</div><div class=muted>événements terminaux</div></div><div><div class=v>${pw.matched_events||0} / ${pw.unmatched_events||0}</div><div class=muted>liés au bot / non liés</div></div><div><div class=v>${pw.ws_before_rest||0} / ${pw.rest_before_ws||0} / ${pw.same_ms||0}</div><div class=muted>WS avant REST / après / égal</div></div><div><div class=v>${pw.post_to_event?.p95_ms==null?'-':Number(pw.post_to_event.p95_ms).toFixed(1)+' ms'}</div><div class=muted>POST → événement privé p95</div></div><div><div class=v>${pw.ws_rest_delta?.p95_ms==null?'-':Number(pw.ws_rest_delta.p95_ms).toFixed(1)+' ms'}</div><div class=muted>delta WS − REST p95</div></div><div><div class=v>${pw.confirmations_ws||0} / ${pw.confirmations_rest||0} / ${pw.confirmations_post||0}</div><div class=muted>autorité WS / REST / POST</div></div><div><div class=v>${pw.pings||0} / ${pw.pongs||0}</div><div class=muted>PING / PONG privés</div></div><div><div class=v>${pw.listenkey_keepalive_ok||0} / ${pw.listenkey_keepalive_errors||0}</div><div class=muted>listenKey OK / erreurs</div></div><div><div class='v ${(pw.decode_errors||0)===0?'good':'bad'}'>${pw.decode_errors||0}</div><div class=muted>erreurs de décodage</div></div><div><div class=v>${pw.pending_orders||0}</div><div class=muted>ordres suivis</div></div></div><div class=muted style='margin-top:10px'>HYBRID : le premier résultat terminal correspondant exactement au clientOrderId et au symbole (WS privé ou REST) devient décisionnaire. Le contrôle REST indépendant continue après une confirmation WS afin de réconcilier et mesurer l'écart, sans retarder la jambe suivante. Une perte du WS bloque les nouvelles entrées ; le secours REST reste actif pour un ordre déjà envoyé.</div>`;
 document.getElementById('cards').innerHTML=`<div class=c><div class=v>${d.symbols}</div><div class=muted>marchés WS</div></div><div class=c><div class=v>${d.routes}</div><div class=muted>routes 2-leg</div></div><div class=c><div class=v>${d.ws}/${d.ws_expected}</div><div class=muted>WebSockets</div></div><div class=c><div class=v>${d.age_ms??'-'} ms</div><div class=muted>dernier BBO reçu</div></div><div class=c><div class=v>${d.depth_ready||0}/${d.symbols}</div><div class=muted>carnets Depth prêts</div></div><div class=c><div class=v>${d.v22?.decisions||0}</div><div class=muted>décisions replay ≥${(p.replay_min_edge_pct??0.30).toFixed(2)}%</div></div><div class=c><div class=v>${d.v22?.trace_points||0}</div><div class=muted>points trajectoire</div></div>`;
@@ -6655,6 +6723,8 @@ def bootstrap():
     threading.Thread(target=route_coverage_flush_worker,daemon=True).start()
     refresh_dashboard_cache()
     threading.Thread(target=dashboard_cache_worker,daemon=True).start()
+    threading.Thread(target=public_dispatch_worker,name='public-dispatch',daemon=True).start()
+    threading.Thread(target=public_watchdog_worker,name='public-watchdog',daemon=True).start()
     for i,g in enumerate(groups,1): threading.Thread(target=ws_worker,args=(g,i,group_loads[i-1]),daemon=True).start()
     time.sleep(1.0)
     threading.Thread(target=depth_resync_worker,daemon=True).start()

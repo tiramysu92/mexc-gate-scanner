@@ -388,5 +388,125 @@ class FlowTests(unittest.TestCase):
                           'LIVE_ARM_PHRASE':'ENABLE MEXC V247 LIVE 20 USD'}.items():
             self.assertEqual(getattr(self.m,key),value,key)
 
+    def test_batch_decodes_outside_lock_and_applies_under_one_outer_lock(self):
+        m=self.m;original=m.depth_lock
+        class CountLock:
+            def __init__(self):self.level=0;self.outer=0
+            def __enter__(self):
+                original.acquire()
+                if self.level==0:self.outer+=1
+                self.level+=1
+                return self
+            def __exit__(self,*a):self.level-=1;original.release()
+        lock=CountLock();m.depth_lock=lock;m._publish_depth_bbo=lambda sym:None
+        decode=m.decode_depth
+        def checked(raw):
+            self.assertEqual(lock.level,0)
+            return decode(raw)
+        m.decode_depth=checked
+        for v in range(101,133):
+            self.feed.accept(packet('XUSDT',999995,start=v,end=v),1000000,time.monotonic())
+        self.feed.consume_batch(self.feed.inbox.get_nowait())
+        self.assertEqual(lock.outer,1)
+        self.assertEqual(self.feed.metrics['processed'],32)
+        self.assertEqual(self.feed.metrics['batches'],1)
+        self.assertEqual(m.state['depth']['XUSDT']['version'],132)
+
+    def test_resync_is_queued_after_batch_releases_depth_lock(self):
+        called=[];m=self.m
+        def enqueue(sym,why):
+            acquired=threading.Event()
+            def probe():
+                with m.depth_lock:acquired.set()
+            t=threading.Thread(target=probe);t.start()
+            self.assertTrue(acquired.wait(.5));t.join(.5)
+            called.append((sym,why))
+        m.queue_depth_resync=enqueue
+        self.feed.accept(packet('XUSDT',999995,start=103,end=103),1000000,time.monotonic())
+        self.feed.consume_batch(self.feed.inbox.get_nowait())
+        self.assertEqual(called,[('XUSDT','version_or_book_invalid')])
+        self.assertFalse(m.state['depth']['XUSDT']['ready'])
+
+    def test_dispatch_serves_cold_socket_before_draining_hot_socket(self):
+        m=self.m;hot=self.feed
+        cold=m.PublicFeed(['YUSDT'],2,1);cold.active=True
+        m.public_feeds[2]=cold;m.public_symbol_feeds['YUSDT']=cold
+        m.state['depth']['YUSDT']=copy.deepcopy(m.state['depth']['XUSDT'])
+        for v in range(101,197):hot.accept(packet('XUSDT',999995,start=v,end=v),1000000,time.monotonic())
+        cold.accept(packet('YUSDT',999995),1000000,time.monotonic())
+        seen=[];consume=cold.consume_batch
+        def check(first):
+            seen.append(hot.metrics['processed'])
+            consume(first)
+        cold.consume_batch=check
+        stop=threading.Event();t=threading.Thread(target=m.public_dispatch_worker,args=(stop,),daemon=True);t.start()
+        try:
+            deadline=time.monotonic()+2
+            while hot.metrics['processed']<96 and time.monotonic()<deadline:time.sleep(.002)
+            self.assertEqual(seen,[32])
+            self.assertEqual(cold.metrics['processed'],1)
+            self.assertEqual(hot.metrics['processed'],96)
+        finally:stop.set();m.public_work_available.set();t.join(1)
+
+    def test_idle_dispatcher_wakes_for_new_frame(self):
+        m=self.m;stop=threading.Event()
+        t=threading.Thread(target=m.public_dispatch_worker,args=(stop,),daemon=True);t.start()
+        try:
+            self.feed.accept(packet('XUSDT',999995),1000000,time.monotonic())
+            deadline=time.monotonic()+1
+            while self.feed.metrics['processed']<1 and time.monotonic()<deadline:time.sleep(.002)
+            self.assertEqual(self.feed.metrics['processed'],1)
+            self.assertEqual(m.state['depth']['XUSDT']['version'],101)
+        finally:stop.set();m.public_work_available.set();t.join(1)
+
+    def test_global_catchup_totals_survive_feed_replacement(self):
+        self.feed.note_catchup(200)
+        self.feed.finish_batch()
+        self.assertEqual(self.m.public_flow_totals['catchup_started'],1)
+        self.assertEqual(self.m.public_flow_totals['catchup_completed'],1)
+        fresh=self.m.PublicFeed(['XUSDT'],1,2);fresh.active=True
+        self.m.public_feeds[1]=fresh;self.m.public_symbol_feeds['XUSDT']=fresh
+        fresh.note_catchup(200)
+        self.assertEqual(self.m.public_flow_totals['catchup_started'],2)
+        self.assertEqual(self.m.public_flow_totals['catchup_completed'],1)
+
+    def test_dispatch_pipeline_handles_observed_rates_across_709_books(self):
+        # Synthetic protocol frames at the measured per-socket rates. This
+        # exercises the pipeline, not MEXC/network/private orders or all research.
+        rates=[108,129,39,69,39,43,40,44,56,53,59,85,87,95,194,161,118,324,160,177,190,191,152,296,180,195,272,164,169]
+        m=self.m;m.public_feeds.clear();m.public_symbol_feeds.clear();m.state['depth'].clear()
+        feeds=[];sent=[0]*29;versions={}
+        for n in range(29):
+            symbols=[f'X{n}_{k}USDT' for k in range(25 if n<28 else 9)]
+            f=m.PublicFeed(symbols,n+1,1);f.active=True;feeds.append(f);m.public_feeds[n+1]=f
+            for sym in symbols:
+                m.public_symbol_feeds[sym]=f;versions[sym]=100
+                m.state['depth'][sym]={'bids':{99.:1},'asks':{101.:1},'version':100,'ready':True,'ts':999995,'send_ts':999990}
+        self.assertEqual(len(m.state['depth']),709)
+        stop=threading.Event()
+        threads=[threading.Thread(target=fn,args=(stop,),daemon=True) for fn in (m.public_dispatch_worker,m.public_watchdog_worker)]
+        for t in threads:t.start()
+        try:
+            start=time.monotonic()
+            while time.monotonic()-start<2:
+                elapsed=time.monotonic()-start
+                for i,f in enumerate(feeds):
+                    wanted=int(elapsed*rates[i])
+                    while sent[i]<wanted:
+                        sym=f.symbols[sent[i]%len(f.symbols)];versions[sym]+=1;v=versions[sym]
+                        self.assertTrue(f.accept(packet(sym,999995,start=v,end=v),1000000,time.monotonic()))
+                        sent[i]+=1
+                time.sleep(.005)
+            deadline=time.monotonic()+3
+            while any(f.metrics['processed']<sent[i] for i,f in enumerate(feeds)) and time.monotonic()<deadline:time.sleep(.005)
+            for i,f in enumerate(feeds):
+                self.assertEqual(f.metrics['processed'],sent[i])
+                self.assertIsNone(f.reason)
+                for sym in f.symbols:self.assertEqual(m.state['depth'][sym]['version'],versions[sym])
+            self.assertEqual(list(m.public_recovery_events),[])
+        finally:
+            stop.set();m.public_work_available.set()
+            for t in threads:t.join(1)
+
 
 if __name__=='__main__':unittest.main(verbosity=2)
