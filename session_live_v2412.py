@@ -1,7 +1,9 @@
-"""Finite LIVE allocation. Historical accounting is read, never reset."""
+"""Bounded LIVE allocation, timed or trade-quota. History is never reset."""
 import json
 import math
 import time
+
+POLICY_MODES = ('timed', 'trade_quota')
 
 TOTALS_SQL = """SELECT
  COALESCE(SUM(CASE WHEN mode='live' AND
@@ -29,22 +31,31 @@ class LiveSession:
         p = self.policy
         if not isinstance(p.get('session_id'), str) or len(p['session_id']) != 32:
             raise ValueError('Invalid session identity')
-        for key in ('created_ts_ms', 'expires_ts_ms', 'max_buys'):
+        self.mode = p.get('mode', 'timed')
+        if self.mode not in POLICY_MODES:
+            raise ValueError('Invalid session mode')
+        for key in ('created_ts_ms', 'max_buys'):
             if type(p.get(key)) is not int:
                 raise ValueError('Invalid session integer')
         limit = p.get('additional_loss_usd')
         if type(limit) not in (int, float) or not math.isfinite(limit) or not 0 < limit <= 5:
             raise ValueError('Explicit additional loss allocation must be in (0, 5]')
-        if not 0 < p['expires_ts_ms'] - p['created_ts_ms'] <= 30 * 60 * 1000:
-            raise ValueError('Session duration exceeds 30 minutes')
+        if self.mode == 'timed':
+            if type(p.get('expires_ts_ms')) is not int:
+                raise ValueError('Timed session requires an expiry')
+            if not 0 < p['expires_ts_ms'] - p['created_ts_ms'] <= 30 * 60 * 1000:
+                raise ValueError('Session duration exceeds 30 minutes')
+        elif 'expires_ts_ms' not in p or p['expires_ts_ms'] is not None:
+            raise ValueError('Trade-quota session requires explicit null expiry')
         if not 1 <= p['max_buys'] <= 10:
             raise ValueError('Session exceeds 10 buys')
         self.baseline = totals(p['baseline'])
-        self.deadline = self.mono() + max(0, p['expires_ts_ms'] - self.wall()) / 1000
+        self.deadline = (self.mono() + max(0, p['expires_ts_ms'] - self.wall()) / 1000
+                         if self.mode == 'timed' else None)
 
     def status(self, current):
         p = self.policy
-        result = dict(required=True, session_id=p['session_id'],
+        result = dict(required=True, mode=self.mode, session_id=p['session_id'],
                       additional_loss_usd=p['additional_loss_usd'],
                       baseline_realized_pnl=self.baseline['pnl'],
                       expires_ts_ms=p['expires_ts_ms'], max_buys=p['max_buys'],
@@ -59,7 +70,7 @@ class LiveSession:
         wall = self.wall()
         if wall < p['created_ts_ms'] - 1000:
             result['reason'] = 'session_clock_invalid'
-        elif wall >= p['expires_ts_ms'] or self.mono() >= self.deadline:
+        elif self.mode == 'timed' and (wall >= p['expires_ts_ms'] or self.mono() >= self.deadline):
             result['reason'] = 'session_expired'
         elif result['buys'] < 0 or result['unwinds'] < 0:
             result['reason'] = 'session_journal_regressed'

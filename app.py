@@ -10,7 +10,7 @@ from flask import Flask, jsonify, render_template_string
 import websocket
 from session_live_v2412 import LiveSession, TOTALS_SQL as SESSION_TOTALS_SQL, totals as session_totals
 
-VERSION = "2.4.13-resync-generations"
+VERSION = "2.4.14-trade-quota-session"
 # V2411: entry exit-headroom, bounded confirmed exit retry, manual-close accounting.
 # Public fair consumer and existing freshness/fee/size limits are retained.
 # Release installation keeps LIVE stopped; exchange-side cancellation is unresolved.
@@ -6808,7 +6808,9 @@ let briefCards=[[simNumber(lv.realized_pnl,4)+' $','PnL réalisé'],[simNumber(l
 document.getElementById('livebrief').innerHTML=`<p class="brief-state ${liveBlocked?'bad':'good'}"><b>${modeBrief}</b> · ${lv.circuit_open?'Circuit ouvert : '+(lv.circuit_reason||'—'):(la.reason||'État non disponible')}</p><div class=brief-grid>${briefCards.map(([v,label])=>`<div><div class=v>${v}</div><div class=muted>${label}</div></div>`).join('')}</div>`;
 if(lv.session?.required){
  let ss=lv.session, note=document.createElement('p');
- note.textContent=`Session LIVE limitée · PnL net ${simNumber(ss.pnl,4)} $ · ${ss.buys??'—'}/${ss.max_buys??'—'} achats · seuil supplémentaire ${ss.additional_loss_usd??'—'} $ · fin ${ss.expires_ts_ms?new Date(ss.expires_ts_ms).toLocaleTimeString():'—'} · ${ss.reason||'ouverte'} · exclus : ${(lv.excluded_assets||[]).join(', ')}`;
+ let sessionTerm=ss.mode==='trade_quota'?'sans échéance horaire':`fin ${ss.expires_ts_ms?new Date(ss.expires_ts_ms).toLocaleTimeString():'—'}`;
+ let sessionState=ss.reason||(la.effective?'entrées autorisées':`entrées bloquées : ${la.reason||'contrôle en cours'}`);
+ note.textContent=`Session LIVE · ${sessionTerm} · PnL net ${simNumber(ss.pnl,4)} $ · ${ss.buys??'—'}/${ss.max_buys??'—'} achats · seuil supplémentaire ${ss.additional_loss_usd??'—'} $ · ${sessionState} · exclus : ${(lv.excluded_assets||[]).join(', ')}`;
  document.getElementById('livebrief').appendChild(note);
 }
 if(Number(lv.open_exposures)>0){
