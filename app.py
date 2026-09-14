@@ -10,7 +10,7 @@ from flask import Flask, jsonify, render_template_string
 import websocket
 from session_live_v2412 import LiveSession, TOTALS_SQL as SESSION_TOTALS_SQL, totals as session_totals
 
-VERSION = "2.4.12-bounded-live-session"
+VERSION = "2.4.13-resync-generations"
 # V2411: entry exit-headroom, bounded confirmed exit retry, manual-close accounting.
 # Public fair consumer and existing freshness/fee/size limits are retained.
 # Release installation keeps LIVE stopped; exchange-side cancellation is unresolved.
@@ -280,6 +280,7 @@ state = {
     "scan_updates": 0, "scan_coalesced": 0, "scan_queue_drops": 0, "db_queue_drops": 0,
     "ws_disconnects": 0, "ws_reconnects": 0, "ws_app_pings": 0, "ws_app_pongs": 0,
     "ws_ping_errors": 0, "ws_workers": {}, "ws_disconnect_times": deque(maxlen=20000),
+    "public_ws_close_events": deque(maxlen=200),
     "depth_gap_events": 0, "depth_resync_failures": 0, "depth_resync_recoveries": 0,
     "latest_routes": {}, "route_diag": {},
     "depth": {}, "depth_ready": 0,
@@ -326,7 +327,7 @@ depth_buffers = defaultdict(lambda: deque(maxlen=5000))
 depth_resync_q = queue.Queue()
 depth_resync_pending = set()
 depth_resync_lock = threading.Lock()
-depth_resync_diag = defaultdict(lambda: {"drops":0,"resync_ok":0,"resync_fail":0,"not_ready_since":None,"last_reason":"","last_resync_ms":None,"last_ready_ts_ms":None})
+depth_resync_diag = defaultdict(lambda: {"drops":0,"resync_ok":0,"resync_fail":0,"not_ready_since":None,"last_reason":"","last_resync_ms":None,"last_ready_ts_ms":None,"request_generation":0})
 depth_quality_compute_us = deque(maxlen=10000)
 db_ready = threading.Event()
 dashboard_cache_lock = threading.RLock()
@@ -714,6 +715,11 @@ def db_writer():
     );
     CREATE INDEX IF NOT EXISTS idx_depth_sync_symbol_ts ON depth_sync_events(symbol,ts_ms);
 
+    CREATE TABLE IF NOT EXISTS public_ws_close_events_v2413(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER NOT NULL,
+      worker_id INTEGER NOT NULL, epoch INTEGER NOT NULL, event_json TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS execution_trials(
       id INTEGER PRIMARY KEY AUTOINCREMENT, day TEXT NOT NULL, decision_id TEXT NOT NULL, route_id TEXT NOT NULL,
       decision_ts_ms INTEGER NOT NULL, exec_ts_ms INTEGER NOT NULL, bbo_age_limit_ms INTEGER NOT NULL, latency_ms INTEGER NOT NULL,
@@ -994,6 +1000,8 @@ def db_writer():
                     WHERE client_order_id=?""",payload)
             elif typ == "depth_sync":
                 con.execute("INSERT INTO depth_sync_events(ts_ms,symbol,event,reason,duration_ms,attempt) VALUES(?,?,?,?,?,?)", payload)
+            elif typ == "public_ws_close_v2413":
+                con.execute("INSERT INTO public_ws_close_events_v2413(ts_ms,worker_id,epoch,event_json) VALUES(?,?,?,?)", payload)
             elif typ == "trial":
                 con.execute("""INSERT INTO execution_trials(day,decision_id,route_id,decision_ts_ms,exec_ts_ms,bbo_age_limit_ms,latency_ms,
                     decision_net,decision_size_usd,decision_max_bbo_age_ms,decision_bbo_skew_ms,exec_net,exec_size_usd,exec_max_bbo_age_ms,
@@ -2009,6 +2017,9 @@ def queue_depth_resync(sym, reason="gap"):
     new_gap=False
     with depth_resync_lock:
         d=depth_resync_diag[sym]
+        # Every request survives a concurrent snapshot/cooldown. Queue membership
+        # alone does not mean the in-flight snapshot covers a newer invalidation.
+        d["request_generation"]+=1
         d["last_reason"]=reason
         if d["not_ready_since"] is None:
             d["not_ready_since"]=ts; d["drops"]+=1
@@ -2122,19 +2133,27 @@ def init_depth_symbol(sym):
 def depth_resync_worker():
     """Single rate-limited REST worker with retry/backoff; prevents 429 resync storms."""
     while True:
-        sym=depth_resync_q.get(); attempt=0; requeue=False
+        sym=depth_resync_q.get(); attempt=0; requeue=False; request_generation=-1
         try:
             while True:
                 attempt+=1
+                with depth_resync_lock:
+                    request_generation=depth_resync_diag[sym]["request_generation"]
                 ok=init_depth_symbol(sym)
                 if ok:
                     ts=now_ms()
                     with depth_resync_lock:
-                        d=depth_resync_diag[sym]; since=d.get("not_ready_since")
+                        d=depth_resync_diag[sym]
+                        if d["request_generation"]!=request_generation:
+                            # The installed snapshot was invalidated/replaced again.
+                            # Do not emit READY or clear the newer not-ready period.
+                            requeue=True
+                            break
+                        since=d.get("not_ready_since")
                         dur=max(0,ts-since) if since is not None else None
                         reason=d.get("last_reason","")
                         d["resync_ok"]+=1; d["not_ready_since"]=None; d["last_resync_ms"]=dur; d["last_ready_ts_ms"]=ts
-                    put_db(("depth_sync",(ts,sym,"READY",reason,dur,attempt)))
+                        put_db(("depth_sync",(ts,sym,"READY",reason,dur,attempt)))
                     if reason!="bootstrap":
                         with state_lock: state["depth_resync_recoveries"]+=1
                     break
@@ -2150,7 +2169,8 @@ def depth_resync_worker():
             time.sleep(0.25)
         finally:
             with depth_resync_lock:
-                if requeue: depth_resync_q.put(sym)
+                if requeue or depth_resync_diag[sym]["request_generation"]!=request_generation:
+                    depth_resync_q.put(sym)
                 else: depth_resync_pending.discard(sym)
             depth_resync_q.task_done()
 
@@ -6266,6 +6286,32 @@ def scan_worker():
             scanq.task_done()
 
 # ---------- WS ----------
+def record_public_ws_close(worker_id, feed, code, message, source):
+    """Preserve closure evidence before the next open resets per-socket fields."""
+    closed_ts=now_ms()
+    with state_lock:
+        h=state['ws_workers'].get(worker_id,{})
+        event={'ts_ms':closed_ts,'worker_id':worker_id,'epoch':feed.epoch,
+               'source':source,'close_code':code,'close_message':str(message or '')[:300],
+               'local_reason':feed.reason or h.get('close_requested_reason'),
+               'last_error':h.get('last_error'),
+               'opened_ms':h.get('opened_ms'),'last_message_ms':h.get('last_message_ms'),
+               'last_ping_ms':h.get('last_ping_ms'),'last_pong_ms':h.get('last_pong_ms'),
+               'last_server_ping_ms':h.get('last_server_ping_ms'),
+               'subscription_ack':h.get('subscription_ack'),
+               'subscription_error':h.get('subscription_error'),
+               'ping_errors':h.get('ping_errors',0),'queue':feed.inbox.qsize(),
+               'queue_age_ms':round(feed.backlog_age_ms(),2),'lag_ms':feed.metrics.get('lag_ms')}
+        opened=event.get('opened_ms')
+        event['connection_age_ms']=max(0,closed_ts-opened) if opened is not None else None
+        for key in ('last_message_ms','last_ping_ms','last_pong_ms','last_server_ping_ms'):
+            event[key.replace('_ms','_age_ms')]=max(0,closed_ts-event[key]) if event[key] is not None else None
+        state['public_ws_close_events'].append(event)
+        h['last_close_event']=event
+    put_db(('public_ws_close_v2413',(closed_ts,worker_id,feed.epoch,json.dumps(event,ensure_ascii=False))))
+    return event
+
+
 def ws_worker(symbols,worker_id,group_volume_24h=0.0):
     retry_delay=2.0; source_epoch=0
     while True:
@@ -6293,7 +6339,9 @@ def ws_worker(symbols,worker_id,group_volume_24h=0.0):
                     if sent and ts-last_pong > MEXC_APP_PONG_TIMEOUT_SEC*1000:
                         with state_lock:
                             h=state["ws_workers"].get(worker_id)
-                            if h is not None: h["last_error"]="MEXC application PONG timeout"
+                            if h is not None:
+                                h["last_error"]="MEXC application PONG timeout"
+                                h["close_requested_reason"]="application_pong_timeout"
                         try: ws.close()
                         except Exception: pass
                         return
@@ -6324,8 +6372,10 @@ def ws_worker(symbols,worker_id,group_volume_24h=0.0):
                     state["ws_workers"][worker_id]={"worker_id":worker_id,"symbols":len(symbols),"connected":True,
                         "opens":opens,"disconnects":int(prev.get("disconnects",0)),"opened_ms":ts,
                         "symbol_names":list(symbols),"volume_24h":group_volume_24h,
+                        "epoch":source_epoch,"last_close_event":prev.get("last_close_event"),
                         "last_message_ms":None,"last_close_code":prev.get("last_close_code"),
                         "last_error":None,"last_ping_ms":None,"last_pong_ms":None,
+                        "last_server_ping_ms":None,"subscription_ack":None,"subscription_error":None,
                         "pings":int(prev.get("pings",0)),"pongs":int(prev.get("pongs",0)),
                         "ping_errors":int(prev.get("ping_errors",0))}
                 params=[f"spot@public.aggre.depth.v3.api.pb@10ms@{s}" for s in symbols]
@@ -6346,6 +6396,13 @@ def ws_worker(symbols,worker_id,group_volume_24h=0.0):
                                 h=state["ws_workers"].get(worker_id)
                                 if h is not None:
                                     h["last_pong_ms"]=ts; h["pongs"]=int(h.get("pongs",0))+1
+                        else:
+                            with state_lock:
+                                h=state["ws_workers"].get(worker_id)
+                                if h is not None:
+                                    ack={"code":j.get("code"),"msg":str(j.get("msg",""))[:300]}
+                                    if j.get("code") not in (None,0): h["subscription_error"]=ack
+                                    elif "spot@public." in ack["msg"]: h["subscription_ack"]=ack
                     except Exception: pass
                     return
                 if feed.accept(msg,received,received_mono):
@@ -6360,10 +6417,17 @@ def ws_worker(symbols,worker_id,group_volume_24h=0.0):
                     h=state["ws_workers"].get(worker_id)
                     if h is not None: h["last_error"]=str(e)[:300]
                 logerr(f"WS {worker_id}: {e}")
+            def on_ping(ws,payload):
+                # websocket-client already replies to RFC PING frames with PONG.
+                # This callback only records receipt; it sends no extra frame.
+                with state_lock:
+                    h=state['ws_workers'].get(worker_id)
+                    if h is not None: h['last_server_ping_ms']=now_ms()
             def on_close(ws,code,msg):
                 nonlocal opened
                 connection_stop.set(); feed.stop()
                 if opened:
+                    record_public_ws_close(worker_id,feed,code,msg,'on_close')
                     with state_lock:
                         closed_ts=now_ms()
                         state["ws_connected"]=max(0,state["ws_connected"]-1); state["ws_disconnects"]+=1
@@ -6373,7 +6437,7 @@ def ws_worker(symbols,worker_id,group_volume_24h=0.0):
                             h["connected"]=False; h["disconnects"]=int(h.get("disconnects",0))+1
                             h["closed_ms"]=closed_ts; h["last_close_code"]=code
                     opened=False
-            w=websocket.WebSocketApp(WS,on_open=on_open,on_message=on_message,on_error=on_error,on_close=on_close)
+            w=websocket.WebSocketApp(WS,on_open=on_open,on_message=on_message,on_error=on_error,on_close=on_close,on_ping=on_ping)
             # MEXC specifies JSON {"method":"PING"}; RFC control-frame ping timeouts
             # caused healthy but busy feeds to reconnect and invalidate their books.
             w.run_forever(ping_interval=0)
@@ -6384,6 +6448,7 @@ def ws_worker(symbols,worker_id,group_volume_24h=0.0):
             # websocket-client normally invokes on_close. Keep the counters exact
             # even if run_forever exits through an exception before that callback.
             if opened:
+                record_public_ws_close(worker_id,feed,None,None,'run_forever_exit')
                 with state_lock:
                     closed_ts=now_ms()
                     state["ws_connected"]=max(0,state["ws_connected"]-1); state["ws_disconnects"]+=1
@@ -6588,6 +6653,7 @@ def runtime_health(now):
         db_bytes=0; wal_bytes=0; live_db_bytes=0; live_wal_bytes=0
     with state_lock:
         workers=[dict(v) for _,v in sorted(state["ws_workers"].items())]
+        close_events=list(state['public_ws_close_events'])
         connected=state["ws_connected"]; expected=state["ws_expected"]; symbols=list(state["symbols"])
         disconnect_times=list(state.get("ws_disconnect_times",()))
         out={"ws_connected":connected,"ws_expected":expected,"ws_disconnects":state["ws_disconnects"],
@@ -6608,9 +6674,18 @@ def runtime_health(now):
     with depth_lock:
         depth_ages=sorted(max(0,now-int(state["depth"].get(sym,{}).get("ts",0))) for sym in symbols
                           if state["depth"].get(sym,{}).get("ready") and state["depth"].get(sym,{}).get("ts"))
+        not_ready=[{'symbol':sym,'version':state['depth'].get(sym,{}).get('version'),
+                    'feed_receiving':_public_symbol_receiving(sym)}
+                   for sym in symbols if not state['depth'].get(sym,{}).get('ready')]
     depth_p95=depth_ages[min(len(depth_ages)-1,int((len(depth_ages)-1)*.95))] if depth_ages else None
     with depth_resync_lock:
         resync_queue=depth_resync_q.qsize(); resync_pending=len(depth_resync_pending)
+        for item in not_ready:
+            sym=item['symbol']; detail=depth_resync_diag.get(sym,{})
+            item.update(pending=sym in depth_resync_pending,
+                        reason=detail.get('last_reason'),since_ms=detail.get('not_ready_since'),
+                        resync_ok=detail.get('resync_ok',0),resync_fail=detail.get('resync_fail',0),
+                        request_generation=detail.get('request_generation',0))
     with pending_lock:
         shadow_pending=len(pending_shadow_trials)
         shadow_overdue=0; shadow_pending_by_profile={p:0 for p in SHADOW_PROFILES}; shadow_pending_by_stage={"leg1":0,"leg2":0}
@@ -6629,6 +6704,7 @@ def runtime_health(now):
         if not lag: return None
         return lag[min(len(lag)-1,int((len(lag)-1)*frac))]
     out.update({"workers":workers,"stale_workers":sum(a>30000 for a in ages),
+                "public_ws_close_events":close_events,"depth_not_ready":not_ready,
                 "max_worker_message_age_ms":max(ages) if ages else None,
                 "max_pong_age_ms":max(pong_ages) if pong_ages else None,
                 "workers_without_pong":pong_overdue,
