@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+data_v3/
+data_demo/
+*.db
+*.db-wal
+*.db-shm
+*.db.lock
+*.log
+*.env
+live_authorization.json

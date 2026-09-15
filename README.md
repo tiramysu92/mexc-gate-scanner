@@ -1,86 +1,76 @@
-# V3.4 — démarrage sans MEXC REST
+# MEXC V3 — 3.0.0-candidate.1
 
-Au démarrage, le scanner charge les 150 paires du dernier `universe_snapshots` de `scanner_v3.db`. Il ouvre ensuite immédiatement Gate WS et MEXC WS. `exchangeInfo` n'est plus appelé au démarrage normal. Si aucune base/univers en cache n'existe, la découverte REST reste uniquement comme solution de secours.
+Scanner spot à deux jambes, moteur commun de décision et d’exécution, simulations retardées et journal indépendant de V2.
 
-# V3.2 — MEXC WebSocket
+**Le démarrage par défaut est l’observation publique.** Cette livraison prépare la V3 ; aucun déploiement ni ordre réel n’a été effectué pour la valider. Les tests couvrent des échanges factices et les contrats des adaptateurs. La tenue des flux et les réponses réelles MEXC restent à mesurer sur le serveur.
 
-MEXC BBO passe en WebSocket protobuf natif, réparti sur 5 connexions max de 30 souscriptions. Gate reste en WebSocket. Le REST MEXC n'est plus utilisé pour le flux BBO continu; il reste utilisé ponctuellement pour la découverte initiale et la vérification de profondeur.
+Lire d’abord `PROPOSITION_V3.md`, puis `docs/DECISIONS_ET_REX.md`. Les deux analyses antérieures sont conservées dans `docs/historique/` comme références datées.
 
-# V3.1 — correctif MEXC 403
+## Nouvelle branche et installation séparée
 
-Cette version remplace le polling MEXC 100 ms par un intervalle par défaut de 250 ms
-et ajoute un backoff exponentiel automatique sur HTTP 403/429 (2 s à 60 s).
-Le dashboard distingue désormais le **cycle MEXC réel** de la **latence HTTP MEXC**.
+Branche proposée : `mexc-spot-2leg-v3`. Téléverser **tout le contenu du paquet**, notamment les dossiers `mexc_v3`, `tests` et `docs`. Le vérificateur contrôle également ces fichiers ; copier seulement `app.py` ne suffit pas.
 
-# MEXC ↔ Gate Arbitrage Scanner V3
-
-Scanner **lecture seule** : aucune clé API, aucun ordre.
-
-## Ce qui change par rapport à V2
-
-- Tailles : **250 / 500 / 1 000 / 2 000 USDT**
-- Univers dynamique : jusqu'à **150 paires USDT communes** à MEXC et Gate
-- Préférence aux marchés moins liquides mais encore tradables
-- Paires V2 intéressantes épinglées : ARB, FET, SEI, NEAR, XRP, OP, SUI, DOGE, AAVE, RENDER, PEPE, ADA
-- Gate BBO via WebSocket
-- MEXC BBO récupéré en **un seul appel pour toutes les paires**, cible 100 ms
-- Vérification exacte par carnet 100 niveaux uniquement lorsque le spread BBO devient intéressant
-- Les ticks positifs sont regroupés en **événements**
-- Le dashboard compte donc le **nombre d'opportunités par token**
-- Base séparée : `scanner_v3.db`
-
-## Pourquoi MEXC n'utilise pas directement son WebSocket ici ?
-
-Le flux Spot WebSocket MEXC actuel est en Protocol Buffers. Pour rendre le déploiement V3 simple et robuste sur le VPS actuel, le scanner utilise l'endpoint public `ticker/bookTicker` qui renvoie **tous les symboles en un appel**, avec une cible de 100 ms. Cela supprime le défaut V2 où ~30 requêtes séquentielles donnaient ~40 secondes entre deux mesures d'une même paire.
-
-La V3 affiche le `cycle MEXC` réel sur la page. Il faut se fier à cette valeur mesurée et non à la cible théorique de 100 ms.
-
-Une V3.1 pourra passer le côté MEXC en WebSocket Protocol Buffers 100 ms/10 ms si l'on veut encore réduire la latence.
-
-## Installation / mise à jour
-
-Dans le dépôt :
+Créer un checkout distinct sur le serveur, après avoir mis le paquet sur cette nouvelle branche :
 
 ```bash
-source venv/bin/activate
-pip install -r requirements.txt
-python app.py
+cd /home/ubuntu &&
+git clone --single-branch --branch mexc-spot-2leg-v3 https://github.com/tiramysu92/mexc-gate-scanner.git mexc-gate-scanner-v3 &&
+cd /home/ubuntu/mexc-gate-scanner-v3 &&
+/home/ubuntu/mexc-venv/bin/python -m venv /home/ubuntu/mexc-v3-venv &&
+/home/ubuntu/mexc-v3-venv/bin/python -m pip install -r requirements.txt &&
+/home/ubuntu/mexc-v3-venv/bin/python verifier_v3.py
 ```
 
-Dashboard : port 8080.
+Ces commandes créent un environnement V3 distinct et ne relancent pas V2. Le bloc s’arrête si une étape échoue. Aucun fichier `.env`, clé API, journal réel ou fichier d’armement n’est inclus dans le paquet.
 
-## Variables utiles
+## Démonstration hors ligne
 
 ```bash
-MAX_PAIRS=150
-MEXC_BBO_INTERVAL=0.10
-MIN_QUOTE_VOL_24H=100000
-MAX_QUOTE_VOL_24H=75000000
-PREFILTER_GROSS=0.0004
-VERIFY_COOLDOWN_MS=250
-EVENT_CLOSE_GAP_MS=1000
+/home/ubuntu/mexc-v3-venv/bin/python app.py --mode demo --data-dir data_demo
 ```
 
-## Base SQLite
+Elle utilise un marché fictif `DEMO`, une horloge déterministe et le même coordinateur que le mode réel. Son résultat est explicitement synthétique. Réutiliser `data_demo` conserve le journal ; pour une autre démonstration indépendante, choisir un autre dossier.
 
-### `verified_checks`
-Mesures exactes après lecture de la profondeur pour chacune des quatre tailles.
+## Observation sur MEXC
 
-### `opportunities`
-Une ligne = **une opportunité**, et non un tick.
-Champs utiles :
-- pair
-- direction
-- start_ms / end_ms
-- duration_ms
-- ticks
-- peak_net / avg_net
-- peak_profit
-- best_size
+```bash
+/home/ubuntu/mexc-v3-venv/bin/python app.py --mode observe --data-dir data_v3 --host 127.0.0.1 --port 8083
+```
 
-### `universe_snapshots`
-Pourquoi une paire a été sélectionnée : volumes 24 h et score de volatilité/liquidité.
+Ce mode utilise uniquement les flux publics et ne charge aucune clé API. Il lance trois portefeuilles simulés indépendants et le tableau de bord sur `http://127.0.0.1:8083`. Pour une consultation distante, utiliser un tunnel SSH vers le port 8083. L’option `--host` est explicite si l’environnement dispose déjà d’un accès protégé à son interface serveur.
 
-## Important
+Pour le laisser tourner après la fermeture du terminal :
 
-Le profit affiché est un **profit théorique après frais de trading configurés**, mais avant risque de latence/exécution, retrait, rééquilibrage, etc. Ce scanner sert à identifier les marchés à tester avant tout bot d'exécution.
+```bash
+nohup /home/ubuntu/mexc-v3-venv/bin/python -u app.py --mode observe --data-dir data_v3 > scanner_v3_observe.log 2>&1 &
+```
+
+Les flux V2 et V3 consomment chacun des connexions et du CPU : mesurer V3 seule pour juger sa capacité sur le serveur. Cette livraison ne termine pas automatiquement V2.
+
+## Surveillance indépendante
+
+```bash
+/home/ubuntu/mexc-v3-venv/bin/python surveiller_v3.py --minutes 10 --interval 5
+```
+
+Le relevé affiche les connexions, les carnets, les rattrapages, l’attente et les reconnexions supplémentaires. Un rapport compressé est conservé même après `Ctrl+C`. Le surveillant ne crée ni ne supprime `STOP`, ne modifie aucun quota et ne commande aucune sortie. Le scanner reste autonome.
+
+Le scanner écrit aussi `data_v3/last_report.json.gz` lors de son arrêt normal. Les journaux de chaque profil sont persistants. Les résultats et compteurs d’un profil ne sont pas remis à zéro au redémarrage.
+
+## Mode réel inclus, distinct de cette validation
+
+L’adaptateur réel est implémenté : REST signé, ordres FOK, notifications privées, frais privés et rapprochement REST. Il n’est pas activé par les commandes précédentes.
+
+`docs/EXPLOITATION_LIVE.md` décrit l’initialisation explicite, l’import en lecture seule de l’historique V2, le fichier d’autorisation, les contrôles persistants et la procédure de diagnostic d’un ordre incertain. Le fichier d’arrêt bloque les nouveaux achats ; une sortie déjà engagée peut se terminer.
+
+## Outils du paquet
+
+| Fichier | Fonction |
+|---|---|
+| `app.py` | Observation, démonstration ou démarrage réel explicitement configuré |
+| `verifier_v3.py` | Intégrité et tests avec le réseau interdit |
+| `surveiller_v3.py` | Relevé indépendant, sans effet sur l’armement |
+| `reconcilier_v3.py` | Requête des ordres incertains par identifiant durable, sans POST d’ordre |
+| `benchmark_v3.py` | Mesure CPU locale sur un carnet fictif ; pas une latence LIVE |
+
+Python requis : 3.12 ou supérieur, sous Linux. Le verrou de processus du journal utilise `fcntl`.
